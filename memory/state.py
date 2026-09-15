@@ -1,0 +1,115 @@
+from dataclasses import dataclass
+from typing import Literal
+
+
+ExecutionStatus = Literal["pending", "running", "completed", "failed", "skipped"]
+_EXECUTION_STATUSES = frozenset({"pending", "running", "completed", "failed", "skipped"})
+
+
+def _require_text(value: str, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+
+
+def _require_revision(value: int, field: str) -> None:
+    if type(value) is not int or not 1 <= value <= 3:
+        raise ValueError(f"{field} must be between 1 and 3")
+
+
+@dataclass(frozen=True, slots=True)
+class PlanStep:
+    id: str
+    intent: str
+    completion_criterion: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.id, "step id")
+        _require_text(self.intent, "step intent")
+        _require_text(self.completion_criterion, "completion criterion")
+
+
+@dataclass(frozen=True, slots=True)
+class Plan:
+    revision: int
+    goal: str
+    steps: tuple[PlanStep, ...]
+
+    def __post_init__(self) -> None:
+        _require_revision(self.revision, "plan revision")
+        _require_text(self.goal, "plan goal")
+        steps = tuple(self.steps)
+        if not steps:
+            raise ValueError("plan must contain at least one step")
+        if any(not isinstance(step, PlanStep) for step in steps):
+            raise TypeError("plan steps must be PlanStep values")
+        if len({step.id for step in steps}) != len(steps):
+            raise ValueError("plan step IDs must be unique")
+        object.__setattr__(self, "steps", steps)
+
+
+@dataclass(frozen=True, slots=True)
+class StepExecution:
+    revision: int
+    step_id: str
+    status: ExecutionStatus
+    result: str | None = None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_revision(self.revision, "step execution revision")
+        _require_text(self.step_id, "step execution step ID")
+        if self.status not in _EXECUTION_STATUSES:
+            raise ValueError("step execution status is invalid")
+        if self.result is not None and not isinstance(self.result, str):
+            raise TypeError("step execution result must be a string or None")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("step execution error must be a string or None")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentState:
+    goal: str
+    plan_history: tuple[Plan, ...] = ()
+    step_executions: tuple[StepExecution, ...] = ()
+    memory_summary: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.goal, "agent state goal")
+        plans = tuple(self.plan_history)
+        executions = tuple(self.step_executions)
+        if any(not isinstance(plan, Plan) for plan in plans):
+            raise TypeError("plan history must contain Plan values")
+        if [plan.revision for plan in plans] != list(range(1, len(plans) + 1)):
+            raise ValueError("plan revisions must be sequential")
+        if any(plan.goal != self.goal for plan in plans):
+            raise ValueError("plan goal must match agent state goal")
+        if len({(execution.revision, execution.step_id) for execution in executions}) != len(executions):
+            raise ValueError("step executions must be uniquely associated")
+        plan_steps = {(plan.revision, step.id) for plan in plans for step in plan.steps}
+        if any((execution.revision, execution.step_id) not in plan_steps for execution in executions):
+            raise ValueError("step execution must be associated with a plan step")
+        if self.memory_summary is not None and not isinstance(self.memory_summary, str):
+            raise TypeError("memory summary must be a string or None")
+        object.__setattr__(self, "plan_history", plans)
+        object.__setattr__(self, "step_executions", executions)
+
+    def with_plan(self, plan: Plan) -> "AgentState":
+        return AgentState(
+            goal=self.goal,
+            plan_history=self.plan_history + (plan,),
+            step_executions=self.step_executions,
+            memory_summary=self.memory_summary,
+        )
+
+    def with_step_execution(self, execution: StepExecution) -> "AgentState":
+        remaining = tuple(
+            item
+            for item in self.step_executions
+            if (item.revision, item.step_id) != (execution.revision, execution.step_id)
+        )
+        return AgentState(
+            goal=self.goal,
+            plan_history=self.plan_history,
+            step_executions=remaining + (execution,),
+            memory_summary=self.memory_summary,
+        )

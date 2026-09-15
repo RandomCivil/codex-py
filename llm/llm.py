@@ -1,0 +1,56 @@
+from collections.abc import AsyncIterator, Iterable, Sequence
+from typing import Any
+
+from openai import AsyncOpenAI
+from openai.types.responses import ResponseStreamEvent
+
+
+class LLM:
+    def __init__(self, base_url: str, api_key: str, model_name: str) -> None:
+        self._model_name = model_name
+        self._client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=0,
+        )
+
+    async def __aenter__(self) -> "LLM":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self._client.close()
+
+    async def stream_events(
+        self,
+        input: str | Sequence[dict[str, Any]],
+        *,
+        instructions: str | None = None,
+        tools: Iterable[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        request: dict[str, Any] = {"model": self._model_name, "input": input}
+        if instructions is not None:
+            request["instructions"] = instructions
+        if tools is not None:
+            request["tools"] = tools
+
+        async with self._client.responses.stream(**request) as stream:
+            async for event in stream:
+                yield event
+
+    async def stream_text(
+        self,
+        input: str | Sequence[dict[str, Any]],
+        *,
+        instructions: str | None = None,
+        tools: Iterable[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
+        async for event in self.stream_events(
+            input,
+            instructions=instructions,
+            tools=tools,
+        ):
+            if event.type == "response.output_text.delta":
+                yield event.delta

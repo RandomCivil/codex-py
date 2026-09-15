@@ -5,8 +5,9 @@ description = ""
 authors = [
     {name = "RandomCivil",email = "theviperxie@gmail.com"}
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.12,<4.0"
 dependencies = [
+    "langgraph (>=1.2.11,<2.0.0)"
 ]
 
 

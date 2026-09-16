@@ -1,13 +1,21 @@
 from collections.abc import AsyncIterator, Iterable, Sequence
-from typing import Any
+from typing import Any, Callable
 
 from openai import AsyncOpenAI
 from openai.types.responses import ResponseStreamEvent
 
 
 class LLM:
-    def __init__(self, base_url: str, api_key: str, model_name: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model_name: str,
+        *,
+        on_event: Callable[[ResponseStreamEvent], None] | None = None,
+    ) -> None:
         self._model_name = model_name
+        self._on_event = on_event
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -38,6 +46,8 @@ class LLM:
 
         async with self._client.responses.stream(**request) as stream:
             async for event in stream:
+                if self._on_event is not None:
+                    self._on_event(event)
                 yield event
 
     async def stream_text(

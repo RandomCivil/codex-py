@@ -41,10 +41,11 @@ def new_run_id() -> str:
 class DurableAgent:
     """Run the existing Planner and Executor behind a durable LangGraph graph."""
 
-    def __init__(self, planner: Planner, executor: Executor, saver: Any) -> None:
+    def __init__(self, planner: Planner, executor: Executor, saver: Any, trace: Any | None = None) -> None:
         self._planner = planner
         self._executor = executor
         self._saver = saver
+        self._trace = trace
 
     def _graph(self):
         graph = StateGraph(GraphState)
@@ -75,14 +76,22 @@ class DurableAgent:
             revision, step_id = _next_step(agent_state)
             if revision is None:
                 return {"status": "completed"}
+            if self._trace is not None:
+                self._trace.execute("started", revision, step_id)
             async with self._executor as executor:
                 execution = await executor.execute(agent_state, revision, step_id)
+            if self._trace is not None:
+                self._trace.execute(execution.status, revision, step_id, execution.error or execution.result)
             return {"agent_state": serialize_agent_state(agent_state.with_step_execution(execution))}
 
         async def replan(state: GraphState) -> GraphState:
             agent_state = deserialize_agent_state(state["agent_state"])
             if agent_state.plan_history[-1].revision == 3:
+                if self._trace is not None:
+                    self._trace.plan("blocked", 3)
                 return {"status": "blocked"}
+            if self._trace is not None:
+                self._trace.plan("replanning", len(agent_state.plan_history) + 1)
             return {"agent_state": serialize_agent_state(agent_state.with_plan(await self._planner.plan(agent_state)))}
 
         async def terminal(state: GraphState) -> GraphState:
@@ -188,12 +197,20 @@ async def _run(url: str, run_id: str, goal: str | None, recovery: str | None = N
         renewal = asyncio.create_task(_renew_lease(registry, run_id, owner))
         try:
             async with _mysql_saver(url) as saver:
-                llm = LLM(os.environ.get("OPENAI_BASE_URL", ""), os.environ.get("OPENAI_API_KEY", ""), model_name)
                 try:
-                    planner = Planner(llm)
-                    executor = Executor(model_name=model_name, checkpointer=saver, run_id=run_id)
+                    from .trace import RunTrace
+
+                    trace = RunTrace()
+                    llm = LLM(
+                        os.environ.get("OPENAI_BASE_URL", ""),
+                        os.environ.get("OPENAI_API_KEY", ""),
+                        model_name,
+                        on_event=trace.llm_event,
+                    )
+                    planner = Planner(llm, trace=trace)
+                    executor = Executor(model_name=model_name, checkpointer=saver, run_id=run_id, trace=trace)
                     initial = AgentState(goal) if goal is not None else None
-                    durable = DurableAgent(planner, executor, saver)
+                    durable = DurableAgent(planner, executor, saver, trace=trace)
                     with _cancel_on_signals():
                         result = await durable.run(run_id, initial, recovery)
                 except (asyncio.CancelledError, KeyboardInterrupt):

@@ -48,6 +48,7 @@ class Executor:
         checkpointer: Any | None = None,
         thread_id: str | None = None,
         run_id: str | None = None,
+        trace: Any | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
@@ -73,6 +74,7 @@ class Executor:
         self._checkpointer = checkpointer
         self._thread_id = thread_id
         self._run_id = run_id
+        self._trace = trace
         self._client = None
         self._session = None
         self._tools = None
@@ -154,8 +156,13 @@ class Executor:
         tool_node = ToolNode(tools, handle_tool_errors=False)
         async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
             message = await self._bound_model.ainvoke(state["messages"])
+            if self._trace is not None and isinstance(message, AIMessage) and message.content:
+                self._trace.llm_text("output", message.content)
             if isinstance(message, AIMessage) and message.tool_calls:
                 self._rounds += 1
+                if self._trace is not None:
+                    for call in message.tool_calls:
+                        self._trace.tool_call(call.get("name", "unknown"), call.get("args", {}), call.get("id"))
             return {"messages": [message]}
 
         def route(state: MessagesState) -> str:
@@ -181,7 +188,29 @@ class Executor:
 
         graph.add_node("model", call_model)
         graph.add_node("mark_running", mark_running)
-        graph.add_node("tools", tool_node)
+        async def call_tools(state: MessagesState) -> dict[str, list[BaseMessage]]:
+            try:
+                result = await tool_node.ainvoke(state)
+            except Exception as error:
+                if self._trace is not None:
+                    last = state["messages"][-1]
+                    for call in getattr(last, "tool_calls", []):
+                        self._trace.tool_result(
+                            call.get("name", "unknown"),
+                            str(error),
+                            error=True,
+                        )
+                raise
+            for message in result.get("messages", []):
+                if isinstance(message, ToolMessage) and self._trace is not None:
+                    self._trace.tool_result(
+                        getattr(message, "name", "unknown"),
+                        message.content,
+                        error=_tool_error(message) is not None,
+                    )
+            return result
+
+        graph.add_node("tools", call_tools)
         graph.add_edge(START, "mark_running")
         graph.add_edge("mark_running", "model")
         graph.add_conditional_edges("model", route, {"tools": "tools", END: END})

@@ -26,11 +26,14 @@ class Planner:
         "contain exactly id, intent, and completion_criterion."
     )
 
-    def __init__(self, text_stream: TextStream) -> None:
+    def __init__(self, text_stream: TextStream, trace: Any | None = None) -> None:
         self._text_stream = text_stream
+        self._trace = trace
 
     async def plan(self, state: AgentState) -> Plan:
         expected_revision = len(state.plan_history) + 1
+        if self._trace is not None:
+            self._trace.plan("started", expected_revision)
         if expected_revision > 3:
             raise PlanningValidationError(
                 "planning cannot exceed the three-revision goal budget"
@@ -46,7 +49,10 @@ class Planner:
                 )
             ]
         )
-        return _parse_plan(output, state.goal, expected_revision)
+        plan = _parse_plan(output, state.goal, expected_revision)
+        if self._trace is not None:
+            self._trace.plan("completed", plan.revision)
+        return plan
 
 
 def _state_payload(state: AgentState) -> dict[str, Any]:

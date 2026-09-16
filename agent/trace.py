@@ -15,16 +15,30 @@ class RunTrace:
 
     def __init__(self, stream: Any = None) -> None:
         self._stream = stream or sys.stderr
+        self._output_buffer = ""
 
     def llm_event(self, event: Any) -> None:
         event_type = getattr(event, "type", "")
         if event_type in {"response.reasoning.delta", "response.reasoning_summary_text.delta"}:
             self._write("thought", getattr(event, "delta", ""))
         elif event_type == "response.output_text.delta":
-            self._write("output", getattr(event, "delta", ""))
+            delta = getattr(event, "delta", "")
+            self._output_buffer += delta
+            self._write("output", delta)
+        elif event_type == "response.created":
+            self._output_buffer = ""
+        elif event_type == "response.completed" and self._output_buffer:
+            self._write("output complete", self._output_buffer)
+            self._output_buffer = ""
 
     def llm_text(self, label: str, value: Any) -> None:
         self._write(label, value)
+
+    def llm_complete(self, revision: int, step_id: str, message: Any) -> None:
+        self._line(
+            f"[llm complete] revision={revision} step={step_id} "
+            f"data={_compact(message)}"
+        )
 
     def plan(self, status: str, revision: int | None = None) -> None:
         suffix = f" revision={revision}" if revision is not None else ""

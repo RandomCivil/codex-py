@@ -62,8 +62,10 @@ poetry run agent migrate
 开始一个新的 Agent run：
 
 ```bash
-poetry run agent run --goal '检查项目中的待办事项并整理摘要'
+poetry run agent run --goal '检查项目中的待办事项并整理摘要' --cwd /path/to/project
 ```
+
+`--cwd` 指定 Agent 操作的项目目录。它会被强制写入每一个 Atom MCP 工具调用的 `cwd` 参数；未指定时使用启动 `agent` 命令时的当前目录。恢复 run 时应使用与原 run 相同的 `--cwd`，该目录属于持久化配置的一部分。
 
 命令会输出 UUIDv4 `run_id`，例如：
 

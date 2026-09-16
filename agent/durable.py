@@ -176,12 +176,24 @@ async def _mysql_saver(url: str):
         yield saver
 
 
-async def _run(url: str, run_id: str, goal: str | None, recovery: str | None = None) -> dict[str, Any]:
+async def _run(
+    url: str,
+    run_id: str,
+    goal: str | None,
+    recovery: str | None = None,
+    cwd: str | None = None,
+) -> dict[str, Any]:
     model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    tool_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     snapshot = configuration_snapshot(
         base_url=os.environ.get("OPENAI_BASE_URL", ""),
         model=model_name,
-        mcp={"command": "poetry", "args": ["run", "atom-mcp"], "cwd": "/home/xzp/workspace/atom-mcp"},
+        mcp={
+            "command": "poetry",
+            "args": ["run", "atom-mcp"],
+            "cwd": "/home/xzp/workspace/atom-mcp",
+            "tool_cwd": tool_cwd,
+        },
     )
     owner = str(uuid.uuid4())
     async with _connection_pool(_parse_url(url)) as pool:
@@ -208,7 +220,13 @@ async def _run(url: str, run_id: str, goal: str | None, recovery: str | None = N
                         on_event=trace.llm_event,
                     )
                     planner = Planner(llm, trace=trace)
-                    executor = Executor(model_name=model_name, checkpointer=saver, run_id=run_id, trace=trace)
+                    executor = Executor(
+                        model_name=model_name,
+                        checkpointer=saver,
+                        run_id=run_id,
+                        trace=trace,
+                        tool_cwd=tool_cwd,
+                    )
                     initial = AgentState(goal) if goal is not None else None
                     durable = DurableAgent(planner, executor, saver, trace=trace)
                     with _cancel_on_signals():
@@ -231,12 +249,12 @@ async def _run(url: str, run_id: str, goal: str | None, recovery: str | None = N
             await registry.release(run_id, owner)
 
 
-def run_agent(url: str, goal: str) -> dict[str, Any]:
-    return asyncio.run(_run(url, new_run_id(), goal))
+def run_agent(url: str, goal: str, cwd: str | None = None) -> dict[str, Any]:
+    return asyncio.run(_run(url, new_run_id(), goal, cwd=cwd))
 
 
-def resume_agent(url: str, run_id: str, recovery: str | None = None) -> dict[str, Any]:
-    return asyncio.run(_run(url, run_id, None, recovery))
+def resume_agent(url: str, run_id: str, recovery: str | None = None, cwd: str | None = None) -> dict[str, Any]:
+    return asyncio.run(_run(url, run_id, None, recovery, cwd))
 
 
 async def _renew_lease(registry: Any, run_id: str, owner: str) -> None:

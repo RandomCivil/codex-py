@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator, Iterable, Sequence
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from openai import AsyncOpenAI
 from openai.types.responses import ResponseStreamEvent
@@ -37,8 +37,14 @@ class LLM:
         *,
         instructions: str | None = None,
         tools: Iterable[dict[str, Any]] | None = None,
+        text_format: Mapping[str, Any],
     ) -> AsyncIterator[ResponseStreamEvent]:
-        request: dict[str, Any] = {"model": self._model_name, "input": input}
+        _require_json_schema(text_format)
+        request: dict[str, Any] = {
+            "model": self._model_name,
+            "input": input,
+            "text": {"format": dict(text_format)},
+        }
         if instructions is not None:
             request["instructions"] = instructions
         if tools is not None:
@@ -56,11 +62,24 @@ class LLM:
         *,
         instructions: str | None = None,
         tools: Iterable[dict[str, Any]] | None = None,
+        text_format: Mapping[str, Any],
     ) -> AsyncIterator[str]:
         async for event in self.stream_events(
             input,
             instructions=instructions,
             tools=tools,
+            text_format=text_format,
         ):
             if event.type == "response.output_text.delta":
                 yield event.delta
+
+
+def _require_json_schema(text_format: Mapping[str, Any]) -> None:
+    if (
+        text_format.get("type") != "json_schema"
+        or not isinstance(text_format.get("name"), str)
+        or not text_format["name"]
+        or not isinstance(text_format.get("schema"), Mapping)
+        or text_format.get("strict") is not True
+    ):
+        raise ValueError("Responses API calls require a strict JSON Schema text format")

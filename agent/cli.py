@@ -36,6 +36,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--goal")
     parser.add_argument("--run-id")
     parser.add_argument("--recovery", choices=("retry", "fail", "abort"))
+    parser.add_argument("--cwd", help="working directory supplied to Atom MCP tool calls")
     try:
         args = parser.parse_args(argv)
     except InvalidInvocationError as exc:
@@ -51,8 +52,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError
         except (ValueError, AttributeError):
             return _emit({"command": "resume", "status": "invalid", "error": "resume requires a UUIDv4 --run-id"}, EXIT_INVALID_INVOCATION)
-    if args.command == "migrate" and (args.goal or args.run_id or args.recovery):
-        return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, or --recovery"}, EXIT_INVALID_INVOCATION)
+    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd):
+        return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, or --cwd"}, EXIT_INVALID_INVOCATION)
 
     if not os.environ.get("CODEX_MYSQL_URL"):
         return _emit(
@@ -69,13 +70,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             migrate_database(os.environ["CODEX_MYSQL_URL"])
             result = {"command": args.command, "status": "completed"}
         elif args.command == "run":
-            result = {"command": args.command, **run_agent(os.environ["CODEX_MYSQL_URL"], args.goal)}
+            if args.cwd:
+                run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, args.cwd)
+            else:
+                run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal)
+            result = {"command": args.command, **run}
             result.setdefault("run_id", str(uuid.uuid4()))
         else:
             if args.recovery is None:
-                resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id)
+                if args.cwd:
+                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, cwd=args.cwd)
+                else:
+                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id)
             else:
-                resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery)
+                if args.cwd:
+                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, args.cwd)
+                else:
+                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery)
             result = {"command": args.command, **resumed}
     except (MigrationConfigurationError, ConfigurationMismatchError) as exc:
         return _emit(

@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -11,11 +12,12 @@ class TextStream:
         self.chunks = chunks
         self.request = None
 
-    async def stream_text(self, input, *, instructions=None, tools=None):
+    async def stream_text(self, input, *, instructions=None, tools=None, text_format=None):
         self.request = {
             "input": input,
             "instructions": instructions,
             "tools": tools,
+            "text_format": text_format,
         }
         for chunk in self.chunks:
             yield chunk
@@ -39,6 +41,32 @@ def test_planner_builds_initial_plan_from_strict_json_text_stream():
     assert plan.steps[1].completion_criterion == "The release is available"
 
 
+def test_planner_normalizes_numeric_step_ids_from_compatible_models():
+    text_stream = TextStream(
+        '{"revision":1,"goal":"Prepare release",'
+        '"steps":[{"id":1,"intent":"Inspect the release",'
+        '"completion_criterion":"Release risks are listed"}]}'
+    )
+    state = AgentState("Prepare release")
+
+    plan = asyncio.run(Planner(text_stream).plan(state))
+
+    assert plan.steps[0].id == "1"
+
+
+@pytest.mark.parametrize("revision", (1.0, "1.0"))
+def test_planner_normalizes_integral_revision_from_compatible_models(revision):
+    text_stream = TextStream(
+        '{"revision":' + json.dumps(revision) + ','
+        '"goal":"Prepare release","steps":[{"id":"1","intent":"Inspect the release",'
+        '"completion_criterion":"Release risks are listed"}]}'
+    )
+
+    plan = asyncio.run(Planner(text_stream).plan(AgentState("Prepare release")))
+
+    assert plan.revision == 1
+
+
 def test_planner_sends_agent_state_to_text_stream_without_tools():
     text_stream = TextStream('{"revision":1,"goal":"Prepare release","steps":[{"id":"one","intent":"Do one","completion_criterion":"One is done"}]}')
     state = AgentState("Prepare release", memory_summary="Version 2.0")
@@ -48,6 +76,7 @@ def test_planner_sends_agent_state_to_text_stream_without_tools():
     assert '"goal": "Prepare release"' in text_stream.request["input"]
     assert '"memory_summary": "Version 2.0"' in text_stream.request["input"]
     assert text_stream.request["tools"] is None
+    assert text_stream.request["text_format"] == Planner._TEXT_FORMAT
 
 
 def test_planner_builds_next_revision_without_mutating_prior_plan_or_executions():
@@ -110,7 +139,7 @@ def test_planner_rejects_a_revision_that_is_not_next_in_sequence():
         asyncio.run(Planner(TextStream(output)).plan(AgentState("Prepare release", (first,))))
 
 
-@pytest.mark.parametrize("revision", ("true", "1.0"))
+@pytest.mark.parametrize("revision", ("true", "1.5"))
 def test_planner_rejects_a_revision_with_a_non_integer_json_type(revision):
     output = (
         '{"revision":' + revision + ',"goal":"Prepare release","steps":['

@@ -368,6 +368,38 @@ def test_executor_forwards_host_configuration_and_reuses_one_mcp_session(monkeyp
     assert sessions[0].closed
 
 
+def test_executor_forces_the_agent_working_directory_into_atom_tool_calls(monkeypatch):
+    model = FinalModel(
+        json.dumps(
+            {
+                "completed": True,
+                "result": "Published the release. Completion criterion met: Release is available",
+            }
+        ),
+        tool_args={"value": "done", "cwd": "/model-selected-directory"},
+    )
+    received = []
+
+    def atom_tool(value: str, cwd: str) -> str:
+        """Record the supplied working directory."""
+        received.append((value, cwd))
+        return value
+
+    tool = StructuredTool.from_function(atom_tool, name="record")
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model, tool_cwd="/workspace/project") as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.status == "completed"
+    assert received == [("done", "/workspace/project")]
+
+
 def test_checkpointed_executor_fails_closed_before_tool_work(monkeypatch):
     _, state = _plan_and_state()
     executor = Executor(model=ControlledModel(), checkpointer=InMemorySaver(), run_id="run-1")

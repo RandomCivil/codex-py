@@ -44,6 +44,20 @@ def test_run_emits_a_uuidv4_agent_run_id(monkeypatch, capsys):
     assert uuid.UUID(output["run_id"]).version == 4
 
 
+def test_run_forwards_cwd_to_agent(monkeypatch, capsys):
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def run(url, goal, cwd):
+        calls.append((url, goal, cwd))
+        return {"status": "completed"}
+
+    monkeypatch.setattr("agent.cli.run_agent", run)
+
+    assert main(["run", "--goal", "Prepare release", "--cwd", "/workspace/project"]) == 0
+    assert calls == [("mysql://user:pass@localhost/db", "Prepare release", "/workspace/project")]
+
+
 def test_resume_requires_a_run_id(monkeypatch, capsys):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
 

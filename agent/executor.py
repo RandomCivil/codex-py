@@ -42,6 +42,7 @@ class Executor:
         command: str = "poetry",
         args: tuple[str, ...] = ("run", "atom-mcp"),
         cwd: str = "/home/xzp/workspace/atom-mcp",
+        tool_cwd: str | None = None,
         env: dict[str, str] | None = None,
         tool_allowlist: tuple[str, ...] | None = None,
         max_rounds: int = 10,
@@ -65,6 +66,7 @@ class Executor:
             "cwd": cwd,
             "env": {**os.environ, **(env or {})},
         }
+        self._tool_cwd = tool_cwd
         self._tool_allowlist = set(tool_allowlist) if tool_allowlist is not None else None
         self._max_rounds = max_rounds
         if checkpointer is not None and thread_id is None and run_id is None:
@@ -131,6 +133,15 @@ class Executor:
             if not tool_messages:
                 return StepExecution(revision, step_id, "failed", error="model did not use an MCP tool")
             final = graph_result["messages"][-1]
+            if self._trace is not None:
+                self._trace.llm_complete(
+                    revision,
+                    step_id,
+                    {
+                        "content": getattr(final, "content", None),
+                        "tool_calls": getattr(final, "tool_calls", []),
+                    },
+                )
             result = _completion_result(final, step.completion_criterion)
             if result is None:
                 if isinstance(final, AIMessage) and final.tool_calls:
@@ -156,6 +167,7 @@ class Executor:
         tool_node = ToolNode(tools, handle_tool_errors=False)
         async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
             message = await self._bound_model.ainvoke(state["messages"])
+            message = self._with_tool_cwd(message)
             if self._trace is not None and isinstance(message, AIMessage) and message.content:
                 self._trace.llm_text("output", message.content)
             if isinstance(message, AIMessage) and message.tool_calls:
@@ -220,6 +232,22 @@ class Executor:
     def _require_active(self) -> None:
         if not self._active:
             raise RuntimeError("Executor must be used as an asynchronous context manager")
+
+    def _with_tool_cwd(self, message: BaseMessage) -> BaseMessage:
+        """Apply the host-selected working directory to every Atom tool call."""
+        if self._tool_cwd is None or not isinstance(message, AIMessage) or not message.tool_calls:
+            return message
+        tool_calls = [
+            {
+                **call,
+                "args": {
+                    **(call["args"] if isinstance(call.get("args"), dict) else {}),
+                    "cwd": self._tool_cwd,
+                },
+            }
+            for call in message.tool_calls
+        ]
+        return message.model_copy(update={"tool_calls": tool_calls})
 
 
 def _resolve_step(state: AgentState, revision: int, step_id: str) -> PlanStep | None:

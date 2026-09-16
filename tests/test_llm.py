@@ -2,9 +2,26 @@ import asyncio
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from openai import APIConnectionError
 
 from llm import LLM
+
+TEXT_FORMAT = {
+    "type": "json_schema",
+    "name": "test_output",
+    "strict": True,
+    "schema": {"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+}
+
+
+def test_event_stream_rejects_non_schema_text_formats_before_calling_provider():
+    async def consume():
+        llm = LLM("https://provider.test", "secret", "model")
+        return [event async for event in llm.stream_events("hello", text_format={"type": "text"})]
+
+    with pytest.raises(ValueError, match="strict JSON Schema"):
+        asyncio.run(consume())
 
 
 def test_text_stream_yields_only_text_deltas_in_provider_order(monkeypatch):
@@ -45,7 +62,7 @@ def test_text_stream_yields_only_text_deltas_in_provider_order(monkeypatch):
 
     async def consume():
         llm = LLM("https://provider.test", "secret", "model")
-        return [delta async for delta in llm.stream_text("hello")]
+        return [delta async for delta in llm.stream_text("hello", text_format=TEXT_FORMAT)]
 
     assert asyncio.run(consume()) == ["Hello", " world"]
 
@@ -81,7 +98,7 @@ def test_text_stream_closes_provider_stream_when_consumer_exits_early(monkeypatc
 
     async def consume_one():
         llm = LLM("https://provider.test", "secret", "model")
-        stream = llm.stream_text("hello")
+        stream = llm.stream_text("hello", text_format=TEXT_FORMAT)
         assert await anext(stream) == "first"
         await stream.aclose()
 
@@ -135,7 +152,7 @@ def test_event_stream_submits_string_request_and_preserves_sdk_events(monkeypatc
 
     async def consume():
         async with LLM("https://provider.test", "secret", "model") as llm:
-            return [event async for event in llm.stream_events("hello")]
+            return [event async for event in llm.stream_events("hello", text_format=TEXT_FORMAT)]
 
     assert asyncio.run(consume()) == events
     assert observed["client"] == {
@@ -143,7 +160,11 @@ def test_event_stream_submits_string_request_and_preserves_sdk_events(monkeypatc
         "api_key": "secret",
         "max_retries": 0,
     }
-    assert observed["request"] == {"model": "model", "input": "hello"}
+    assert observed["request"] == {
+        "model": "model",
+        "input": "hello",
+        "text": {"format": TEXT_FORMAT},
+    }
     assert observed["closed"] is True
     assert observed["client_closed"] is True
 
@@ -188,6 +209,7 @@ def test_event_stream_forwards_input_items_instructions_and_tools(monkeypatch):
                 items,
                 instructions="Be concise",
                 tools=tools,
+                text_format=TEXT_FORMAT,
             )
         ]
 
@@ -197,6 +219,7 @@ def test_event_stream_forwards_input_items_instructions_and_tools(monkeypatch):
         "input": items,
         "instructions": "Be concise",
         "tools": tools,
+        "text": {"format": TEXT_FORMAT},
     }
 
 
@@ -231,7 +254,7 @@ def test_event_stream_closes_provider_stream_when_consumer_exits_early(monkeypat
 
     async def consume_one():
         llm = LLM("https://provider.test", "secret", "model")
-        stream = llm.stream_events("hello")
+        stream = llm.stream_events("hello", text_format=TEXT_FORMAT)
         assert await anext(stream) == "first event"
         await stream.aclose()
         await llm.close()
@@ -271,7 +294,7 @@ def test_event_stream_propagates_provider_error_without_retry(monkeypatch):
 
     async def consume():
         llm = LLM("https://provider.test", "secret", "model")
-        stream = llm.stream_events("hello")
+        stream = llm.stream_events("hello", text_format=TEXT_FORMAT)
         try:
             await anext(stream)
         finally:

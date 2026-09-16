@@ -55,3 +55,19 @@ _Avoid_: retry, silent failure
 **Planner**:
 The component that derives a complete Plan from the goal and Agent state without directly accessing tools or the environment.
 _Avoid_: executor, tool caller
+
+**Executor**:
+The component that makes one bounded Tool execution attempt for a Plan step, selecting from tools exposed by its host without changing the Plan or requesting a new Plan.
+_Avoid_: agent, planner, automatic tool loop
+
+**MCP tool set**:
+The named, host-configured collection of Model Context Protocol tools made available to an Executor for a Step execution.
+_Avoid_: tool permissions, tool server
+
+**Execution result**:
+The concise final explanation returned by an Executor after a completed Step execution, specifically stating how the Plan step's completion criterion was met.
+_Avoid_: transcript, tool trace
+
+**Tool-calling model**:
+A LangChain chat model configured for an OpenAI-compatible provider that can request tools from an MCP tool set during Step execution.
+_Avoid_: text stream, planner model

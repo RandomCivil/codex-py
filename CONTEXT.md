@@ -37,7 +37,7 @@ One sequentially executed unit of a Plan, with its intended outcome and completi
 _Avoid_: task, instruction, tool invocation
 
 **Step execution**:
-The Executor's single attempt to complete one Plan step in a Plan revision, recorded in Agent state by revision and step ID without changing the Plan. Its status is pending, running, completed, failed, or skipped; a failed step is returned to the Planner for revision.
+The Executor's single attempt to complete one Plan step in a Plan revision, recorded in Agent state by revision and step ID without changing the Plan. Its status is pending, running, completed, failed, skipped, or interrupted; an interrupted execution awaits an explicit recovery decision unless its tool side effects are known to be idempotent.
 _Avoid_: plan mutation, replanning, autonomous recovery
 
 **Agent**:
@@ -45,12 +45,40 @@ The top-level coordinator that owns the Plan–Execute loop, records execution r
 _Avoid_: executor, planner, worker
 
 **Agent state**:
-The durable coordination record supplied to the Planner: the goal, current Plan revision and position, execution results, and optional memory summary.
+The durable coordination record supplied to the Planner: the goal, current Plan revision and position, execution results, and optional memory summary. It is captured as Checkpoints for an Agent run.
 _Avoid_: session, context window
 
+**Agent run**:
+One identified invocation of the top-level Agent, addressed through the CLI by an application-generated UUIDv4 run ID and resumable from its stored Checkpoints. Only one active execution may own an Agent run under a renewable 60-second lease.
+_Avoid_: session, thread
+
+**Checkpoint**:
+One durable snapshot of a LangGraph execution within an Agent run, stored in MySQL for either the top-level Agent graph or a Step-execution graph. It contains unredacted state and is resumed only from its latest version.
+_Avoid_: savepoint, snapshot
+
+**Persistence failure**:
+The condition in which MySQL cannot record the next Checkpoint; it ends the Agent run before any further Tool execution.
+_Avoid_: degraded mode, best-effort persistence
+
+**Run lease**:
+A renewable 60-second MySQL claim granting one process exclusive authority to execute or resume an Agent run. It is renewed every 15 seconds and evaluated by MySQL server time.
+_Avoid_: lock, active session
+
+**Recovery decision**:
+The caller's explicit disposition of an interrupted Step execution: retry when its side effects are idempotent, record it as failed for replanning, or abort the Agent run as blocked.
+_Avoid_: automatic retry, crash recovery
+
+**Idempotent tool**:
+An MCP tool whose host registration explicitly declares that repeating the same invocation does not create an additional externally observable effect. An unannotated tool is non-idempotent, and an interrupted Step execution is retryable only when every tool it invoked is idempotent.
+_Avoid_: safe tool, retryable step
+
 **Blocked result**:
-The terminal Agent result emitted when its Plan-revision budget is exhausted without completing the goal; it retains the Plan and execution history.
+The terminal Agent result emitted when its Plan-revision budget is exhausted without completing the goal, or when the caller aborts an interrupted Agent run; it retains the Plan and execution history.
 _Avoid_: retry, silent failure
+
+**Run registry**:
+The project-owned MySQL record of an Agent run's identity, terminal status, configuration fingerprint, and Run lease. It does not duplicate Checkpoint state.
+_Avoid_: checkpoint table, session registry
 
 **Planner**:
 The component that derives a complete Plan from the goal and Agent state without directly accessing tools or the environment.

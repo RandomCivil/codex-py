@@ -5,8 +5,9 @@ import pytest
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
+from langgraph.checkpoint.memory import InMemorySaver
 
-from agent import Executor
+from agent import Executor, PersistenceError
 from memory.state import AgentState, Plan, PlanStep
 
 
@@ -82,6 +83,33 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert request["selected_plan_step"]["completion_criterion"] == "Release is available"
     assert request["plan_history"][0]["steps"][0]["id"] == "publish"
     assert request["memory_summary"] is None
+
+
+def test_executor_checkpoints_running_before_model_work(monkeypatch):
+    model = ControlledModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    saver = InMemorySaver()
+    plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish it", "Release is available"),))
+    state = AgentState("Prepare release", plan_history=(plan,))
+
+    async def run():
+        async with Executor(
+            model=model,
+            checkpointer=saver,
+            thread_id="run-1:r1:s-publish",
+        ) as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.status == "completed"
+    checkpoints = list(saver.list({"configurable": {"thread_id": "run-1:r1:s-publish"}}))
+    assert any(
+        checkpoint.checkpoint["channel_values"].get("execution", {}).get("status") == "running"
+        for checkpoint in checkpoints
+    )
 
 
 def _load_tools(tool):
@@ -338,3 +366,24 @@ def test_executor_forwards_host_configuration_and_reuses_one_mcp_session(monkeyp
     assert load_count == 1
     assert len(sessions) == 1
     assert sessions[0].closed
+
+
+def test_checkpointed_executor_fails_closed_before_tool_work(monkeypatch):
+    _, state = _plan_and_state()
+    executor = Executor(model=ControlledModel(), checkpointer=InMemorySaver(), run_id="run-1")
+
+    class UnavailableGraph:
+        async def ainvoke(self, payload, config):
+            raise OSError("checkpoint storage is unavailable")
+
+    async def install_unavailable_graph():
+        executor._graph = UnavailableGraph()
+
+    monkeypatch.setattr(executor, "_ensure_tools", install_unavailable_graph)
+
+    async def run():
+        async with executor:
+            with pytest.raises(PersistenceError, match="stopped before further tool work"):
+                await executor.execute(state, 1, "publish")
+
+    asyncio.run(run())

@@ -2,7 +2,14 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from memory.state import AgentState, Plan, PlanStep, StepExecution
+from memory.state import (
+    AgentState,
+    Plan,
+    PlanStep,
+    StepExecution,
+    deserialize_agent_state,
+    serialize_agent_state,
+)
 
 
 def test_plan_is_an_immutable_ordered_whole_goal_contract():
@@ -83,3 +90,39 @@ def test_agent_state_rejects_invalid_history_and_execution_associations():
 def test_step_execution_exposes_only_supported_statuses():
     with pytest.raises(ValueError, match="status"):
         StepExecution(1, "one", "done")
+
+
+def test_agent_state_round_trips_through_the_graph_state_adapter():
+    plan = Plan(1, "Prepare release", (PlanStep("inspect", "Inspect", "Risks listed"),))
+    state = AgentState(
+        "Prepare release",
+        plan_history=(plan,),
+        step_executions=(StepExecution(1, "inspect", "completed", result="Risks listed"),),
+        memory_summary="release memory",
+    )
+
+    encoded = serialize_agent_state(state)
+
+    assert encoded == {
+        "goal": "Prepare release",
+        "memory_summary": "release memory",
+        "plan_history": [
+            {
+                "revision": 1,
+                "goal": "Prepare release",
+                "steps": [
+                    {"id": "inspect", "intent": "Inspect", "completion_criterion": "Risks listed"}
+                ],
+            }
+        ],
+        "step_executions": [
+            {
+                "revision": 1,
+                "step_id": "inspect",
+                "status": "completed",
+                "result": "Risks listed",
+                "error": None,
+            }
+        ],
+    }
+    assert deserialize_agent_state(encoded) == state

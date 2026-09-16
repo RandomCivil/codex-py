@@ -1,7 +1,11 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from memory.state import AgentState, Plan, StepExecution
+from memory.state import AgentState, Plan, RecoveryDecision, StepExecution
+
+
+class RecoveryDecisionError(ValueError):
+    """The requested recovery decision is not safe or valid."""
 
 
 class PlannerLike(Protocol):
@@ -22,6 +26,53 @@ class AgentResult:
     state: AgentState
 
 
+def mark_stale_execution_interrupted(state: AgentState) -> AgentState:
+    """Record uncertain in-progress work before applying a recovery policy."""
+    running = next((item for item in state.step_executions if item.status == "running"), None)
+    if running is None:
+        return state
+    return state.with_step_execution(
+        StepExecution(
+            running.revision,
+            running.step_id,
+            "interrupted",
+            error=running.error or "Step execution was interrupted before recovery",
+        )
+    )
+
+
+def apply_recovery_decision(
+    state: AgentState, recovery: RecoveryDecision | None
+) -> tuple[AgentState, bool]:
+    """Apply the only safe disposition of interrupted work.
+
+    The boolean result is true when the caller must return a blocked result.
+    """
+    state = mark_stale_execution_interrupted(state)
+    interrupted = next((item for item in state.step_executions if item.status == "interrupted"), None)
+    if interrupted is None:
+        return state, False
+    if recovery is None:
+        raise RecoveryDecisionError("an interrupted Step execution requires --recovery")
+    if recovery == "retry":
+        raise RecoveryDecisionError("retry is unavailable for non-idempotent MCP tools")
+    if recovery == "abort":
+        return state, True
+    if recovery != "fail":
+        raise RecoveryDecisionError(f"invalid recovery decision: {recovery}")
+    return (
+        state.with_step_execution(
+            StepExecution(
+                interrupted.revision,
+                interrupted.step_id,
+                "failed",
+                error=interrupted.error or "Step execution was interrupted",
+            )
+        ),
+        False,
+    )
+
+
 class Agent:
     """Coordinate one serial Plan–Execute run for an Agent state."""
 
@@ -29,7 +80,10 @@ class Agent:
         self._planner = planner
         self._executor = executor
 
-    async def run(self, state: AgentState) -> AgentResult:
+    async def run(self, state: AgentState, recovery: RecoveryDecision | None = None) -> AgentResult:
+        state, abort = apply_recovery_decision(state, recovery)
+        if abort:
+            return AgentResult("blocked", state)
         async with self._executor as executor:
             while True:
                 if not state.plan_history:

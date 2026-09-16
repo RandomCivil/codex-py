@@ -12,6 +12,14 @@ from langgraph.prebuilt import ToolNode
 from memory.state import AgentState, PlanStep, StepExecution
 
 
+class ExecutorGraphState(MessagesState, total=False):
+    execution: dict[str, Any]
+
+
+class PersistenceError(RuntimeError):
+    """A checkpointed execution cannot safely continue after an unhandled failure."""
+
+
 class Executor:
     """Execute exactly one Plan step through a host-configured MCP tool set."""
 
@@ -37,6 +45,9 @@ class Executor:
         env: dict[str, str] | None = None,
         tool_allowlist: tuple[str, ...] | None = None,
         max_rounds: int = 10,
+        checkpointer: Any | None = None,
+        thread_id: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
@@ -55,6 +66,13 @@ class Executor:
         }
         self._tool_allowlist = set(tool_allowlist) if tool_allowlist is not None else None
         self._max_rounds = max_rounds
+        if checkpointer is not None and thread_id is None and run_id is None:
+            raise ValueError("a checkpointer requires thread_id or run_id")
+        if thread_id is not None and run_id is not None:
+            raise ValueError("thread_id and run_id are mutually exclusive")
+        self._checkpointer = checkpointer
+        self._thread_id = thread_id
+        self._run_id = run_id
         self._client = None
         self._session = None
         self._tools = None
@@ -85,13 +103,25 @@ class Executor:
             return StepExecution(revision, step_id, "failed", error="unknown plan revision or step")
 
         try:
+            self._active_step = step
+            self._active_revision = revision
             await self._ensure_tools()
+        except Exception as error:
+            return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
+
+        try:
             messages: list[BaseMessage] = [
                 SystemMessage(content=self._INSTRUCTIONS),
                 HumanMessage(content=json.dumps(_request_payload(state, revision, step), sort_keys=True)),
             ]
             self._rounds = 0
-            graph_result = await self._graph.ainvoke({"messages": messages})
+            config = None
+            thread_id = self._thread_id
+            if thread_id is None and self._run_id is not None:
+                thread_id = f"{self._run_id}:r{revision}:s{step_id}"
+            if thread_id is not None:
+                config = {"configurable": {"thread_id": thread_id}}
+            graph_result = await self._graph.ainvoke({"messages": messages}, config=config)
             tool_messages = [message for message in graph_result["messages"] if isinstance(message, ToolMessage)]
             tool_error = next((error for message in tool_messages if (error := _tool_error(message))), None)
             if tool_error is not None:
@@ -106,6 +136,8 @@ class Executor:
                 return StepExecution(revision, step_id, "failed", error="model did not return a valid completion result")
             return StepExecution(revision, step_id, "completed", result=result)
         except Exception as error:
+            if self._checkpointer is not None:
+                raise PersistenceError("checkpointed step execution stopped before further tool work") from error
             return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
 
     async def _ensure_tools(self) -> None:
@@ -135,13 +167,26 @@ class Executor:
         def route_after_tools(state: MessagesState) -> str:
             return END if any(_tool_error(message) is not None for message in _latest_tool_messages(state["messages"])) else "model"
 
-        graph = StateGraph(MessagesState)
+        graph = StateGraph(ExecutorGraphState)
+        async def mark_running(state: ExecutorGraphState) -> ExecutorGraphState:
+            step = self._active_step
+            revision = self._active_revision
+            return {
+                "execution": {
+                    "revision": revision,
+                    "step_id": step.id,
+                    "status": "running",
+                }
+            }
+
         graph.add_node("model", call_model)
+        graph.add_node("mark_running", mark_running)
         graph.add_node("tools", tool_node)
-        graph.add_edge(START, "model")
+        graph.add_edge(START, "mark_running")
+        graph.add_edge("mark_running", "model")
         graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
         graph.add_conditional_edges("tools", route_after_tools, {"model": "model", END: END})
-        self._graph = graph.compile()
+        self._graph = graph.compile(checkpointer=self._checkpointer)
 
     def _require_active(self) -> None:
         if not self._active:

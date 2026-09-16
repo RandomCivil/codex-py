@@ -10,7 +10,8 @@ dependencies = [
     "langgraph (>=1.2.11,<2.0.0)",
     "openai (>=1.66.0,<2.0.0)",
     "langchain-openai (>=1.1.0,<2.0.0)",
-    "langchain-mcp-adapters (>=0.2.1,<1.0.0)"
+    "langchain-mcp-adapters (>=0.2.1,<1.0.0)",
+    "langgraph-checkpoint-mysql[aiomysql] (>=3.0.0,<4.0.0)"
 ]
 
 
@@ -21,7 +22,13 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 packages = [{include = "agent"}, {include = "llm"}, {include = "memory"}]
 
+[project.scripts]
+agent = "agent.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest (>=9.1.1,<10.0.0)"
 ]
+
+[tool.pytest.ini_options]
+markers = ["integration: requires an explicitly configured local MySQL database"]

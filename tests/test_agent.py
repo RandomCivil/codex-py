@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from agent import Agent, AgentResult, PlanningValidationError
+from agent import Agent, AgentResult, PlanningValidationError, RecoveryDecisionError
 from memory.state import AgentState, Plan, PlanStep, StepExecution
 
 
@@ -245,7 +245,57 @@ def test_agent_blocks_on_a_recorded_failure_in_the_third_revision():
     assert (executor.entered, executor.exited) == (1, 1)
 
 
-def test_agent_resumes_all_incomplete_step_statuses_in_plan_order():
+def test_agent_fails_an_interrupted_step_into_immutable_replanning():
+    first_plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish", "Released"),))
+    second_plan = Plan(2, "Prepare release", (PlanStep("verify", "Verify", "Verified"),))
+    state = AgentState(
+        "Prepare release",
+        plan_history=(first_plan,),
+        step_executions=(StepExecution(1, "publish", "interrupted", error="owner stopped"),),
+    )
+
+    class Planner:
+        async def plan(self, current):
+            assert current.step_executions == (
+                StepExecution(1, "publish", "failed", error="owner stopped"),
+            )
+            return second_plan
+
+    result = asyncio.run(Agent(Planner(), ControlledExecutor()).run(state, recovery="fail"))
+
+    assert result.status == "completed"
+    assert result.state.plan_history == (first_plan, second_plan)
+    assert result.state.step_executions[0].status == "failed"
+
+
+def test_agent_aborts_an_interrupted_step_without_executing_more_work():
+    plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish", "Released"),))
+    state = AgentState(
+        "Prepare release",
+        plan_history=(plan,),
+        step_executions=(StepExecution(1, "publish", "interrupted", error="uncertain side effect"),),
+    )
+    executor = ControlledExecutor()
+
+    result = asyncio.run(Agent(object(), executor).run(state, recovery="abort"))
+
+    assert result == AgentResult("blocked", state)
+    assert executor.calls == []
+
+
+def test_agent_rejects_retry_for_an_interrupted_non_idempotent_step():
+    plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish", "Released"),))
+    state = AgentState(
+        "Prepare release",
+        plan_history=(plan,),
+        step_executions=(StepExecution(1, "publish", "interrupted"),),
+    )
+
+    with pytest.raises(RecoveryDecisionError, match="retry"):
+        asyncio.run(Agent(object(), ControlledExecutor()).run(state, recovery="retry"))
+
+
+def test_agent_requires_recovery_for_a_running_step_instead_of_reexecuting_it():
     plan = Plan(
         1,
         "Prepare release",
@@ -266,13 +316,9 @@ def test_agent_resumes_all_incomplete_step_statuses_in_plan_order():
     )
     executor = ControlledExecutor()
 
-    result = asyncio.run(Agent(object(), executor).run(state))
-
-    assert [call[2] for call in executor.calls] == ["pending", "running", "skipped"]
-    assert result.status == "completed"
-    assert result.state.step_executions[0] == StepExecution(
-        1, "completed", "completed", result="already done"
-    )
+    with pytest.raises(RecoveryDecisionError, match="requires"):
+        asyncio.run(Agent(object(), executor).run(state))
+    assert executor.calls == []
 
 
 def test_agent_propagates_planner_validation_errors_without_recording_execution():

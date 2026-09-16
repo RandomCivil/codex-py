@@ -1,9 +1,10 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 
-ExecutionStatus = Literal["pending", "running", "completed", "failed", "skipped"]
-_EXECUTION_STATUSES = frozenset({"pending", "running", "completed", "failed", "skipped"})
+ExecutionStatus = Literal["pending", "running", "interrupted", "completed", "failed", "skipped"]
+RecoveryDecision = Literal["retry", "fail", "abort"]
+_EXECUTION_STATUSES = frozenset({"pending", "running", "interrupted", "completed", "failed", "skipped"})
 
 
 def _require_text(value: str, field: str) -> None:
@@ -113,3 +114,67 @@ class AgentState:
             step_executions=remaining + (execution,),
             memory_summary=self.memory_summary,
         )
+
+
+def serialize_agent_state(state: AgentState) -> dict[str, Any]:
+    """Convert validated domain state to the JSON-compatible graph state."""
+    return {
+        "goal": state.goal,
+        "memory_summary": state.memory_summary,
+        "plan_history": [
+            {
+                "revision": plan.revision,
+                "goal": plan.goal,
+                "steps": [
+                    {
+                        "id": step.id,
+                        "intent": step.intent,
+                        "completion_criterion": step.completion_criterion,
+                    }
+                    for step in plan.steps
+                ],
+            }
+            for plan in state.plan_history
+        ],
+        "step_executions": [
+            {
+                "revision": execution.revision,
+                "step_id": execution.step_id,
+                "status": execution.status,
+                "result": execution.result,
+                "error": execution.error,
+            }
+            for execution in state.step_executions
+        ],
+    }
+
+
+def deserialize_agent_state(payload: dict[str, Any]) -> AgentState:
+    """Restore domain values and reapply all AgentState invariants."""
+    plans = tuple(
+        Plan(
+            item["revision"],
+            item["goal"],
+            tuple(
+                PlanStep(step["id"], step["intent"], step["completion_criterion"])
+                for step in item["steps"]
+            ),
+        )
+        for item in payload.get("plan_history", [])
+    )
+    executions = tuple(
+        StepExecution(
+            item["revision"],
+            item["step_id"],
+            item["status"],
+            result=item.get("result"),
+            error=item.get("error"),
+        )
+        for item in payload.get("step_executions", [])
+    )
+    return AgentState(
+        payload["goal"],
+        plan_history=plans,
+        step_executions=executions,
+        memory_summary=payload.get("memory_summary"),
+    )

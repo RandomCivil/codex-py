@@ -1,15 +1,32 @@
 import json
 import os
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, ConfigDict
 
 from memory.state import AgentState, PlanStep, StepExecution
+
+
+class _StepCompletion(BaseModel):
+    """The strictly structured receipt for a completed Plan step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    completed: Literal[True]
+    completion_criterion_met: Literal[True]
+    result: str
+
+
+def _report_step_completion(completed: bool, completion_criterion_met: bool, result: str) -> str:
+    """Record the final result for a completed Plan step."""
+    return result
 
 
 class ExecutorGraphState(MessagesState, total=False):
@@ -25,11 +42,8 @@ class Executor:
 
     _INSTRUCTIONS = (
         "Use the available MCP tools to complete the selected Plan step. "
-        "After successful tool use, return only strict JSON with exactly these "
-        "fields: completed and result. completed must be true and result must "
-        "briefly explain how the completion criterion was met. End result with "
-        "'Completion criterion met: <the exact selected completion criterion>'; "
-        "include a non-empty explanation before that statement."
+        "After successful tool use, stop requesting MCP tools. The Executor "
+        "will collect the required structured completion receipt separately."
     )
 
     def __init__(
@@ -45,7 +59,7 @@ class Executor:
         tool_cwd: str | None = None,
         env: dict[str, str] | None = None,
         tool_allowlist: tuple[str, ...] | None = None,
-        max_rounds: int = 10,
+        max_rounds: int = 50,
         checkpointer: Any | None = None,
         thread_id: str | None = None,
         run_id: str | None = None,
@@ -81,6 +95,7 @@ class Executor:
         self._session = None
         self._tools = None
         self._bound_model = None
+        self._completion_model = None
         self._active = False
 
     async def __aenter__(self) -> "Executor":
@@ -98,6 +113,7 @@ class Executor:
             self._session = None
             self._tools = None
             self._bound_model = None
+            self._completion_model = None
             self._active = False
 
     async def execute(self, state: AgentState, revision: int, step_id: str) -> StepExecution:
@@ -127,12 +143,25 @@ class Executor:
                 config = {"configurable": {"thread_id": thread_id}}
             graph_result = await self._graph.ainvoke({"messages": messages}, config=config)
             tool_messages = [message for message in graph_result["messages"] if isinstance(message, ToolMessage)]
-            tool_error = next((error for message in tool_messages if (error := _tool_error(message))), None)
-            if tool_error is not None:
-                return StepExecution(revision, step_id, "failed", error=tool_error)
             if not tool_messages:
                 return StepExecution(revision, step_id, "failed", error="model did not use an MCP tool")
-            final = graph_result["messages"][-1]
+            if not any(_tool_error(message) is None for message in tool_messages):
+                return StepExecution(revision, step_id, "failed", error="model did not complete a successful MCP tool call")
+            operational_final = graph_result["messages"][-1]
+            if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
+                return StepExecution(revision, step_id, "failed", error="tool round budget exhausted")
+            final = await self._completion_model.ainvoke(
+                [
+                    *graph_result["messages"],
+                    HumanMessage(
+                        content=(
+                            "Submit the completion receipt now. Explain how the criterion was met "
+                            "in result. Set completion_criterion_met to true only if the selected "
+                            f"completion criterion was met: {step.completion_criterion}"
+                        )
+                    ),
+                ]
+            )
             if self._trace is not None:
                 self._trace.llm_complete(
                     revision,
@@ -144,8 +173,6 @@ class Executor:
                 )
             result = _completion_result(final, step.completion_criterion)
             if result is None:
-                if isinstance(final, AIMessage) and final.tool_calls:
-                    return StepExecution(revision, step_id, "failed", error="tool round budget exhausted")
                 return StepExecution(revision, step_id, "failed", error="model did not return a valid completion result")
             return StepExecution(revision, step_id, "completed", result=result)
         except Exception as error:
@@ -163,8 +190,25 @@ class Executor:
         if self._tool_allowlist is not None:
             tools = [tool for tool in tools if tool.name in self._tool_allowlist]
         self._tools = tools
+        # MCP hosts do not promise OpenAI's strict function-tool schema, so
+        # operational tool use remains non-strict. Completion is instead a
+        # separate, strictly typed, forced function call after MCP work ends.
         self._bound_model = self._model.bind_tools(tools)
-        tool_node = ToolNode(tools, handle_tool_errors=False)
+        completion_tool = StructuredTool.from_function(
+            _report_step_completion,
+            name="report_step_completion",
+            args_schema=_StepCompletion,
+        )
+        self._completion_model = self._model.bind_tools(
+            [completion_tool],
+            tool_choice="report_step_completion",
+            strict=True,
+            parallel_tool_calls=False,
+        )
+        # Tool errors are part of the model/tool conversation: a bad argument or
+        # an MCP error must be returned to the model so it can correct its next
+        # call, rather than aborting this Step and causing top-level replanning.
+        tool_node = ToolNode(tools, handle_tool_errors=True)
         async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
             message = await self._bound_model.ainvoke(state["messages"])
             message = self._with_tool_cwd(message)
@@ -184,7 +228,7 @@ class Executor:
             return "tools" if self._rounds <= self._max_rounds else END
 
         def route_after_tools(state: MessagesState) -> str:
-            return END if any(_tool_error(message) is not None for message in _latest_tool_messages(state["messages"])) else "model"
+            return "model"
 
         graph = StateGraph(ExecutorGraphState)
         async def mark_running(state: ExecutorGraphState) -> ExecutorGraphState:
@@ -213,14 +257,18 @@ class Executor:
                             error=True,
                         )
                 raise
-            for message in result.get("messages", []):
+            messages = [
+                _as_error_tool_message(message)
+                for message in result.get("messages", [])
+            ]
+            for message in messages:
                 if isinstance(message, ToolMessage) and self._trace is not None:
                     self._trace.tool_result(
                         getattr(message, "name", "unknown"),
                         message.content,
                         error=_tool_error(message) is not None,
                     )
-            return result
+            return {**result, "messages": messages}
 
         graph.add_node("tools", call_tools)
         graph.add_edge(START, "mark_running")
@@ -296,31 +344,22 @@ def _request_payload(state: AgentState, revision: int, step: PlanStep) -> dict[s
 
 
 def _completion_result(message: AIMessage, completion_criterion: str) -> str | None:
-    if not isinstance(message.content, str):
+    if not isinstance(message, AIMessage) or len(message.tool_calls) != 1:
         return None
-    try:
-        document = json.loads(message.content)
-    except json.JSONDecodeError:
+    call = message.tool_calls[0]
+    if call.get("name") != "report_step_completion":
         return None
-    if not isinstance(document, dict) or set(document) != {"completed", "result"}:
+    document = call.get("args")
+    if not isinstance(document, dict) or set(document) != {"completed", "completion_criterion_met", "result"}:
         return None
-    if document["completed"] is not True or not isinstance(document["result"], str) or not document["result"].strip():
+    if (
+        document["completed"] is not True
+        or document["completion_criterion_met"] is not True
+        or not isinstance(document["result"], str)
+        or not document["result"].strip()
+    ):
         return None
-    result = document["result"].strip()
-    criterion_statement = f"Completion criterion met: {completion_criterion}"
-    explanation = result.removesuffix(criterion_statement).strip()
-    if not result.endswith(criterion_statement) or not explanation:
-        return None
-    return result
-
-
-def _latest_tool_messages(messages: list[BaseMessage]) -> list[ToolMessage]:
-    tool_messages: list[ToolMessage] = []
-    for message in reversed(messages):
-        if not isinstance(message, ToolMessage):
-            break
-        tool_messages.append(message)
-    return tool_messages
+    return document["result"].strip()
 
 
 def _tool_error(message: BaseMessage) -> str | None:
@@ -333,6 +372,13 @@ def _tool_error(message: BaseMessage) -> str | None:
         if exit_code not in (None, 0):
             return f"Atom exec failed with exit code {exit_code}"
     return None
+
+
+def _as_error_tool_message(message: BaseMessage) -> BaseMessage:
+    """Mark nonzero Atom exec results as errors before returning them to the model."""
+    if isinstance(message, ToolMessage) and _tool_error(message) is not None:
+        return message.model_copy(update={"status": "error"})
+    return message
 
 
 def _exit_code(content: Any) -> int | None:

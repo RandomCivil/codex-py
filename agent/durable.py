@@ -182,6 +182,7 @@ async def _run(
     goal: str | None,
     recovery: str | None = None,
     cwd: str | None = None,
+    log_level: str = "info",
 ) -> dict[str, Any]:
     model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     tool_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
@@ -212,7 +213,7 @@ async def _run(
                 try:
                     from .trace import RunTrace
 
-                    trace = RunTrace()
+                    trace = RunTrace(level=log_level, run_id=run_id)
                     llm = LLM(
                         os.environ.get("OPENAI_BASE_URL", ""),
                         os.environ.get("OPENAI_API_KEY", ""),
@@ -249,12 +250,18 @@ async def _run(
             await registry.release(run_id, owner)
 
 
-def run_agent(url: str, goal: str, cwd: str | None = None) -> dict[str, Any]:
-    return asyncio.run(_run(url, new_run_id(), goal, cwd=cwd))
+def run_agent(url: str, goal: str, cwd: str | None = None, log_level: str = "info") -> dict[str, Any]:
+    return asyncio.run(_run(url, new_run_id(), goal, cwd=cwd, log_level=log_level))
 
 
-def resume_agent(url: str, run_id: str, recovery: str | None = None, cwd: str | None = None) -> dict[str, Any]:
-    return asyncio.run(_run(url, run_id, None, recovery, cwd))
+def resume_agent(
+    url: str,
+    run_id: str,
+    recovery: str | None = None,
+    cwd: str | None = None,
+    log_level: str = "info",
+) -> dict[str, Any]:
+    return asyncio.run(_run(url, run_id, None, recovery, cwd, log_level))
 
 
 async def _renew_lease(registry: Any, run_id: str, owner: str) -> None:

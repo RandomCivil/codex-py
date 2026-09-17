@@ -58,6 +58,20 @@ def test_run_forwards_cwd_to_agent(monkeypatch, capsys):
     assert calls == [("mysql://user:pass@localhost/db", "Prepare release", "/workspace/project")]
 
 
+def test_run_forwards_log_level_to_agent(monkeypatch, capsys):
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def run(url, goal, log_level):
+        calls.append((url, goal, log_level))
+        return {"status": "completed"}
+
+    monkeypatch.setattr("agent.cli.run_agent", run)
+
+    assert main(["run", "--goal", "Prepare release", "--log-level", "error"]) == 0
+    assert calls == [("mysql://user:pass@localhost/db", "Prepare release", "error")]
+
+
 def test_resume_requires_a_run_id(monkeypatch, capsys):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
 

@@ -81,6 +81,10 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert request["selected_plan_step"]["completion_criterion"] == "Release is available"
     assert request["plan_history"][0]["steps"][0]["id"] == "publish"
     assert request["memory_summary"] is None
+    completion_prompt = model.calls[2][-1].content
+    assert "handoff and evidence summary" in completion_prompt
+    assert "subsequent Plan steps will receive" in completion_prompt
+    assert "message transcript" in completion_prompt
     # MCP tools remain non-strict, while the separate completion tool is
     # forced and strictly typed.
     assert "response_format" not in model.bind_options
@@ -597,8 +601,9 @@ def test_checkpointed_executor_fails_closed_before_tool_work(monkeypatch):
         async def ainvoke(self, payload, config):
             raise OSError("checkpoint storage is unavailable")
 
-    async def install_unavailable_graph():
+    async def install_unavailable_graph(state, revision, step):
         executor._graph = UnavailableGraph()
+        return await executor._graph.ainvoke({}, None)
 
     monkeypatch.setattr(executor, "_execute_with_tools", install_unavailable_graph)
 

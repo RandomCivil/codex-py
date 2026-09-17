@@ -50,6 +50,12 @@ class Plan:
 
 @dataclass(frozen=True, slots=True)
 class StepExecution:
+    """The durable status and next-step handoff for one Plan step.
+
+    For completed executions, ``result`` is a concise evidence summary derived
+    from the executor's graph messages, rather than the raw graph state.
+    """
+
     revision: int
     step_id: str
     status: ExecutionStatus

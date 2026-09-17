@@ -37,6 +37,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-id")
     parser.add_argument("--recovery", choices=("retry", "fail", "abort"))
     parser.add_argument("--cwd", help="working directory supplied to Atom MCP tool calls")
+    parser.add_argument("--log-level", "--level", dest="log_level", choices=("info", "error"))
     try:
         args = parser.parse_args(argv)
     except InvalidInvocationError as exc:
@@ -52,8 +53,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError
         except (ValueError, AttributeError):
             return _emit({"command": "resume", "status": "invalid", "error": "resume requires a UUIDv4 --run-id"}, EXIT_INVALID_INVOCATION)
-    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd):
-        return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, or --cwd"}, EXIT_INVALID_INVOCATION)
+    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd or args.log_level):
+        return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, --cwd, or --log-level"}, EXIT_INVALID_INVOCATION)
 
     if not os.environ.get("CODEX_MYSQL_URL"):
         return _emit(
@@ -71,7 +72,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = {"command": args.command, "status": "completed"}
         elif args.command == "run":
             if args.cwd:
-                run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, args.cwd)
+                if args.log_level:
+                    run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, args.cwd, args.log_level)
+                else:
+                    run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, args.cwd)
+            elif args.log_level:
+                run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, log_level=args.log_level)
             else:
                 run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal)
             result = {"command": args.command, **run}
@@ -79,12 +85,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             if args.recovery is None:
                 if args.cwd:
-                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, cwd=args.cwd)
+                    if args.log_level:
+                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, cwd=args.cwd, log_level=args.log_level)
+                    else:
+                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, cwd=args.cwd)
+                elif args.log_level:
+                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, log_level=args.log_level)
                 else:
                     resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id)
             else:
                 if args.cwd:
-                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, args.cwd)
+                    if args.log_level:
+                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, args.cwd, args.log_level)
+                    else:
+                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, args.cwd)
+                elif args.log_level:
+                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, log_level=args.log_level)
                 else:
                     resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery)
             result = {"command": args.command, **resumed}

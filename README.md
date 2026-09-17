@@ -92,6 +92,8 @@ CLI 输出包含 `command`、`status`、`run_id` 等字段；发生错误时还�
 
 运行过程日志使用带有 `[llm thought]`、`[llm output]`、`[plan]`、`[execute]`、`[tool call]` 和 `[tool result]` 前缀的文本格式写入 stderr，因此不会污染 stdout 中的一行 JSON 结果。
 
+每行运行日志都会以 `run_id` 作为前缀。默认日志级别为 `info`。需要降低输出量时可使用 `--log-level error`：隐藏 LLM 流式输出，只保留最终 LLM 返回、Plan/Execute 状态和工具调用信息；tool result 只显示工具名，tool call 保留传入参数。
+
 | 退出码 | 含义 |
 | ---: | --- |
 | 0 | completed |

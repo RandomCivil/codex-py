@@ -9,23 +9,29 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from memory.state import AgentState, PlanStep, StepExecution
 
 
 class _StepCompletion(BaseModel):
-    """The strictly structured receipt for a completed Plan step."""
+    """The strictly structured handoff receipt for a completed Plan step."""
 
     model_config = ConfigDict(extra="forbid")
 
     completed: Literal[True]
     completion_criterion_met: Literal[True]
-    result: str
+    result: str = Field(
+        description=(
+            "A concise handoff and evidence summary for the next Plan step. "
+            "State the material outcome and the supporting tool output, artifact, "
+            "identifier, or state fact; do not reproduce the message transcript."
+        )
+    )
 
 
 def _report_step_completion(completed: bool, completion_criterion_met: bool, result: str) -> str:
-    """Record the final result for a completed Plan step."""
+    """Record the completed step's handoff and evidence summary."""
     return result
 
 
@@ -96,6 +102,7 @@ class Executor:
         self._tools = None
         self._bound_model = None
         self._completion_model = None
+        self._graph = None
         self._active = False
 
     async def __aenter__(self) -> "Executor":
@@ -114,6 +121,7 @@ class Executor:
             self._tools = None
             self._bound_model = None
             self._completion_model = None
+            self._graph = None
             self._active = False
 
     # one plan step execution
@@ -126,32 +134,22 @@ class Executor:
         try:
             self._active_step = step
             self._active_revision = revision
-            await self._execute_with_tools()
+            graph_result = await self._execute_with_tools(state, revision, step)
         except Exception as error:
+            if self._checkpointer is not None:
+                raise PersistenceError("checkpointed step execution stopped before further tool work") from error
             return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
 
-        return await self._check_step_completion(state, revision, step_id, step)
+        return await self._check_step_completion(graph_result, revision, step_id, step)
 
     async def _check_step_completion(
         self,
-        state: AgentState,
+        graph_result: dict[str, Any],
         revision: int,
         step_id: str,
         step: PlanStep,
     ) -> StepExecution:
         try:
-            messages: list[BaseMessage] = [
-                SystemMessage(content=self._INSTRUCTIONS),
-                HumanMessage(content=json.dumps(_request_payload(state, revision, step), sort_keys=True)),
-            ]
-            self._rounds = 0
-            config = None
-            thread_id = self._thread_id
-            if thread_id is None and self._run_id is not None:
-                thread_id = f"{self._run_id}:r{revision}:s{step_id}"
-            if thread_id is not None:
-                config = {"configurable": {"thread_id": thread_id}}
-            graph_result = await self._graph.ainvoke({"messages": messages}, config=config)
             tool_messages = [message for message in graph_result["messages"] if isinstance(message, ToolMessage)]
             if tool_messages and not any(_tool_error(message) is None for message in tool_messages):
                 return StepExecution(revision, step_id, "failed", error="model did not complete a successful MCP tool call")
@@ -163,9 +161,14 @@ class Executor:
                     *graph_result["messages"],
                     HumanMessage(
                         content=(
-                            "Submit the completion receipt now. Explain how the criterion was met "
-                            "in result. Set completion_criterion_met to true only if the selected "
-                            f"completion criterion was met: {step.completion_criterion}"
+                            "Submit the completion receipt now. `result` is the handoff and "
+                            "evidence summary that subsequent Plan steps will receive. Derive it "
+                            "only from the preceding messages: state the material outcome and the "
+                            "supporting tool output, artifact path, resource identifier, or state "
+                            "fact. Be concise; do not merely say it completed or reproduce the "
+                            "message transcript. Set completion_criterion_met to true only if the "
+                            "selected completion criterion was met: "
+                            f"{step.completion_criterion}"
                         )
                     ),
                 ]
@@ -188,35 +191,42 @@ class Executor:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
             return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
 
-    async def _execute_with_tools(self) -> None:
-        if self._tools is not None:
-            return
-        self._client = MultiServerMCPClient({"atom": self._connection})
-        self._session = self._client.session("atom")
-        session = await self._session.__aenter__()
-        tools = await load_mcp_tools(session)
-        if self._tool_allowlist is not None:
-            tools = [tool for tool in tools if tool.name in self._tool_allowlist]
-        self._tools = tools
-        # MCP hosts do not promise OpenAI's strict function-tool schema, so
-        # operational tool use remains non-strict. Completion is instead a
-        # separate, strictly typed, forced function call after MCP work ends.
-        self._bound_model = self._model.bind_tools(tools)
-        completion_tool = StructuredTool.from_function(
-            _report_step_completion,
-            name="report_step_completion",
-            args_schema=_StepCompletion,
-        )
-        self._completion_model = self._model.bind_tools(
-            [completion_tool],
-            tool_choice="report_step_completion",
-            strict=True,
-            parallel_tool_calls=False,
-        )
-        # Tool errors are part of the model/tool conversation: a bad argument or
-        # an MCP error must be returned to the model so it can correct its next
-        # call, rather than aborting this Step and causing top-level replanning.
-        tool_node = ToolNode(tools, handle_tool_errors=True)
+    async def _execute_with_tools(
+        self,
+        state: AgentState,
+        revision: int,
+        step: PlanStep,
+    ) -> dict[str, Any]:
+        if self._tools is None:
+            self._client = MultiServerMCPClient({"atom": self._connection})
+            self._session = self._client.session("atom")
+            session = await self._session.__aenter__()
+            tools = await load_mcp_tools(session)
+            if self._tool_allowlist is not None:
+                tools = [tool for tool in tools if tool.name in self._tool_allowlist]
+            self._tools = tools
+            # MCP hosts do not promise OpenAI's strict function-tool schema, so
+            # operational tool use remains non-strict. Completion is instead a
+            # separate, strictly typed, forced function call after MCP work ends.
+            self._bound_model = self._model.bind_tools(tools)
+            completion_tool = StructuredTool.from_function(
+                _report_step_completion,
+                name="report_step_completion",
+                args_schema=_StepCompletion,
+            )
+            self._completion_model = self._model.bind_tools(
+                [completion_tool],
+                tool_choice="report_step_completion",
+                strict=True,
+                parallel_tool_calls=False,
+            )
+            # Tool errors are part of the model/tool conversation: a bad argument or
+            # an MCP error must be returned to the model so it can correct its next
+            # call, rather than aborting this Step and causing top-level replanning.
+            tool_node = ToolNode(tools, handle_tool_errors=True)
+        else:
+            tool_node = ToolNode(self._tools, handle_tool_errors=True)
+
         async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
             message = await self._bound_model.ainvoke(state["messages"])
             message = self._with_tool_cwd(message)
@@ -283,7 +293,21 @@ class Executor:
         graph.add_edge("mark_running", "model")
         graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
         graph.add_conditional_edges("tools", route_after_tools, {"model": "model", END: END})
-        self._graph = graph.compile(checkpointer=self._checkpointer)
+        if self._graph is None:
+            self._graph = graph.compile(checkpointer=self._checkpointer)
+
+        messages: list[BaseMessage] = [
+            SystemMessage(content=self._INSTRUCTIONS),
+            HumanMessage(content=json.dumps(_request_payload(state, revision, step), sort_keys=True)),
+        ]
+        self._rounds = 0
+        config = None
+        thread_id = self._thread_id
+        if thread_id is None and self._run_id is not None:
+            thread_id = f"{self._run_id}:r{revision}:s{step.id}"
+        if thread_id is not None:
+            config = {"configurable": {"thread_id": thread_id}}
+        return await self._graph.ainvoke({"messages": messages}, config=config)
 
     def _require_active(self) -> None:
         if not self._active:

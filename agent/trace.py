@@ -18,6 +18,11 @@ class RunTrace:
         self._output_buffer = ""
 
     def llm_event(self, event: Any) -> None:
+        # Keep the complete provider event available for debugging.  The
+        # specialised lines below are still useful for following a run, but
+        # they intentionally omit fields such as ids, status, usage, and
+        # provider-specific metadata.
+        self._line(f"[llm event] data={_compact(event)}")
         event_type = getattr(event, "type", "")
         if event_type in {"response.reasoning.delta", "response.reasoning_summary_text.delta"}:
             self._write("thought", getattr(event, "delta", ""))
@@ -66,9 +71,25 @@ class RunTrace:
 
 
 def _compact(value: Any) -> str:
+    value = _as_serializable(value)
     if isinstance(value, Mapping | list | tuple):
         try:
             return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
         except (TypeError, ValueError):
             pass
     return str(value)
+
+
+def _as_serializable(value: Any) -> Any:
+    """Convert SDK model objects to their complete response payload."""
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except (TypeError, ValueError):
+            return model_dump()
+    if isinstance(value, Mapping | list | tuple):
+        return value
+    if hasattr(value, "__dict__"):
+        return vars(value)
+    return value

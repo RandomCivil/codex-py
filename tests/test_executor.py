@@ -93,6 +93,38 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     }
 
 
+def test_executor_completes_a_plan_step_without_an_mcp_tool_call(monkeypatch):
+    class NoToolCompletionModel:
+        def __init__(self):
+            self.calls = []
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(content="The selected Plan step is already complete.")
+            return _completion_message("The selected Plan step was already complete; Release is available.")
+
+    model = NoToolCompletionModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.status == "completed", execution.error
+    assert execution.result == "The selected Plan step was already complete; Release is available."
+    assert len(model.calls) == 2
+    assert not any(isinstance(message, ToolMessage) for message in model.calls[1])
+
+
 def test_executor_checkpoints_running_before_model_work(monkeypatch):
     model = ControlledModel()
     tool = StructuredTool.from_function(record)

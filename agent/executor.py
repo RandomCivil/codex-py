@@ -41,8 +41,8 @@ class Executor:
     """Execute exactly one Plan step through a host-configured MCP tool set."""
 
     _INSTRUCTIONS = (
-        "Use the available MCP tools to complete the selected Plan step. "
-        "After successful tool use, stop requesting MCP tools. The Executor "
+        "Use the available MCP tools when they are needed to complete the selected Plan step. "
+        "If no tool use is needed, stop requesting MCP tools. The Executor "
         "will collect the required structured completion receipt separately."
     )
 
@@ -153,9 +153,7 @@ class Executor:
                 config = {"configurable": {"thread_id": thread_id}}
             graph_result = await self._graph.ainvoke({"messages": messages}, config=config)
             tool_messages = [message for message in graph_result["messages"] if isinstance(message, ToolMessage)]
-            if not tool_messages:
-                return StepExecution(revision, step_id, "failed", error="model did not use an MCP tool")
-            if not any(_tool_error(message) is None for message in tool_messages):
+            if tool_messages and not any(_tool_error(message) is None for message in tool_messages):
                 return StepExecution(revision, step_id, "failed", error="model did not complete a successful MCP tool call")
             operational_final = graph_result["messages"][-1]
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:

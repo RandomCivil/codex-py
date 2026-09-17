@@ -116,6 +116,7 @@ class Executor:
             self._completion_model = None
             self._active = False
 
+    # one plan step execution
     async def execute(self, state: AgentState, revision: int, step_id: str) -> StepExecution:
         self._require_active()
         step = _resolve_step(state, revision, step_id)
@@ -125,10 +126,19 @@ class Executor:
         try:
             self._active_step = step
             self._active_revision = revision
-            await self._ensure_tools()
+            await self._execute_with_tools()
         except Exception as error:
             return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
 
+        return await self._check_step_completion(state, revision, step_id, step)
+
+    async def _check_step_completion(
+        self,
+        state: AgentState,
+        revision: int,
+        step_id: str,
+        step: PlanStep,
+    ) -> StepExecution:
         try:
             messages: list[BaseMessage] = [
                 SystemMessage(content=self._INSTRUCTIONS),
@@ -180,7 +190,7 @@ class Executor:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
             return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
 
-    async def _ensure_tools(self) -> None:
+    async def _execute_with_tools(self) -> None:
         if self._tools is not None:
             return
         self._client = MultiServerMCPClient({"atom": self._connection})

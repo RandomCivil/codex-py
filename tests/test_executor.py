@@ -568,7 +568,7 @@ def test_checkpointed_executor_fails_closed_before_tool_work(monkeypatch):
     async def install_unavailable_graph():
         executor._graph = UnavailableGraph()
 
-    monkeypatch.setattr(executor, "_ensure_tools", install_unavailable_graph)
+    monkeypatch.setattr(executor, "_execute_with_tools", install_unavailable_graph)
 
     async def run():
         async with executor:

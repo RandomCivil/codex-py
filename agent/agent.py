@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from memory.state import AgentState, Plan, RecoveryDecision, StepExecution
-
+from agent.executor import Executor
 
 class RecoveryDecisionError(ValueError):
     """The requested recovery decision is not safe or valid."""
@@ -76,7 +76,7 @@ def apply_recovery_decision(
 class Agent:
     """Coordinate one serial Plan–Execute run for an Agent state."""
 
-    def __init__(self, planner: PlannerLike, executor: ExecutorLike) -> None:
+    def __init__(self, planner: PlannerLike, executor: ExecutorLike|Executor) -> None:
         self._planner = planner
         self._executor = executor
 
@@ -103,6 +103,7 @@ class Agent:
                     continue
 
                 for step in plan.steps:
+                    # state is a communitation between plan steps
                     execution = _execution_for(state, plan.revision, step.id)
                     if execution is not None:
                         if execution.status == "completed":

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from memory.state import AgentState, Plan, RecoveryDecision, StepExecution
+from memory.state import AgentState, ExecutionOutcome, Plan, RecoveryDecision, StepExecution
 from agent.executor import Executor
 
 class RecoveryDecisionError(ValueError):
@@ -17,7 +17,7 @@ class ExecutorLike(Protocol):
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
 
-    async def execute(self, state: AgentState, revision: int, step_id: str) -> StepExecution: ...
+    async def execute(self, state: AgentState, revision: int, step_id: str) -> ExecutionOutcome: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +111,8 @@ class Agent:
                         if execution.status == "failed":
                             failed = True
                             break
-                    execution = await executor.execute(state, plan.revision, step.id)
+                    outcome = await executor.execute(state, plan.revision, step.id)
+                    execution = outcome.execution
                     state = state.with_step_execution(execution)
                     if execution.status == "failed":
                         failed = True

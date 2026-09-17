@@ -1,5 +1,6 @@
 from .agent import Agent, AgentResult, RecoveryDecisionError, apply_recovery_decision, mark_stale_execution_interrupted
 from .planner import Planner, PlanningValidationError
 from .executor import Executor, PersistenceError
+from memory.state import ContextUpdate, ExecutionOutcome, StepContext
 
-__all__ = ["Agent", "AgentResult", "Executor", "Planner", "PlanningValidationError", "PersistenceError", "RecoveryDecisionError", "apply_recovery_decision", "mark_stale_execution_interrupted"]
+__all__ = ["Agent", "AgentResult", "Executor", "Planner", "PlanningValidationError", "PersistenceError", "RecoveryDecisionError", "apply_recovery_decision", "mark_stale_execution_interrupted", "ContextUpdate", "ExecutionOutcome", "StepContext"]

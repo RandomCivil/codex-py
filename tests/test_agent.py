@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from agent import Agent, AgentResult, PlanningValidationError, RecoveryDecisionError
-from memory.state import AgentState, Plan, PlanStep, StepExecution
+from memory.state import AgentState, ContextUpdate, ExecutionOutcome, Plan, PlanStep, StepExecution
 
 
 class ControlledPlanner:
@@ -32,9 +32,13 @@ class ControlledExecutor:
 
     async def execute(self, state, revision, step_id):
         self.calls.append((state, revision, step_id))
-        return self.executions.get(
+        execution = self.executions.get(
             (revision, step_id),
             StepExecution(revision, step_id, "completed", result=f"{step_id} done"),
+        )
+        return ExecutionOutcome(
+            execution,
+            ContextUpdate() if execution.status == "completed" else None,
         )
 
 
@@ -161,7 +165,7 @@ def test_agent_blocks_after_third_failed_revision_without_requesting_a_fourth_pl
     class AlwaysFailingExecutor(ControlledExecutor):
         async def execute(self, state, revision, step_id):
             self.calls.append((state, revision, step_id))
-            return StepExecution(revision, step_id, "failed", error=f"revision {revision} failed")
+            return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"revision {revision} failed"))
 
     planner = SequentialPlanner()
     executor = AlwaysFailingExecutor()

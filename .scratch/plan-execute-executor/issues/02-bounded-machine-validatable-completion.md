@@ -1,11 +1,11 @@
 # 02: Enforce bounded, machine-validatable completion
 
-**What to build:** A completed Step execution is accepted when the model submits a forced, strict `report_step_completion` function call containing `completed: true`, `completion_criterion_met: true`, and a concise result. MCP tool use is optional because a Plan step may need no tool call; when MCP tools are used, at least one must succeed. The model/tool workflow has a configurable positive round budget with a default of fifty, and unsupported exits are recorded as failed Step executions.
+**What to build:** A completed Step execution is accepted when the model submits a strict JSON Schema response containing `completed: true`, `completion_criterion_met: true`, and a concise result. MCP tool use is optional because a Plan step may need no tool call; when MCP tools are used, at least one must succeed. The model/tool workflow has a configurable positive round budget with a default of fifty, and unsupported exits are recorded as failed Step executions.
 
 **Blocked by:** 01 — Deliver a usable Atom MCP Plan-step Executor.
 
 **Status:** ready-for-agent
 
-- [x] A no-tool response can complete when followed by a valid completion-tool call; malformed or incomplete completion-tool calls, false completion declarations, and invalid results return failed Step executions.
+- [x] A no-tool response can complete when followed by a valid JSON Schema completion response; malformed or incomplete responses, false completion declarations, and invalid results return failed Step executions.
 - [x] The Executor permits a configurable positive tool-round budget, defaults it to fifty, and returns a failed Step execution when that budget is exhausted.
 - [x] A completed Step execution records only the concise completion result, not model-message or MCP-tool transcripts.

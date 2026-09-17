@@ -8,7 +8,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent import Executor, PersistenceError
-from memory.state import AgentState, Plan, PlanStep
+from memory.state import AgentState, ContextUpdate, ExecutionOutcome, Plan, PlanStep, StepContext
 
 
 class ControlledModel:
@@ -20,6 +20,11 @@ class ControlledModel:
         self.tools = tools
         self.bind_options = kwargs
         self.bindings.append((tools, kwargs))
+        return self
+
+    def bind(self, **kwargs):
+        self.bind_options = kwargs
+        self.bindings.append((None, kwargs))
         return self
 
     async def ainvoke(self, messages):
@@ -70,10 +75,10 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
 
     execution = asyncio.run(run())
 
-    assert execution.revision == 1
-    assert execution.step_id == "publish"
-    assert execution.status == "completed", execution.error
-    assert execution.result == "Published the release. Completion criterion met: Release is available"
+    assert execution.execution.revision == 1
+    assert execution.execution.step_id == "publish"
+    assert execution.execution.status == "completed", execution.execution.error
+    assert execution.execution.result == "Published the release. Completion criterion met: Release is available"
     assert state.step_executions == ()
     assert state.plan_history == (plan,)
     request = json.loads(model.calls[0][1].content)
@@ -81,20 +86,86 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert request["selected_plan_step"]["completion_criterion"] == "Release is available"
     assert request["plan_history"][0]["steps"][0]["id"] == "publish"
     assert request["memory_summary"] is None
+    assert model.calls[0][2].content == (
+        "## Step context\n\n"
+        "### Files read\n"
+        "- (none)\n\n"
+        "### Files modified\n"
+        "- (none)\n\n"
+        "### Observations\n"
+        "- (none)"
+    )
     completion_prompt = model.calls[2][-1].content
     assert "handoff and evidence summary" in completion_prompt
     assert "subsequent Plan steps will receive" in completion_prompt
     assert "message transcript" in completion_prompt
-    # MCP tools remain non-strict, while the separate completion tool is
-    # forced and strictly typed.
-    assert "response_format" not in model.bind_options
+    # MCP tools remain non-strict; the separate completion reply uses JSON Schema.
     completion_tools, completion_options = model.bindings[1]
-    assert [tool.name for tool in completion_tools] == ["report_step_completion"]
-    assert completion_options == {
-        "tool_choice": "report_step_completion",
-        "strict": True,
-        "parallel_tool_calls": False,
-    }
+    assert completion_tools is None
+    response_format = completion_options["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == "step_completion"
+    assert response_format["json_schema"]["strict"] is True
+
+
+def test_executor_returns_context_update_and_sends_step_context_separately(monkeypatch):
+    class ContextModel(ControlledModel):
+        async def ainvoke(self, messages):
+            if len(self.calls) == 0:
+                assert messages[1].content.startswith("{")
+                assert messages[2].content == (
+                    "## Step context\n\n"
+                    "### Files read\n"
+                    "- docs/overview.md\n\n"
+                    "### Files modified\n"
+                    "- src/agent.py\n\n"
+                    "### Observations\n"
+                    "- The execution boundary is already isolated."
+                )
+            if len(self.calls) == 2:
+                self.calls.append(messages)
+                return AIMessage(
+                    content=json.dumps(
+                        {
+                            "completed": True,
+                            "completion_criterion_met": True,
+                            "result": "Published the release.",
+                            "files_read": ["docs/overview.md"],
+                            "files_modified": ["src/agent.py"],
+                            "observations": ["The execution boundary is already isolated."],
+                        }
+                    ),
+                )
+            return await super().ainvoke(messages)
+
+    model = ContextModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model, tool_cwd="/workspace/project") as executor:
+            return await executor.execute(
+                state,
+                1,
+                "publish",
+                StepContext(
+                    files_read=("docs/overview.md",),
+                    files_modified=("src/agent.py",),
+                    observations=("The execution boundary is already isolated.",),
+                ),
+            )
+
+    outcome = asyncio.run(run())
+
+    assert isinstance(outcome, ExecutionOutcome)
+    assert outcome.execution.status == "completed", outcome.execution.error
+    assert outcome.context_update == ContextUpdate(
+        files_read=("docs/overview.md",),
+        files_modified=("src/agent.py",),
+        observations=("The execution boundary is already isolated.",),
+    )
 
 
 def test_executor_completes_a_plan_step_without_an_mcp_tool_call(monkeypatch):
@@ -103,6 +174,9 @@ def test_executor_completes_a_plan_step_without_an_mcp_tool_call(monkeypatch):
             self.calls = []
 
         def bind_tools(self, tools, **kwargs):
+            return self
+
+        def bind(self, **kwargs):
             return self
 
         async def ainvoke(self, messages):
@@ -123,8 +197,8 @@ def test_executor_completes_a_plan_step_without_an_mcp_tool_call(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed", execution.error
-    assert execution.result == "The selected Plan step was already complete; Release is available."
+    assert execution.execution.status == "completed", execution.execution.error
+    assert execution.execution.result == "The selected Plan step was already complete; Release is available."
     assert len(model.calls) == 2
     assert not any(isinstance(message, ToolMessage) for message in model.calls[1])
 
@@ -148,10 +222,11 @@ def test_executor_checkpoints_running_before_model_work(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed"
+    assert execution.execution.status == "completed"
     checkpoints = list(saver.list({"configurable": {"thread_id": "run-1:r1:s-publish"}}))
     assert any(
-        checkpoint.checkpoint["channel_values"].get("execution", {}).get("status") == "running"
+        checkpoint.checkpoint["channel_values"].get("execution") is not None
+        and checkpoint.checkpoint["channel_values"]["execution"].status == "running"
         for checkpoint in checkpoints
     )
 
@@ -180,8 +255,8 @@ def test_executor_rejects_an_unknown_plan_step_without_opening_mcp(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "failed"
-    assert "step" in execution.error.lower()
+    assert execution.execution.status == "failed"
+    assert "step" in execution.execution.error.lower()
     assert not opened
 
 
@@ -191,6 +266,9 @@ class ToolThenToolModel:
 
     def bind_tools(self, tools, **kwargs):
         self.tools = tools
+        return self
+
+    def bind(self, **kwargs):
         return self
 
     async def ainvoke(self, messages):
@@ -219,8 +297,8 @@ def test_executor_fails_when_tool_round_budget_is_exhausted(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "failed"
-    assert "round" in execution.error.lower()
+    assert execution.execution.status == "failed"
+    assert "round" in execution.execution.error.lower()
     assert len(model.calls) == 2
 
 
@@ -230,18 +308,16 @@ def _completion_message(
     criterion_met=True,
 ):
     return AIMessage(
-        content="",
-        tool_calls=[
+        content=json.dumps(
             {
-                "name": "report_step_completion",
-                "args": {
-                    "completed": True,
-                    "completion_criterion_met": criterion_met,
-                    "result": result,
-                },
-                "id": "completion-call",
+                "completed": True,
+                "completion_criterion_met": criterion_met,
+                "result": result,
+                "files_read": [],
+                "files_modified": [],
+                "observations": [],
             }
-        ],
+        )
     )
 
 
@@ -254,6 +330,9 @@ class FinalModel:
         self.calls = []
 
     def bind_tools(self, tools, **kwargs):
+        return self
+
+    def bind(self, **kwargs):
         return self
 
     async def ainvoke(self, messages):
@@ -304,10 +383,68 @@ def test_executor_returns_an_mcp_tool_error_to_the_model(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed", execution.error
+    assert execution.execution.status == "completed", execution.execution.error
     assert len(model.calls) == 4
     errors = [message.content for message in model.calls[1] if isinstance(message, ToolMessage)]
     assert any("mcp unavailable" in str(error).lower() for error in errors)
+
+
+def test_executor_returns_a_toolnode_exception_to_the_model(monkeypatch):
+    class RecoverFromToolNodeExceptionModel(FinalModel):
+        async def ainvoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"name": "record", "args": {"value": "first"}, "id": "first-call"}],
+                )
+            if len(self.calls) == 2:
+                errors = [message.content for message in messages if isinstance(message, ToolMessage)]
+                assert errors == ["MCP tool failed: connection lost"]
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"name": "record", "args": {"value": "recovered"}, "id": "recovery-call"}],
+                )
+            if len(self.calls) == 3:
+                return AIMessage(content="MCP work is complete.")
+            return _completion_message("Recovered after the MCP connection error.")
+
+    class FailingThenSuccessfulToolNode:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ainvoke(self, state):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise OSError("connection lost")
+            call = state["messages"][-1].tool_calls[0]
+            return {
+                "messages": [
+                    ToolMessage(
+                        content="recovered",
+                        tool_call_id=call["id"],
+                        name=call["name"],
+                    )
+                ]
+            }
+
+    model = RecoverFromToolNodeExceptionModel("unused")
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    monkeypatch.setattr("agent.executor.ToolNode", FailingThenSuccessfulToolNode)
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.execution.status == "completed", execution.execution.error
+    assert len(model.calls) == 4
 
 
 def test_executor_rejects_a_completion_result_without_criterion_evidence(monkeypatch):
@@ -323,8 +460,39 @@ def test_executor_rejects_a_completion_result_without_criterion_evidence(monkeyp
 
     execution = asyncio.run(run())
 
-    assert execution.status == "failed"
-    assert "valid completion" in execution.error.lower()
+    assert execution.execution.status == "failed"
+    assert "valid completion" in execution.execution.error.lower()
+
+
+@pytest.mark.parametrize("unsafe_path", ["/workspace/project/file.py", "../file.py", "src/../file.py"])
+def test_executor_rejects_an_unsafe_context_path(monkeypatch, unsafe_path):
+    class UnsafeContextModel(FinalModel):
+        async def ainvoke(self, messages):
+            message = await super().ainvoke(messages)
+            if len(self.calls) == 3:
+                return message.model_copy(
+                    update={
+                        "content": json.dumps(
+                            {**json.loads(message.content), "files_read": [unsafe_path]}
+                        )
+                    }
+                )
+            return message
+
+    model = UnsafeContextModel("The release is available.")
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model, tool_cwd="/workspace/project") as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.execution.status == "failed"
+    assert "valid completion" in execution.execution.error.lower()
 
 
 def test_executor_rejects_prose_completion_after_mcp_work(monkeypatch):
@@ -350,11 +518,11 @@ def test_executor_rejects_prose_completion_after_mcp_work(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "failed"
-    assert "valid completion" in execution.error.lower()
+    assert execution.execution.status == "failed"
+    assert "valid completion" in execution.execution.error.lower()
 
 
-def test_executor_accepts_a_strict_completion_tool_call(monkeypatch):
+def test_executor_accepts_a_strict_json_schema_completion(monkeypatch):
     model = FinalModel("Published the release. Completion criterion met: Release is available")
     tool = StructuredTool.from_function(record)
     monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
@@ -367,7 +535,7 @@ def test_executor_accepts_a_strict_completion_tool_call(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed", execution.error
+    assert execution.execution.status == "completed", execution.execution.error
 
 
 def test_executor_accepts_a_structured_criterion_assertion_without_a_text_suffix(monkeypatch):
@@ -375,18 +543,11 @@ def test_executor_accepts_a_structured_criterion_assertion_without_a_text_suffix
         async def ainvoke(self, messages):
             message = await super().ainvoke(messages)
             if len(self.calls) == 3:
-                call = message.tool_calls[0]
                 return message.model_copy(
                     update={
-                        "tool_calls": [
-                            {
-                                **call,
-                                "args": {
-                                    **call["args"],
-                                    "completion_criterion_met": True,
-                                },
-                            }
-                        ]
+                        "content": json.dumps(
+                            {**json.loads(message.content), "completion_criterion_met": True}
+                        )
                     }
                 )
             return message
@@ -403,8 +564,8 @@ def test_executor_accepts_a_structured_criterion_assertion_without_a_text_suffix
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed", execution.error
-    assert execution.result == "功能清单已建立；下一步可扫描代码实现状态。"
+    assert execution.execution.status == "completed", execution.execution.error
+    assert execution.execution.result == "功能清单已建立；下一步可扫描代码实现状态。"
 
 
 class RecoverFromInvalidArgumentsModel:
@@ -412,6 +573,9 @@ class RecoverFromInvalidArgumentsModel:
         self.calls = []
 
     def bind_tools(self, tools, **kwargs):
+        return self
+
+    def bind(self, **kwargs):
         return self
 
     async def ainvoke(self, messages):
@@ -446,7 +610,7 @@ def test_executor_returns_invalid_tool_arguments_to_the_model(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed", execution.error
+    assert execution.execution.status == "completed", execution.execution.error
     assert len(model.calls) == 4
     errors = [message.content for message in model.calls[1] if isinstance(message, ToolMessage)]
     assert any("value" in str(error).lower() for error in errors)
@@ -458,6 +622,9 @@ def test_executor_returns_nonzero_atom_exec_result_to_the_model(monkeypatch):
             self.calls = []
 
         def bind_tools(self, tools, **kwargs):
+            return self
+
+        def bind(self, **kwargs):
             return self
 
         async def ainvoke(self, messages):
@@ -494,7 +661,7 @@ def test_executor_returns_nonzero_atom_exec_result_to_the_model(monkeypatch):
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed", execution.error
+    assert execution.execution.status == "completed", execution.execution.error
     assert len(model.calls) == 4
     results = [message.content for message in model.calls[1] if isinstance(message, ToolMessage)]
     assert any("failed" in str(result).lower() for result in results)
@@ -553,7 +720,7 @@ def test_executor_forwards_host_configuration_and_reuses_one_mcp_session(monkeyp
 
     first, second = asyncio.run(run())
 
-    assert first.status == second.status == "completed"
+    assert first.execution.status == second.execution.status == "completed"
     assert len(configurations) == 1
     assert configurations[0]["atom"]["transport"] == "stdio"
     assert configurations[0]["atom"]["command"] == "custom-atom"
@@ -589,7 +756,7 @@ def test_executor_forces_the_agent_working_directory_into_atom_tool_calls(monkey
 
     execution = asyncio.run(run())
 
-    assert execution.status == "completed"
+    assert execution.execution.status == "completed"
     assert received == [("done", "/workspace/project")]
 
 

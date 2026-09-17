@@ -96,6 +96,14 @@ _Avoid_: tool permissions, tool server
 The concise final explanation returned by an Executor after a completed Step execution, specifically stating how the Plan step's completion criterion was met.
 _Avoid_: transcript, tool trace
 
+**Step context**:
+The durable, cumulative handoff from successful Step executions to the next Executor invocation: the files read, files modified, and observations gathered during the Agent run. Its file paths are normalized, relative POSIX paths within the Agent working directory.
+_Avoid_: message transcript, tool trace
+
+**Context update**:
+The strict structured portion of a successful Step execution's completion receipt that extends Step context with files read, files modified, and observations attributed to that Plan step.
+_Avoid_: inferred tool trace, raw tool output
+
 **Tool-calling model**:
 A LangChain chat model configured for an OpenAI-compatible provider that can request tools from an MCP tool set during Step execution.
 _Avoid_: text stream, planner model

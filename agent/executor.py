@@ -3,7 +3,6 @@ import os
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
@@ -11,32 +10,41 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, ConfigDict, Field
 
-from memory.state import AgentState, PlanStep, StepExecution
+from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
 
 
 class _StepCompletion(BaseModel):
-    """The strictly structured handoff receipt for a completed Plan step."""
+    """The JSON Schema handoff receipt for a completed Plan step."""
 
     model_config = ConfigDict(extra="forbid")
 
     completed: Literal[True]
     completion_criterion_met: Literal[True]
     result: str = Field(
+        min_length=1,
         description=(
             "A concise handoff and evidence summary for the next Plan step. "
             "State the material outcome and the supporting tool output, artifact, "
             "identifier, or state fact; do not reproduce the message transcript."
         )
     )
+    files_read: list[str]
+    files_modified: list[str]
+    observations: list[str]
 
 
-def _report_step_completion(completed: bool, completion_criterion_met: bool, result: str) -> str:
-    """Record the completed step's handoff and evidence summary."""
-    return result
+_COMPLETION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "step_completion",
+        "strict": True,
+        "schema": _StepCompletion.model_json_schema(),
+    },
+}
 
 
 class ExecutorGraphState(MessagesState, total=False):
-    execution: dict[str, Any]
+    execution: StepExecution
 
 
 class PersistenceError(RuntimeError):
@@ -125,20 +133,26 @@ class Executor:
             self._active = False
 
     # one plan step execution
-    async def execute(self, state: AgentState, revision: int, step_id: str) -> StepExecution:
+    async def execute(
+        self,
+        state: AgentState,
+        revision: int,
+        step_id: str,
+        step_context: StepContext | None = None,
+    ) -> ExecutionOutcome:
         self._require_active()
         step = _resolve_step(state, revision, step_id)
         if step is None:
-            return StepExecution(revision, step_id, "failed", error="unknown plan revision or step")
+            return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="unknown plan revision or step"))
 
         try:
             self._active_step = step
             self._active_revision = revision
-            graph_result = await self._execute_with_tools(state, revision, step)
+            graph_result = await self._execute_with_tools(state, revision, step, step_context)
         except Exception as error:
             if self._checkpointer is not None:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
-            return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
+            return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"execution failed: {error}"))
 
         return await self._check_step_completion(graph_result, revision, step_id, step)
 
@@ -148,20 +162,20 @@ class Executor:
         revision: int,
         step_id: str,
         step: PlanStep,
-    ) -> StepExecution:
+    ) -> ExecutionOutcome:
         try:
             tool_messages = [message for message in graph_result["messages"] if isinstance(message, ToolMessage)]
             if tool_messages and not any(_tool_error(message) is None for message in tool_messages):
-                return StepExecution(revision, step_id, "failed", error="model did not complete a successful MCP tool call")
+                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not complete a successful MCP tool call"))
             operational_final = graph_result["messages"][-1]
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
-                return StepExecution(revision, step_id, "failed", error="tool round budget exhausted")
+                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="tool round budget exhausted"))
             final = await self._completion_model.ainvoke(
                 [
                     *graph_result["messages"],
                     HumanMessage(
                         content=(
-                            "Submit the completion receipt now. `result` is the handoff and "
+                            "Submit the JSON completion receipt now. `result` is the handoff and "
                             "evidence summary that subsequent Plan steps will receive. Derive it "
                             "only from the preceding messages: state the material outcome and the "
                             "supporting tool output, artifact path, resource identifier, or state "
@@ -184,18 +198,23 @@ class Executor:
                 )
             result = _completion_result(final, step.completion_criterion)
             if result is None:
-                return StepExecution(revision, step_id, "failed", error="model did not return a valid completion result")
-            return StepExecution(revision, step_id, "completed", result=result)
+                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not return a valid completion result"))
+            handoff, context_update = result
+            return ExecutionOutcome(
+                StepExecution(revision, step_id, "completed", result=handoff),
+                context_update,
+            )
         except Exception as error:
             if self._checkpointer is not None:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
-            return StepExecution(revision, step_id, "failed", error=f"execution failed: {error}")
+            return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"execution failed: {error}"))
 
     async def _execute_with_tools(
         self,
         state: AgentState,
         revision: int,
         step: PlanStep,
+        step_context: StepContext | None = None,
     ) -> dict[str, Any]:
         if self._tools is None:
             self._client = MultiServerMCPClient({"atom": self._connection})
@@ -207,19 +226,9 @@ class Executor:
             self._tools = tools
             # MCP hosts do not promise OpenAI's strict function-tool schema, so
             # operational tool use remains non-strict. Completion is instead a
-            # separate, strictly typed, forced function call after MCP work ends.
+            # separate, strict JSON Schema response after MCP work ends.
             self._bound_model = self._model.bind_tools(tools)
-            completion_tool = StructuredTool.from_function(
-                _report_step_completion,
-                name="report_step_completion",
-                args_schema=_StepCompletion,
-            )
-            self._completion_model = self._model.bind_tools(
-                [completion_tool],
-                tool_choice="report_step_completion",
-                strict=True,
-                parallel_tool_calls=False,
-            )
+            self._completion_model = self._model.bind(response_format=_COMPLETION_RESPONSE_FORMAT)
             # Tool errors are part of the model/tool conversation: a bad argument or
             # an MCP error must be returned to the model so it can correct its next
             # call, rather than aborting this Step and causing top-level replanning.
@@ -253,11 +262,7 @@ class Executor:
             step = self._active_step
             revision = self._active_revision
             return {
-                "execution": {
-                    "revision": revision,
-                    "step_id": step.id,
-                    "status": "running",
-                }
+                "execution": StepExecution(revision, step.id, "running")
             }
 
         graph.add_node("model", call_model)
@@ -266,15 +271,26 @@ class Executor:
             try:
                 result = await tool_node.ainvoke(state)
             except Exception as error:
+                last = state["messages"][-1]
+                messages = [
+                    ToolMessage(
+                        content=f"MCP tool failed: {error}",
+                        tool_call_id=str(call.get("id") or "unknown"),
+                        name=str(call.get("name") or "unknown"),
+                        status="error",
+                    )
+                    for call in getattr(last, "tool_calls", [])
+                ]
                 if self._trace is not None:
-                    last = state["messages"][-1]
                     for call in getattr(last, "tool_calls", []):
                         self._trace.tool_result(
                             call.get("name", "unknown"),
                             str(error),
                             error=True,
                         )
-                raise
+                # A tool failure is actionable model context, not a reason for
+                # the Executor to end this step and make the Agent replan.
+                return {"messages": messages}
             messages = [
                 _as_error_tool_message(message)
                 for message in result.get("messages", [])
@@ -299,6 +315,7 @@ class Executor:
         messages: list[BaseMessage] = [
             SystemMessage(content=self._INSTRUCTIONS),
             HumanMessage(content=json.dumps(_request_payload(state, revision, step), sort_keys=True)),
+            HumanMessage(content=_format_step_context(step_context or StepContext())),
         ]
         self._rounds = 0
         config = None
@@ -375,23 +392,59 @@ def _request_payload(state: AgentState, revision: int, step: PlanStep) -> dict[s
     }
 
 
-def _completion_result(message: AIMessage, completion_criterion: str) -> str | None:
-    if not isinstance(message, AIMessage) or len(message.tool_calls) != 1:
+def _completion_result(
+    message: AIMessage, completion_criterion: str
+) -> tuple[str, ContextUpdate] | None:
+    if not isinstance(message, AIMessage) or not isinstance(message.content, str):
         return None
-    call = message.tool_calls[0]
-    if call.get("name") != "report_step_completion":
+    try:
+        document = json.loads(message.content)
+    except json.JSONDecodeError:
         return None
-    document = call.get("args")
-    if not isinstance(document, dict) or set(document) != {"completed", "completion_criterion_met", "result"}:
+    required = {
+        "completed",
+        "completion_criterion_met",
+        "result",
+        "files_read",
+        "files_modified",
+        "observations",
+    }
+    if not isinstance(document, dict) or set(document) != required:
         return None
     if (
         document["completed"] is not True
         or document["completion_criterion_met"] is not True
         or not isinstance(document["result"], str)
         or not document["result"].strip()
+        or not isinstance(document["files_read"], list)
+        or not isinstance(document["files_modified"], list)
+        or not isinstance(document["observations"], list)
     ):
         return None
-    return document["result"].strip()
+    try:
+        context_update = ContextUpdate(
+            files_read=document["files_read"],
+            files_modified=document["files_modified"],
+            observations=document["observations"],
+        )
+    except (TypeError, ValueError):
+        return None
+    return document["result"].strip(), context_update
+
+
+def _format_step_context(context: StepContext) -> str:
+    def section(title: str, values: tuple[str, ...]) -> str:
+        items = "\n".join(f"- {value}" for value in values) or "- (none)"
+        return f"### {title}\n{items}"
+
+    return "\n\n".join(
+        (
+            "## Step context",
+            section("Files read", context.files_read),
+            section("Files modified", context.files_modified),
+            section("Observations", context.observations),
+        )
+    )
 
 
 def _tool_error(message: BaseMessage) -> str | None:

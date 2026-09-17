@@ -6,13 +6,15 @@ import signal
 import uuid
 from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import Any, TypedDict
-
 from langgraph.graph import END, START, StateGraph
 
 from llm import LLM
 from memory.state import (
     AgentState,
+    ContextUpdate,
+    ExecutionOutcome,
     StepExecution,
+    StepContext,
     deserialize_agent_state,
     serialize_agent_state,
 )
@@ -30,8 +32,14 @@ from .registry import (
 
 
 class GraphState(TypedDict, total=False):
-    agent_state: dict[str, Any]
+    agent_state: AgentState
     status: str
+    # 发生变化的文件路径
+    files_modified: list[str]
+    # 读取过的文件路径
+    files_read: list[str]
+    # 对读取过的文件的总结出的关键发现
+    observations: list[str]
 
 
 def new_run_id() -> str:
@@ -51,13 +59,13 @@ class DurableAgent:
         graph = StateGraph(GraphState)
 
         async def plan(state: GraphState) -> GraphState:
-            agent_state = deserialize_agent_state(state["agent_state"])
+            agent_state = state["agent_state"]
             if agent_state.plan_history:
                 return {}
-            return {"agent_state": serialize_agent_state(agent_state.with_plan(await self._planner.plan(agent_state)))}
+            return {"agent_state": agent_state.with_plan(await self._planner.plan(agent_state))}
 
         async def mark_running(state: GraphState) -> GraphState:
-            agent_state = deserialize_agent_state(state["agent_state"])
+            agent_state = state["agent_state"]
             step = _next_step(agent_state)
             if step is None:
                 return {"status": "completed"}
@@ -69,30 +77,43 @@ class DurableAgent:
             if current is not None and current.status == "failed":
                 return {}
             updated = agent_state.with_step_execution(StepExecution(revision, step_id, "running"))
-            return {"agent_state": serialize_agent_state(updated)}
+            return {"agent_state": updated}
 
         async def execute(state: GraphState) -> GraphState:
-            agent_state = deserialize_agent_state(state["agent_state"])
+            agent_state = state["agent_state"]
             revision, step_id = _next_step(agent_state)
             if revision is None:
                 return {"status": "completed"}
             if self._trace is not None:
                 self._trace.execute("started", revision, step_id)
             async with self._executor as executor:
-                execution = await executor.execute(agent_state, revision, step_id)
+                outcome = await executor.execute(
+                    agent_state,
+                    revision,
+                    step_id,
+                    StepContext(
+                        files_read=tuple(state.get("files_read", [])),
+                        files_modified=tuple(state.get("files_modified", [])),
+                        observations=tuple(state.get("observations", [])),
+                    ),
+                )
+                execution = outcome.execution
             if self._trace is not None:
                 self._trace.execute(execution.status, revision, step_id, execution.error or execution.result)
-            return {"agent_state": serialize_agent_state(agent_state.with_step_execution(execution))}
+            updates: GraphState = {"agent_state": agent_state.with_step_execution(execution)}
+            if isinstance(outcome, ExecutionOutcome) and outcome.context_update is not None:
+                updates.update(_merge_context(state, outcome.context_update, revision, step_id))
+            return updates
 
         async def replan(state: GraphState) -> GraphState:
-            agent_state = deserialize_agent_state(state["agent_state"])
+            agent_state = state["agent_state"]
             if agent_state.plan_history[-1].revision == 3:
                 if self._trace is not None:
                     self._trace.plan("blocked", 3)
                 return {"status": "blocked"}
             if self._trace is not None:
                 self._trace.plan("replanning", len(agent_state.plan_history) + 1)
-            return {"agent_state": serialize_agent_state(agent_state.with_plan(await self._planner.plan(agent_state)))}
+            return {"agent_state": agent_state.with_plan(await self._planner.plan(agent_state))}
 
         async def terminal(state: GraphState) -> GraphState:
             return {"status": "completed"}
@@ -134,25 +155,31 @@ class DurableAgent:
             checkpoint = await graph.aget_state(config)
             values = checkpoint.values
             if values.get("agent_state"):
-                state = deserialize_agent_state(values["agent_state"])
+                state = values["agent_state"]
+                if isinstance(state, dict):
+                    state = deserialize_agent_state(state)
                 if values.get("status") in {"completed", "blocked"}:
                     return {
                         "run_id": run_id,
                         "status": values["status"],
-                        "state": values["agent_state"],
+                        "state": serialize_agent_state(state),
                     }
         if state is not None:
             state, abort = apply_recovery_decision(state, recovery)
             if abort:
                 result = await graph.ainvoke(
-                    {"agent_state": serialize_agent_state(state), "status": "blocked"}, config=config
+                    {"agent_state": state, "status": "blocked"}, config=config
                 )
-                return {"run_id": run_id, "status": "blocked", "state": result["agent_state"]}
+                return {"run_id": run_id, "status": "blocked", "state": serialize_agent_state(result["agent_state"])}
         result = await graph.ainvoke(
-            {"agent_state": serialize_agent_state(state), "status": "resuming"} if state is not None else None,
+            {"agent_state": state, "status": "resuming"} if state is not None else None,
             config=config,
         )
-        return {"run_id": run_id, "status": result.get("status", "completed"), "state": result.get("agent_state")}
+        return {
+            "run_id": run_id,
+            "status": result.get("status", "completed"),
+            "state": serialize_agent_state(result["agent_state"]) if result.get("agent_state") else None,
+        }
 
     async def interrupt(self, run_id: str) -> None:
         """Durably mark in-progress work uncertain after cancellation."""
@@ -162,9 +189,11 @@ class DurableAgent:
         state_payload = checkpoint.values.get("agent_state")
         if not state_payload:
             return
-        state = mark_stale_execution_interrupted(deserialize_agent_state(state_payload))
+        if isinstance(state_payload, dict):
+            state_payload = deserialize_agent_state(state_payload)
+        state = mark_stale_execution_interrupted(state_payload)
         await graph.ainvoke(
-            {"agent_state": serialize_agent_state(state), "status": "interrupted"}, config=config
+            {"agent_state": state, "status": "interrupted"}, config=config
         )
 
 
@@ -306,18 +335,18 @@ def _next_step(state: AgentState) -> tuple[int | None, str | None]:
 
 
 def _after_plan(state: GraphState) -> str:
-    return "complete" if _next_step(deserialize_agent_state(state["agent_state"])) == (None, None) else "mark_running"
+    return "complete" if _next_step(state["agent_state"]) == (None, None) else "mark_running"
 
 
 def _after_mark_running(state: GraphState) -> str:
-    agent_state = deserialize_agent_state(state["agent_state"])
+    agent_state = state["agent_state"]
     if agent_state.step_executions and agent_state.step_executions[-1].status == "failed":
         return "replan"
     return "complete" if _next_step(agent_state) == (None, None) else "execute"
 
 
 def _after_execute(state: GraphState) -> str:
-    agent_state = deserialize_agent_state(state["agent_state"])
+    agent_state = state["agent_state"]
     execution = agent_state.step_executions[-1]
     if execution.status == "failed":
         return "replan"
@@ -332,3 +361,34 @@ def _start_node(state: GraphState) -> str:
     if state.get("status") in {"blocked", "interrupted"}:
         return state["status"]
     return "plan"
+
+
+def _merge_context(
+    state: GraphState,
+    update: ContextUpdate,
+    revision: int,
+    step_id: str,
+) -> GraphState:
+    """Merge one successful update into cumulative checkpointed Step context."""
+
+    def append_unique(existing: list[str], values: tuple[str, ...]) -> list[str]:
+        merged = list(existing)
+        seen = set(merged)
+        for value in values:
+            if value not in seen:
+                merged.append(value)
+                seen.add(value)
+        return merged
+
+    observations = [
+        *state.get("observations", []),
+        *(
+            f"revision {revision}, step {step_id}: {observation}"
+            for observation in update.observations
+        ),
+    ]
+    return {
+        "files_read": append_unique(state.get("files_read", []), update.files_read),
+        "files_modified": append_unique(state.get("files_modified", []), update.files_modified),
+        "observations": observations,
+    }

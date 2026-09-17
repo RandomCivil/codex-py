@@ -8,7 +8,7 @@ from agent.migration import _connection_pool, _parse_url, migrate_database
 from agent.registry import ConfigurationMismatchError, MySQLRunRegistry, RunBusyError
 from agent.durable import DurableAgent, _mysql_saver
 from agent import RecoveryDecisionError
-from memory.state import AgentState, Plan, PlanStep, StepExecution, deserialize_agent_state, serialize_agent_state
+from memory.state import AgentState, ContextUpdate, ExecutionOutcome, Plan, PlanStep, StepExecution, deserialize_agent_state, serialize_agent_state
 
 
 MYSQL_URL = os.environ.get("CODEX_TEST_MYSQL_URL")
@@ -67,7 +67,10 @@ def test_mysql_checkpoint_resumes_terminal_work_in_a_fresh_application_instance(
 
         async def execute(self, state, revision, step_id):
             self.calls += 1
-            return StepExecution(revision, step_id, "completed", result="Inspected")
+            return ExecutionOutcome(
+                StepExecution(revision, step_id, "completed", result="Inspected"),
+                ContextUpdate(),
+            )
 
     run_id = str(uuid.uuid4())
 

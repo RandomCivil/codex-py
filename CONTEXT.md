@@ -13,7 +13,7 @@ The OpenAI-compatible provider request mode used for a component's final structu
 _Avoid_: JSON mode, response type
 
 **Component provider configuration**:
-The effective OpenAI-compatible provider credentials, endpoint, model name, and Structured-output mode used by either the Planner or Executor. Both components may inherit shared values, then apply component-specific overrides.
+The effective OpenAI-compatible provider credentials, endpoint, model name, and, where structured output is required, Structured-output mode used by a named language-model component. Components may inherit shared values, then apply component-specific overrides.
 _Avoid_: global model configuration, executor tool configuration
 
 **Text stream**:
@@ -31,6 +31,34 @@ _Avoid_: provider request, completion request
 **Tool execution**:
 The upper-layer responsibility for acting on a model-issued function call and deciding whether to make a follow-up model request.
 _Avoid_: automatic tool loop, LLM tool execution
+
+**Execution mode**:
+A whole-task answer strategy selected explicitly through a common factory, and eventually by a deterministic router. The modes are `direct`, `tool_agent`, `react`, and `plan_execute`; an Execution mode is not an Executor.
+_Avoid_: executor, agent architecture
+
+**Execution answer**:
+The common whole-task result returned by an Execution mode: an answer plus its `completed` or `failed` terminal status and, on failure, an error. It is distinct from an Agent result and an Execution result.
+_Avoid_: Agent result, step result
+
+**Ephemeral execution**:
+A whole-task Execution mode invocation that does not create Checkpoints and cannot be resumed. `direct`, `tool_agent`, and `react` are Ephemeral executions.
+_Avoid_: durable run, resumable execution
+
+**Direct mode**:
+An Ephemeral Execution mode that obtains an answer from one language-model call without exposing tools. A nonempty response is a completed Execution answer.
+_Avoid_: tool-free executor
+
+**Tool-agent mode**:
+An Execution mode limited to one language-model request and at most one Tool execution. When a model requests more than one tool, only its first request is executed. A tool's host-rendered result is the final answer rather than a second model-generated summary; when no tool is selected, the model's text is the final answer. A tool or rendering failure is a failed Execution answer.
+_Avoid_: single-round ReAct, executor
+
+**ReAct mode**:
+An Ephemeral Execution mode that iterates language-model requests and Tool executions toward one answer, without a Planner or Plan. It ends only when its final structured response explicitly declares the goal satisfied.
+_Avoid_: Executor, plan execution
+
+**Plan–execute mode**:
+An Execution mode in which an Agent obtains a Plan from a Planner and completes its Plan steps through the Plan-step Executor. Its Execution answer is the last completed Plan step's handoff.
+_Avoid_: ReAct mode, executor
 
 **Plan**:
 A versioned, machine-validatable execution contract produced by a Planner for the whole goal, consisting of ordered Plan steps plus their completion criteria. Replanning appends an immutable revision rather than overwriting prior Plans.
@@ -103,6 +131,14 @@ _Avoid_: agent, planner, automatic tool loop
 **MCP tool set**:
 The named, host-configured collection of Model Context Protocol tools made available to an Executor for a Step execution.
 _Avoid_: tool permissions, tool server
+
+**Tool runtime**:
+The shared host-configured MCP connection, tool set, allowlist, and forced working-directory boundary used by tool-enabled Execution modes. It owns one MCP session for a mode invocation.
+_Avoid_: tool client, per-mode tool configuration
+
+**Tool-result renderer**:
+The deterministic conversion of a Tool runtime result into an Execution answer without another language-model request. It preserves text, stably serializes structured or multi-content values, and rejects values that cannot be presented.
+_Avoid_: tool-result summary, model synthesis
 
 **Execution result**:
 The concise final explanation returned by an Executor after a completed Step execution, specifically stating how the Plan step's completion criterion was met.

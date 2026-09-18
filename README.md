@@ -116,9 +116,20 @@ planner:
 
 executor:
   response_format: json_object
+
+# Whole-task execution mode overrides are optional and inherit from model.
+direct:
+  model_name: direct-model
+
+tool_agent:
+  base_url: https://tools-provider.example/v1
+
+react:
+  response_format: json_schema
 ```
 
 `response_format` 只能是 `json_schema` 或 `json_object`。前者要求 provider 强制执行 Plan 或 completion receipt 的 schema；后者只要求返回 JSON object，Agent 仍会在本地严格校验 Plan 和 completion receipt。Executor 的 MCP tool call 仍由 host 定义，不会变成 structured-output 响应。
+`direct` 和 `tool_agent` 只要求有效的 endpoint、credential 和 model；`react` 还要求有效的 `response_format`，用于最终的 goal-satisfaction 响应。现有 CLI 仍运行 durable Plan–Execute，不增加 mode selector；新 mode 通过 Python factory 组合。
 
 YAML 中的 `api_key` 是明文配置。请限制配置文件的文件权限，例如：
 

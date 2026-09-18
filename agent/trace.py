@@ -141,6 +141,10 @@ class RunTrace:
         suffix = f" id={call_id}" if call_id else ""
         self._line(f"[tool call] {name}{suffix} args={_compact(arguments)}")
 
+    def tool_ignored(self, name: str, call_id: str | None = None) -> None:
+        suffix = f" id={call_id}" if call_id else ""
+        self._line(f"[tool call ignored] {name}{suffix} reason=single-call limit")
+
     def tool_result(self, name: str, result: Any, *, error: bool = False) -> None:
         label = "tool result error" if error else "tool result"
         # Error results contain the information needed to diagnose or correct

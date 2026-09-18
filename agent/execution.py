@@ -1,0 +1,433 @@
+import asyncio
+import json
+import os
+import uuid
+from dataclasses import dataclass
+from typing import Any, Literal, Mapping, Protocol
+
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_openai import ChatOpenAI
+
+from agent.configuration import ComponentProviderConfiguration
+from llm.llm import LLM
+from llm.response_format import ResponseFormat
+
+
+ExecutionStatus = Literal["completed", "failed"]
+ExecutionModeName = Literal["direct", "tool_agent", "react", "plan_execute"]
+
+
+_REACT_RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "react_goal_completion",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["answer", "goal_satisfied"],
+            "properties": {
+                "answer": {"type": "string", "minLength": 1},
+                "goal_satisfied": {"const": True},
+            },
+        },
+    },
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionAnswer:
+    """The terminal result shared by whole-task Execution modes."""
+
+    answer: str | None
+    status: ExecutionStatus
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"completed", "failed"}:
+            raise ValueError("execution answer status must be completed or failed")
+        if self.status == "completed":
+            if not isinstance(self.answer, str) or not self.answer.strip():
+                raise ValueError("a completed execution answer requires nonempty answer text")
+            if self.error is not None:
+                raise ValueError("a completed execution answer cannot contain an error")
+        elif self.error is None or not self.error.strip():
+            raise ValueError("a failed execution answer requires a safe error")
+
+
+class ExecutionMode(Protocol):
+    async def run(self, goal: str) -> ExecutionAnswer: ...
+
+
+class DirectMode:
+    """Obtain one tool-free answer from a language model."""
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+
+    async def run(self, goal: str) -> ExecutionAnswer:
+        try:
+            output = "".join(
+                [chunk async for chunk in self._model.stream_text(goal, tools=None)]
+            )
+        except Exception:
+            return ExecutionAnswer(None, "failed", error="direct model invocation failed")
+        if not output.strip():
+            return ExecutionAnswer(None, "failed", error="direct model returned an empty response")
+        return ExecutionAnswer(output, "completed")
+
+
+class ToolRuntime:
+    """One invocation-scoped, constrained MCP authority for ephemeral modes."""
+
+    def __init__(
+        self,
+        *,
+        command: str = "poetry",
+        args: tuple[str, ...] = ("run", "atom-mcp"),
+        cwd: str = "/home/xzp/workspace/atom-mcp",
+        tool_cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        tool_allowlist: tuple[str, ...] | None = None,
+        trace: Any | None = None,
+    ) -> None:
+        self._connection = {
+            "transport": "stdio",
+            "command": command,
+            "args": list(args),
+            "cwd": cwd,
+            "env": {**os.environ, **(env or {})},
+        }
+        self._tool_cwd = tool_cwd
+        self._allowlist = set(tool_allowlist) if tool_allowlist is not None else None
+        self._trace = trace
+        self._client = None
+        self._session = None
+        self._tools: list[Any] | None = None
+
+    async def __aenter__(self) -> "ToolRuntime":
+        if self._session is not None:
+            raise RuntimeError("Tool runtime is already active")
+        self._client = MultiServerMCPClient({"atom": self._connection})
+        self._session = self._client.session("atom")
+        session = await self._session.__aenter__()
+        tools = await load_mcp_tools(session)
+        self._tools = [tool for tool in tools if self._allowlist is None or tool.name in self._allowlist]
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        try:
+            if self._session is not None:
+                await self._session.__aexit__(exc_type, exc, traceback)
+        finally:
+            self._client = self._session = None
+            self._tools = None
+
+    @property
+    def tools(self) -> list[Any]:
+        if self._tools is None:
+            raise RuntimeError("Tool runtime is not active")
+        return self._tools
+
+    async def invoke(self, call: Mapping[str, Any]) -> Any:
+        name = call.get("name")
+        tool = next((item for item in self.tools if item.name == name), None)
+        if tool is None:
+            raise ValueError(f"tool {name!r} is not allowed")
+        args = dict(call.get("args") or {})
+        if self._tool_cwd is not None:
+            args["cwd"] = self._tool_cwd
+        if self._trace is not None:
+            self._trace.tool_call(name, args, call.get("id"))
+        result = await tool.ainvoke(args)
+        if self._trace is not None:
+            self._trace.tool_result(name, result, error=_tool_result_failed(result))
+        if _tool_result_failed(result):
+            raise RuntimeError("tool returned a non-success result")
+        return result
+
+
+class ToolAgentMode:
+    """Make one model request and, at most, one host tool invocation."""
+
+    def __init__(self, model: Any, tool_runtime: Any, trace: Any | None = None) -> None:
+        self._model = model
+        self._runtime = tool_runtime
+        self._trace = trace
+
+    async def run(self, goal: str) -> ExecutionAnswer:
+        try:
+            async with self._runtime as runtime:
+                bound = self._model.bind_tools(runtime.tools)
+                response = await bound.ainvoke(goal)
+                calls = list(getattr(response, "tool_calls", []) or [])
+                if not calls:
+                    text = _message_text(response)
+                    if not text.strip():
+                        return ExecutionAnswer(None, "failed", error="tool-agent model returned an empty response")
+                    return ExecutionAnswer(text, "completed")
+                for ignored in calls[1:]:
+                    if self._trace is not None:
+                        _trace_ignored(self._trace, ignored)
+                result = await runtime.invoke(calls[0])
+                return ExecutionAnswer(render_tool_result(result), "completed")
+        except Exception:
+            return ExecutionAnswer(None, "failed", error="tool-agent execution failed")
+
+
+class ReactMode:
+    """Iterate model/tool rounds until a structured completion proof is returned."""
+
+    def __init__(
+        self,
+        model: Any,
+        tool_runtime: Any,
+        trace: Any | None = None,
+        *,
+        max_rounds: int = 50,
+        response_format: ResponseFormat | None = None,
+    ) -> None:
+        if type(max_rounds) is not int or max_rounds <= 0:
+            raise ValueError("max_rounds must be a positive integer")
+        self._model = model
+        self._runtime = tool_runtime
+        self._trace = trace
+        self._max_rounds = max_rounds
+        self._response_format = response_format
+
+    async def run(self, goal: str) -> ExecutionAnswer:
+        try:
+            async with self._runtime as runtime:
+                model = self._model.bind_tools(runtime.tools)
+                messages: list[Any] = [HumanMessage(content=goal)]
+                for round_number in range(1, self._max_rounds + 1):
+                    response = await model.ainvoke(messages)
+                    calls = list(getattr(response, "tool_calls", []) or [])
+                    messages.append(response)
+                    if not calls:
+                        if self._response_format is not None:
+                            completion_model = self._model.bind(
+                                response_format=_react_response_format(self._response_format)
+                            )
+                            response = await completion_model.ainvoke(
+                                [
+                                    *messages,
+                                    HumanMessage(
+                                        content=(
+                                            "Return the final goal-completion response now. "
+                                            "It must satisfy the configured structured contract."
+                                        )
+                                    ),
+                                ]
+                            )
+                            if getattr(response, "tool_calls", []):
+                                return ExecutionAnswer(
+                                    None,
+                                    "failed",
+                                    error="react response did not prove goal completion",
+                                )
+                        return _react_answer(response)
+                    if round_number == self._max_rounds:
+                        return ExecutionAnswer(None, "failed", error="react round budget exhausted")
+                    results = await asyncio.gather(
+                        *(self._invoke_for_react(runtime, call) for call in calls)
+                    )
+                    messages.extend(
+                        ToolMessage(
+                            content=content,
+                            tool_call_id=str(call.get("id") or "unknown"),
+                            name=str(call.get("name") or "unknown"),
+                            status="error" if is_error else "success",
+                        )
+                        for call, (content, is_error) in zip(calls, results)
+                    )
+        except Exception:
+            return ExecutionAnswer(None, "failed", error="react execution failed")
+
+        return ExecutionAnswer(None, "failed", error="react execution failed")
+
+    async def _invoke_for_react(self, runtime: Any, call: Mapping[str, Any]) -> tuple[str, bool]:
+        try:
+            return render_tool_result(await runtime.invoke(call)), False
+        except Exception as error:
+            if self._trace is not None:
+                self._trace.tool_result(
+                    call.get("name", "unknown"),
+                    str(error),
+                    error=True,
+                )
+            return f"MCP tool failed: {error}", True
+
+
+def _react_answer(response: Any) -> ExecutionAnswer:
+    try:
+        content = getattr(response, "content", response)
+        if isinstance(content, str):
+            document = json.loads(content)
+        elif isinstance(content, Mapping):
+            document = content
+        else:
+            return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
+    if document.get("goal_satisfied") is not True:
+        return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
+    answer = document.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
+    return ExecutionAnswer(answer, "completed")
+
+
+def _react_response_format(response_format: ResponseFormat) -> dict[str, Any]:
+    if response_format == "json_schema":
+        return _REACT_RESPONSE_SCHEMA
+    if response_format == "json_object":
+        return {"type": "json_object"}
+    raise ValueError("response_format must be json_schema or json_object")
+
+
+def render_tool_result(value: Any) -> str:
+    """Render only safely presentable tool values in a stable form."""
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError("tool result is empty")
+        return value
+    if isinstance(value, (Mapping, list, tuple, int, float, bool)) or value is None:
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError) as error:
+            raise ValueError("tool result cannot be rendered") from error
+    content = getattr(value, "content", None)
+    if content is not None:
+        return render_tool_result(content)
+    raise ValueError("tool result cannot be rendered")
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    return render_tool_result(content)
+
+
+def _tool_result_failed(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("isError") is True or value.get("error"):
+            return True
+        return isinstance(value.get("returncode"), int) and value["returncode"] != 0
+    return getattr(value, "isError", False) is True or (
+        isinstance(getattr(value, "returncode", None), int) and value.returncode != 0
+    )
+
+
+def _trace_ignored(trace: Any, call: Mapping[str, Any]) -> None:
+    ignored = getattr(trace, "tool_ignored", None)
+    if callable(ignored):
+        ignored(call.get("name", "unknown"), call.get("id"))
+    else:
+        trace.tool_call(call.get("name", "unknown"), call.get("args", {}), call.get("id"))
+
+
+class PlanExecuteMode:
+    """Adapt the existing durable Plan–Execute lifecycle to ExecutionAnswer."""
+
+    def __init__(self, durable_agent: Any, *, run_id_factory: Any = uuid.uuid4) -> None:
+        self._durable_agent = durable_agent
+        self._run_id_factory = run_id_factory
+
+    async def run(self, goal: str) -> ExecutionAnswer:
+        from memory.state import AgentState, deserialize_agent_state
+
+        run_id = str(self._run_id_factory())
+        try:
+            result = await self._durable_agent.run(run_id, AgentState(goal))
+            status = result.get("status")
+            if status == "completed":
+                state = result.get("state")
+                if isinstance(state, dict):
+                    state = deserialize_agent_state(state)
+                completed = next(
+                    (item for item in reversed(state.step_executions) if item.status == "completed"),
+                    None,
+                )
+                if completed is not None and completed.result:
+                    return ExecutionAnswer(completed.result, "completed")
+                return ExecutionAnswer(None, "failed", error="plan-execute run completed without a step handoff")
+            return ExecutionAnswer(None, "failed", error="plan-execute run did not complete")
+        except Exception:
+            return ExecutionAnswer(None, "failed", error="plan-execute execution failed")
+
+
+class _UnavailableMode:
+    def __init__(self, mode: ExecutionModeName) -> None:
+        self._mode = mode
+
+    async def run(self, goal: str) -> ExecutionAnswer:
+        return ExecutionAnswer(
+            None,
+            "failed",
+            error=f"execution mode {self._mode!r} is not implemented",
+        )
+
+
+def create_execution_mode(
+    mode: ExecutionModeName,
+    *,
+    model: Any | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    tool_runtime: Any | None = None,
+    trace: Any | None = None,
+    durable_agent: Any | None = None,
+    max_rounds: int = 50,
+    configuration: ComponentProviderConfiguration | None = None,
+) -> ExecutionMode:
+    """Select a whole-task Execution mode explicitly.
+
+    Dependencies are injected at this seam so modes remain usable without live
+    provider, MCP, or durable-run infrastructure in tests and embeddings.
+    """
+    if mode not in {"direct", "tool_agent", "react", "plan_execute"}:
+        raise ValueError("mode must be direct, tool_agent, react, or plan_execute")
+    if mode == "plan_execute":
+        if durable_agent is None:
+            return _UnavailableMode(mode)
+        return PlanExecuteMode(durable_agent)
+    provider = getattr(configuration, mode, None) if configuration is not None else None
+    if provider is not None and model is None:
+        if mode == "direct":
+            model = LLM(
+                provider.base_url,
+                provider.api_key,
+                provider.model_name,
+                response_format=provider.response_format or "json_schema",
+            )
+        else:
+            model = ChatOpenAI(
+                base_url=provider.base_url,
+                api_key=provider.api_key,
+                model=provider.model_name,
+                max_retries=0,
+            )
+    if mode == "tool_agent":
+        if model is None:
+            return _UnavailableMode(mode)
+        return ToolAgentMode(model, tool_runtime or ToolRuntime(trace=trace), trace=trace)
+    if mode == "react":
+        if model is None:
+            return _UnavailableMode(mode)
+        return ReactMode(
+            model,
+            tool_runtime or ToolRuntime(trace=trace),
+            trace=trace,
+            max_rounds=max_rounds,
+            response_format=provider.response_format if provider is not None else None,
+        )
+    if model is None:
+        if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
+            raise ValueError("direct mode requires an injected model or explicit provider values")
+        model = LLM(base_url, api_key, model_name)
+    return DirectMode(model)

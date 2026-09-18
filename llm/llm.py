@@ -40,20 +40,21 @@ class LLM:
         *,
         instructions: str | None = None,
         tools: Iterable[dict[str, Any]] | None = None,
-        text_format: Mapping[str, Any],
+        text_format: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[ResponseStreamEvent]:
-        if text_format.get("type") != "json_object":
+        if text_format is not None and text_format.get("type") != "json_object":
             _require_json_schema(text_format)
-        provider_format = (
-            {"type": "json_object"}
-            if self._response_format == "json_object"
-            else {"type": "json_schema", **dict(text_format)}
-        )
         request: dict[str, Any] = {
             "model": self._model_name,
             "input": input,
-            "text": {"format": provider_format},
         }
+        if text_format is not None:
+            provider_format = (
+                {"type": "json_object"}
+                if self._response_format == "json_object"
+                else {"type": "json_schema", **dict(text_format)}
+            )
+            request["text"] = {"format": provider_format}
         if instructions is not None:
             request["instructions"] = instructions
         if tools is not None:
@@ -71,7 +72,7 @@ class LLM:
         *,
         instructions: str | None = None,
         tools: Iterable[dict[str, Any]] | None = None,
-        text_format: Mapping[str, Any],
+        text_format: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         async for event in self.stream_events(
             input,

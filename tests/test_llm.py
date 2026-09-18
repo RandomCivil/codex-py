@@ -261,6 +261,47 @@ def test_event_stream_forwards_input_items_instructions_and_tools(monkeypatch):
     }
 
 
+def test_text_stream_can_request_plain_text_without_tools_or_structured_format(monkeypatch):
+    observed = {}
+
+    class Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            pass
+
+        def __aiter__(self):
+            return self._events()
+
+        async def _events(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="Answer")
+
+    class Responses:
+        def stream(self, **kwargs):
+            observed.update(kwargs)
+            return Stream()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.responses = Responses()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("llm.llm.AsyncOpenAI", Client)
+
+    async def consume():
+        llm = LLM("https://provider.test", "secret", "model")
+        return [chunk async for chunk in llm.stream_text("hello", tools=None)]
+
+    assert asyncio.run(consume()) == ["Answer"]
+    assert observed == {
+        "model": "model",
+        "input": "hello",
+    }
+
+
 def test_event_stream_closes_provider_stream_when_consumer_exits_early(monkeypatch):
     observed = {"stream_closed": False, "client_closed": False}
 

@@ -93,16 +93,40 @@ poetry install
 
 ## 配置
 
-运行前设置以下环境变量：
+运行前只需要设置 MySQL 连接环境变量：
 
 ```bash
 export CODEX_MYSQL_URL='mysql://user:password@127.0.0.1:3306/codex'
-export OPENAI_BASE_URL='https://your-provider.example/v1'
-export OPENAI_API_KEY='your-api-key'
-export OPENAI_MODEL='gpt-4o-mini'       # 可选，默认 gpt-4o-mini
 ```
 
 `CODEX_MYSQL_URL` 只用于 MySQL 连接，不能省略。凭据不会写入运行配置快照；Checkpoint 状态目前按原样保存，请为该数据库设置合适的访问控制。
+
+Planner 和 Executor 的 provider 配置必须写在显式传入的 YAML 文件中。文件使用共享的 `model` 默认值，并可用 `planner`、`executor` 分别覆盖任意字段：
+
+```yaml
+# agent.yaml
+model:
+  base_url: https://your-provider.example/v1
+  api_key: your-api-key
+  model_name: gpt-4o-mini
+  response_format: json_schema
+
+planner:
+  model_name: planner-model
+
+executor:
+  response_format: json_object
+```
+
+`response_format` 只能是 `json_schema` 或 `json_object`。前者要求 provider 强制执行 Plan 或 completion receipt 的 schema；后者只要求返回 JSON object，Agent 仍会在本地严格校验 Plan 和 completion receipt。Executor 的 MCP tool call 仍由 host 定义，不会变成 structured-output 响应。
+
+YAML 中的 `api_key` 是明文配置。请限制配置文件的文件权限，例如：
+
+```bash
+chmod 600 agent.yaml
+```
+
+不要把 Planner 或 Executor 的 model 配置放入环境变量；CLI 不会从 `OPENAI_*` 环境变量读取或覆盖 YAML。配置文件路径也不会写入运行快照，API key 不会写入快照或 fingerprint。
 
 Executor 默认连接：
 
@@ -125,7 +149,7 @@ poetry run agent migrate
 开始一个新的 Agent run：
 
 ```bash
-poetry run agent run --goal '检查项目中的待办事项并整理摘要' --cwd /path/to/project
+poetry run agent run --goal '检查项目中的待办事项并整理摘要' --config agent.yaml --cwd /path/to/project
 ```
 
 `--cwd` 指定 Agent 操作的项目目录。它会被强制写入每一个 Atom MCP 工具调用的 `cwd` 参数；未指定时使用启动 `agent` 命令时的当前目录。恢复 run 时应使用与原 run 相同的 `--cwd`，该目录属于持久化配置的一部分。
@@ -139,14 +163,14 @@ poetry run agent run --goal '检查项目中的待办事项并整理摘要' --cw
 恢复未完成的 run：
 
 ```bash
-poetry run agent resume --run-id <uuidv4>
+poetry run agent resume --run-id <uuidv4> --config agent.yaml
 ```
 
 如果上次中断时存在正在执行的 Step，必须显式选择恢复策略：
 
 ```bash
-poetry run agent resume --run-id <uuidv4> --recovery fail
-poetry run agent resume --run-id <uuidv4> --recovery abort
+poetry run agent resume --run-id <uuidv4> --config agent.yaml --recovery fail
+poetry run agent resume --run-id <uuidv4> --config agent.yaml --recovery abort
 ```
 
 当前 Atom MCP 工具没有声明幂等性，因此 `retry` 会被拒绝。`fail` 将该 Step 标记为失败并触发 replanning；`abort` 将 run 标记为 `blocked`。已完成或已阻塞的 run 再次 resume 时直接返回保存的终态结果，不会重新调用模型或工具。

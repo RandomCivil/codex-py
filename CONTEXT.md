@@ -8,6 +8,14 @@ This context coordinates language-model interactions for the Codex Python agent.
 A service exposing the OpenAI Responses API through a caller-supplied base URL, API key, and model name.
 _Avoid_: OpenAI provider, model provider
 
+**Structured-output mode**:
+The OpenAI-compatible provider request mode used for a component's final structured response: `json_schema`, which asks the provider to enforce a supplied schema, or `json_object`, which asks it only to return a JSON object and relies on local validation for the component's contract.
+_Avoid_: JSON mode, response type
+
+**Component provider configuration**:
+The effective OpenAI-compatible provider credentials, endpoint, model name, and Structured-output mode used by either the Planner or Executor. Both components may inherit shared values, then apply component-specific overrides.
+_Avoid_: global model configuration, executor tool configuration
+
 **Text stream**:
 An asynchronous sequence containing only successive generated text deltas; it ends after the model response completes.
 _Avoid_: response stream, event stream

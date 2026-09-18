@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 from agent.durable import resume_agent, run_agent
 from agent.agent import RecoveryDecisionError
+from agent.configuration import ConfigurationError, load_configuration
 from agent.migration import MigrationConfigurationError, migrate_database
 from agent.registry import ConfigurationMismatchError, RunBusyError
 
@@ -38,23 +39,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--recovery", choices=("fail", "abort"))
     parser.add_argument("--cwd", help="working directory supplied to Atom MCP tool calls")
     parser.add_argument("--log-level", "--level", dest="log_level", choices=("info", "error"))
+    parser.add_argument("--config")
     try:
         args = parser.parse_args(argv)
     except InvalidInvocationError as exc:
         return _emit({"command": None, "status": "invalid", "error": str(exc)}, EXIT_INVALID_INVOCATION)
 
-    if args.command == "run" and (not args.goal or args.run_id or args.recovery):
-        return _emit({"command": "run", "status": "invalid", "error": "run requires --goal and does not accept --run-id or --recovery"}, EXIT_INVALID_INVOCATION)
-    if args.command == "resume" and (not args.run_id or args.goal):
-        return _emit({"command": "resume", "status": "invalid", "error": "resume requires --run-id and does not accept --goal"}, EXIT_INVALID_INVOCATION)
+    if args.command == "run" and (not args.goal or args.run_id or args.recovery or not args.config):
+        return _emit({"command": "run", "status": "invalid", "error": "run requires --goal and --config and does not accept --run-id or --recovery"}, EXIT_INVALID_INVOCATION)
+    if args.command == "resume" and (not args.run_id or args.goal or not args.config):
+        return _emit({"command": "resume", "status": "invalid", "error": "resume requires --run-id and --config and does not accept --goal"}, EXIT_INVALID_INVOCATION)
     if args.command == "resume":
         try:
             if uuid.UUID(args.run_id).version != 4:
                 raise ValueError
         except (ValueError, AttributeError):
             return _emit({"command": "resume", "status": "invalid", "error": "resume requires a UUIDv4 --run-id"}, EXIT_INVALID_INVOCATION)
-    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd or args.log_level):
-        return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, --cwd, or --log-level"}, EXIT_INVALID_INVOCATION)
+    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd or args.log_level or args.config):
+        return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, --cwd, --log-level, or --config"}, EXIT_INVALID_INVOCATION)
+
+    try:
+        configuration = load_configuration(args.config) if args.config else None
+    except ConfigurationError as exc:
+        return _emit({"command": args.command, "status": "configuration", "error": str(exc)}, EXIT_CONFIGURATION)
 
     if not os.environ.get("CODEX_MYSQL_URL"):
         return _emit(
@@ -71,38 +78,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             migrate_database(os.environ["CODEX_MYSQL_URL"])
             result = {"command": args.command, "status": "completed"}
         elif args.command == "run":
+            options = {"configuration": configuration}
             if args.cwd:
-                if args.log_level:
-                    run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, args.cwd, args.log_level)
-                else:
-                    run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, args.cwd)
-            elif args.log_level:
-                run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, log_level=args.log_level)
-            else:
-                run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal)
+                options["cwd"] = args.cwd
+            if args.log_level:
+                options["log_level"] = args.log_level
+            run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, **options)
             result = {"command": args.command, **run}
             result.setdefault("run_id", str(uuid.uuid4()))
         else:
-            if args.recovery is None:
-                if args.cwd:
-                    if args.log_level:
-                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, cwd=args.cwd, log_level=args.log_level)
-                    else:
-                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, cwd=args.cwd)
-                elif args.log_level:
-                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, log_level=args.log_level)
-                else:
-                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id)
-            else:
-                if args.cwd:
-                    if args.log_level:
-                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, args.cwd, args.log_level)
-                    else:
-                        resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, args.cwd)
-                elif args.log_level:
-                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery, log_level=args.log_level)
-                else:
-                    resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, args.recovery)
+            options = {"configuration": configuration}
+            if args.recovery:
+                options["recovery"] = args.recovery
+            if args.cwd:
+                options["cwd"] = args.cwd
+            if args.log_level:
+                options["log_level"] = args.log_level
+            resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, **options)
             result = {"command": args.command, **resumed}
     except (MigrationConfigurationError, ConfigurationMismatchError) as exc:
         return _emit(

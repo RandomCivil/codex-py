@@ -5,6 +5,18 @@ from agent.cli import EXIT_BUSY, EXIT_CONFIGURATION, main
 from agent.registry import ConfigurationMismatchError, RunBusyError
 
 
+def _configuration_file(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        "model:\n"
+        "  base_url: https://provider.test/v1\n"
+        "  api_key: key\n"
+        "  model_name: model\n"
+        "  response_format: json_schema\n"
+    )
+    return str(path)
+
+
 def test_migrate_requires_codex_mysql_url(monkeypatch, capsys):
     monkeypatch.delenv("CODEX_MYSQL_URL", raising=False)
 
@@ -31,11 +43,11 @@ def test_migrate_emits_completed_result(monkeypatch, capsys):
     }
 
 
-def test_run_emits_a_uuidv4_agent_run_id(monkeypatch, capsys):
+def test_run_emits_a_uuidv4_agent_run_id(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
-    monkeypatch.setattr("agent.cli.run_agent", lambda url, goal: {"status": "completed"})
+    monkeypatch.setattr("agent.cli.run_agent", lambda url, goal, **kwargs: {"status": "completed"})
 
-    exit_code = main(["run", "--goal", "Prepare release"])
+    exit_code = main(["run", "--goal", "Prepare release", "--config", _configuration_file(tmp_path)])
 
     output = json.loads(capsys.readouterr().out)
     assert exit_code == 0
@@ -44,31 +56,31 @@ def test_run_emits_a_uuidv4_agent_run_id(monkeypatch, capsys):
     assert uuid.UUID(output["run_id"]).version == 4
 
 
-def test_run_forwards_cwd_to_agent(monkeypatch, capsys):
+def test_run_forwards_cwd_to_agent(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
     calls = []
 
-    def run(url, goal, cwd):
+    def run(url, goal, cwd, **kwargs):
         calls.append((url, goal, cwd))
         return {"status": "completed"}
 
     monkeypatch.setattr("agent.cli.run_agent", run)
 
-    assert main(["run", "--goal", "Prepare release", "--cwd", "/workspace/project"]) == 0
+    assert main(["run", "--goal", "Prepare release", "--cwd", "/workspace/project", "--config", _configuration_file(tmp_path)]) == 0
     assert calls == [("mysql://user:pass@localhost/db", "Prepare release", "/workspace/project")]
 
 
-def test_run_forwards_log_level_to_agent(monkeypatch, capsys):
+def test_run_forwards_log_level_to_agent(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
     calls = []
 
-    def run(url, goal, log_level):
+    def run(url, goal, log_level, **kwargs):
         calls.append((url, goal, log_level))
         return {"status": "completed"}
 
     monkeypatch.setattr("agent.cli.run_agent", run)
 
-    assert main(["run", "--goal", "Prepare release", "--log-level", "error"]) == 0
+    assert main(["run", "--goal", "Prepare release", "--log-level", "error", "--config", _configuration_file(tmp_path)]) == 0
     assert calls == [("mysql://user:pass@localhost/db", "Prepare release", "error")]
 
 
@@ -81,7 +93,7 @@ def test_resume_requires_a_run_id(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out) == {
         "command": "resume",
         "status": "invalid",
-        "error": "resume requires --run-id and does not accept --goal",
+        "error": "resume requires --run-id and --config and does not accept --goal",
     }
 
 
@@ -96,19 +108,19 @@ def test_parser_errors_are_stable_json(monkeypatch, capsys):
     }
 
 
-def test_resume_configuration_mismatch_is_a_configuration_result(monkeypatch, capsys):
+def test_resume_configuration_mismatch_is_a_configuration_result(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
-    monkeypatch.setattr("agent.cli.resume_agent", lambda url, run_id: (_ for _ in ()).throw(ConfigurationMismatchError("configuration changed")))
+    monkeypatch.setattr("agent.cli.resume_agent", lambda url, run_id, **kwargs: (_ for _ in ()).throw(ConfigurationMismatchError("configuration changed")))
 
-    assert main(["resume", "--run-id", str(uuid.uuid4())]) == EXIT_CONFIGURATION
+    assert main(["resume", "--run-id", str(uuid.uuid4()), "--config", _configuration_file(tmp_path)]) == EXIT_CONFIGURATION
     assert json.loads(capsys.readouterr().out)["status"] == "configuration"
 
 
-def test_competing_resume_is_a_busy_result(monkeypatch, capsys):
+def test_competing_resume_is_a_busy_result(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
-    monkeypatch.setattr("agent.cli.resume_agent", lambda url, run_id: (_ for _ in ()).throw(RunBusyError("run busy")))
+    monkeypatch.setattr("agent.cli.resume_agent", lambda url, run_id, **kwargs: (_ for _ in ()).throw(RunBusyError("run busy")))
 
-    assert main(["resume", "--run-id", str(uuid.uuid4())]) == EXIT_BUSY
+    assert main(["resume", "--run-id", str(uuid.uuid4()), "--config", _configuration_file(tmp_path)]) == EXIT_BUSY
     assert json.loads(capsys.readouterr().out) == {
         "command": "resume",
         "status": "busy",
@@ -116,17 +128,17 @@ def test_competing_resume_is_a_busy_result(monkeypatch, capsys):
     }
 
 
-def test_resume_accepts_an_explicit_recovery_decision(monkeypatch, capsys):
+def test_resume_accepts_an_explicit_recovery_decision(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
     calls = []
 
-    def resume(url, run_id, recovery):
+    def resume(url, run_id, recovery, **kwargs):
         calls.append(recovery)
         return {"status": "blocked", "run_id": run_id}
 
     monkeypatch.setattr("agent.cli.resume_agent", resume)
 
-    assert main(["resume", "--run-id", str(uuid.uuid4()), "--recovery", "abort"]) == 1
+    assert main(["resume", "--run-id", str(uuid.uuid4()), "--recovery", "abort", "--config", _configuration_file(tmp_path)]) == 1
     assert calls == ["abort"]
     assert json.loads(capsys.readouterr().out)["status"] == "blocked"
 

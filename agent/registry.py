@@ -32,12 +32,33 @@ class RunRecord:
     lease_expires_at: datetime | None = None
 
 
-def configuration_snapshot(*, base_url: str, model: str, mcp: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the non-secret execution configuration persisted with a run."""
+def configuration_snapshot(
+    *,
+    mcp: Mapping[str, Any],
+    planner: Mapping[str, Any] | None = None,
+    executor: Mapping[str, Any] | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Return effective non-secret component and execution configuration."""
+    if planner is None:
+        planner = {"base_url": base_url or "", "model_name": model or "", "response_format": "json_schema"}
+    if executor is None:
+        executor = planner
     return {
-        "base_url": base_url,
-        "model": model,
+        "planner": _provider_snapshot(planner),
+        "executor": _provider_snapshot(executor),
         "mcp": _without_secrets(mcp),
+    }
+
+
+def _provider_snapshot(provider: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(provider, Mapping):
+        provider = vars(provider)
+    return {
+        "base_url": provider["base_url"],
+        "model_name": provider["model_name"],
+        "response_format": provider["response_format"],
     }
 
 

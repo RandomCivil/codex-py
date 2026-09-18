@@ -20,6 +20,7 @@ from memory.state import (
 )
 
 from .agent import RecoveryDecisionError, apply_recovery_decision, mark_stale_execution_interrupted
+from .configuration import ComponentProviderConfiguration
 from .executor import Executor
 from .migration import _connection_pool, _parse_url, ensure_schema_initialized
 from .planner import Planner
@@ -328,12 +329,16 @@ async def _run(
     recovery: str | None = None,
     cwd: str | None = None,
     log_level: str = "info",
+    configuration: ComponentProviderConfiguration | None = None,
 ) -> dict[str, Any]:
-    model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    if configuration is None:
+        raise ValueError("an explicit component provider configuration is required")
+    planner_configuration = configuration.planner
+    executor_configuration = configuration.executor
     tool_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     snapshot = configuration_snapshot(
-        base_url=os.environ.get("OPENAI_BASE_URL", ""),
-        model=model_name,
+        planner=planner_configuration.__dict__,
+        executor=executor_configuration.__dict__,
         mcp={
             "command": "poetry",
             "args": ["run", "atom-mcp"],
@@ -360,14 +365,18 @@ async def _run(
 
                     trace = RunTrace(level=log_level, run_id=run_id)
                     llm = LLM(
-                        os.environ.get("OPENAI_BASE_URL", ""),
-                        os.environ.get("OPENAI_API_KEY", ""),
-                        model_name,
+                        planner_configuration.base_url,
+                        planner_configuration.api_key,
+                        planner_configuration.model_name,
+                        response_format=planner_configuration.response_format,
                         on_event=trace.llm_event,
                     )
-                    planner = Planner(llm, trace=trace)
+                    planner = Planner(llm, trace=trace, response_format=planner_configuration.response_format)
                     executor = Executor(
-                        model_name=model_name,
+                        base_url=executor_configuration.base_url,
+                        api_key=executor_configuration.api_key,
+                        model_name=executor_configuration.model_name,
+                        response_format=executor_configuration.response_format,
                         checkpointer=saver,
                         run_id=run_id,
                         trace=trace,
@@ -401,8 +410,15 @@ async def _run(
             await registry.release(run_id, owner)
 
 
-def run_agent(url: str, goal: str, cwd: str | None = None, log_level: str = "info") -> dict[str, Any]:
-    return asyncio.run(_run(url, new_run_id(), goal, cwd=cwd, log_level=log_level))
+def run_agent(
+    url: str,
+    goal: str,
+    cwd: str | None = None,
+    log_level: str = "info",
+    *,
+    configuration: ComponentProviderConfiguration | None = None,
+) -> dict[str, Any]:
+    return asyncio.run(_run(url, new_run_id(), goal, cwd=cwd, log_level=log_level, configuration=configuration))
 
 
 def resume_agent(
@@ -411,8 +427,10 @@ def resume_agent(
     recovery: str | None = None,
     cwd: str | None = None,
     log_level: str = "info",
+    *,
+    configuration: ComponentProviderConfiguration | None = None,
 ) -> dict[str, Any]:
-    return asyncio.run(_run(url, run_id, None, recovery, cwd, log_level))
+    return asyncio.run(_run(url, run_id, None, recovery, cwd, log_level, configuration))
 
 
 async def _renew_lease(registry: Any, run_id: str, owner: str) -> None:

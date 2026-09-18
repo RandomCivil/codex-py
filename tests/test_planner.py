@@ -79,6 +79,14 @@ def test_planner_sends_agent_state_to_text_stream_without_tools():
     assert text_stream.request["text_format"] == Planner._TEXT_FORMAT
 
 
+def test_planner_passes_selected_response_format_to_text_stream():
+    text_stream = TextStream('{"revision":1,"goal":"Prepare release","steps":[{"id":"one","intent":"Do one","completion_criterion":"One is done"}]}')
+
+    asyncio.run(Planner(text_stream, response_format="json_object").plan(AgentState("Prepare release")))
+
+    assert text_stream.request["text_format"]["type"] == "json_object"
+
+
 def test_planner_builds_next_revision_without_mutating_prior_plan_or_executions():
     first = Plan(1, "Prepare release", (PlanStep("inspect", "Inspect", "Risks listed"),))
     state = AgentState(

@@ -74,3 +74,45 @@ def test_resume_rejects_configuration_drift_before_runner_is_called():
 
     asyncio.run(scenario())
     assert calls == []
+
+
+def test_effective_component_snapshot_excludes_keys_and_allows_key_rotation():
+    first = configuration_snapshot(
+        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema", "api_key": "one"},
+        executor={"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object", "api_key": "two"},
+        mcp={"command": "atom"},
+    )
+    rotated = configuration_snapshot(
+        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema", "api_key": "rotated"},
+        executor={"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object", "api_key": "rotated"},
+        mcp={"command": "atom"},
+    )
+
+    assert first["planner"] == {"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"}
+    assert first["executor"] == {"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object"}
+    assert "api_key" not in str(first)
+    assert configuration_fingerprint(first) == configuration_fingerprint(rotated)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"base_url": "https://changed.test"},
+        {"model_name": "changed-model"},
+        {"response_format": "json_schema"},
+    ],
+)
+def test_effective_component_drift_changes_resume_fingerprint(change):
+    original = configuration_snapshot(
+        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
+        executor={"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object"},
+        mcp={},
+    )
+    changed_executor = {"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object", **change}
+    changed = configuration_snapshot(
+        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
+        executor=changed_executor,
+        mcp={},
+    )
+
+    assert configuration_fingerprint(original) != configuration_fingerprint(changed)

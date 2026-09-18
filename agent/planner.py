@@ -2,6 +2,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any, Mapping, Protocol
 
+from llm.response_format import ResponseFormat, require_response_format
 from memory.state import AgentState, Plan, PlanStep
 
 
@@ -55,9 +56,10 @@ class Planner:
         "contain exactly id, intent, and completion_criterion."
     )
 
-    def __init__(self, text_stream: TextStream, trace: Any | None = None) -> None:
+    def __init__(self, text_stream: TextStream, trace: Any | None = None, *, response_format: ResponseFormat = "json_schema") -> None:
         self._text_stream = text_stream
         self._trace = trace
+        self._response_format = require_response_format(response_format)
 
     async def plan(self, state: AgentState) -> Plan:
         expected_revision = len(state.plan_history) + 1
@@ -68,6 +70,7 @@ class Planner:
                 "planning cannot exceed the three-revision goal budget"
             )
         request = json.dumps(_state_payload(state), ensure_ascii=False, sort_keys=True)
+        text_format = self._TEXT_FORMAT if self._response_format == "json_schema" else {"type": "json_object"}
         output = "".join(
             [
                 chunk
@@ -75,7 +78,7 @@ class Planner:
                     request,
                     instructions=self._INSTRUCTIONS,
                     tools=None,
-                    text_format=self._TEXT_FORMAT,
+                    text_format=text_format,
                 )
             ]
         )

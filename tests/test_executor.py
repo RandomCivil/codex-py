@@ -99,6 +99,8 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert "handoff and evidence summary" in completion_prompt
     assert "subsequent Plan steps will receive" in completion_prompt
     assert "message transcript" in completion_prompt
+    assert "top-level JSON object" in completion_prompt
+    assert 'Do not wrap the receipt in `{"type":"json_object","result":...}`' in completion_prompt
     # MCP tools remain non-strict; the separate completion reply uses JSON Schema.
     completion_tools, completion_options = model.bindings[1]
     assert completion_tools is None
@@ -106,6 +108,61 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["name"] == "step_completion"
     assert response_format["json_schema"]["strict"] is True
+
+
+def test_executor_json_object_mode_keeps_local_completion_validation(monkeypatch):
+    model = ControlledModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish it", "Release is available"),))
+    state = AgentState("Prepare release", plan_history=(plan,))
+
+    async def run():
+        async with Executor(model=model, response_format="json_object") as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.execution.status == "completed", execution.execution.error
+    assert model.bindings[1][0] is None
+    assert model.bindings[1][1] == {"response_format": {"type": "json_object"}}
+    completion_prompt = model.calls[2][-1].content
+    assert "Follow this example exactly in shape" in completion_prompt
+    assert '"completed":true,"completion_criterion_met":true' in completion_prompt
+    assert "Do not include any other fields, including step_id, revision" in completion_prompt
+
+
+def test_executor_requires_explicit_provider_values_instead_of_model_environment(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
+    monkeypatch.setenv("OPENAI_MODEL", "environment-model")
+
+    with pytest.raises(ValueError, match="requires explicit"):
+        Executor()
+
+    observed = {}
+
+    class Model:
+        pass
+
+    def build_model(**kwargs):
+        observed.update(kwargs)
+        return Model()
+
+    monkeypatch.setattr("agent.executor.ChatOpenAI", build_model)
+    executor = Executor(
+        base_url="https://provider.test/v1",
+        api_key="configured-key",
+        model_name="configured-model",
+    )
+
+    assert executor._model.__class__ is Model
+    assert observed == {
+        "base_url": "https://provider.test/v1",
+        "api_key": "configured-key",
+        "model": "configured-model",
+        "max_retries": 0,
+    }
 
 
 def test_executor_runs_one_model_response_tool_call_batch_concurrently_and_waits(monkeypatch):

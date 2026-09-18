@@ -10,6 +10,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, ConfigDict, Field
 
+from llm.response_format import ResponseFormat, require_response_format
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
 
 
@@ -43,6 +44,14 @@ _COMPLETION_RESPONSE_FORMAT = {
 }
 
 
+def _completion_response_format(response_format: ResponseFormat) -> dict[str, Any]:
+    if response_format == "json_schema":
+        return _COMPLETION_RESPONSE_FORMAT
+    if response_format == "json_object":
+        return {"type": "json_object"}
+    raise ValueError("response_format must be json_schema or json_object")
+
+
 class ExecutorGraphState(MessagesState, total=False):
     execution: StepExecution
 
@@ -67,6 +76,7 @@ class Executor:
         base_url: str | None = None,
         api_key: str | None = None,
         model_name: str | None = None,
+        response_format: ResponseFormat = "json_schema",
         command: str = "poetry",
         args: tuple[str, ...] = ("run", "atom-mcp"),
         cwd: str = "/home/xzp/workspace/atom-mcp",
@@ -82,12 +92,17 @@ class Executor:
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
-        self._model = model if model is not None else ChatOpenAI(
-            base_url=base_url,
-            api_key=api_key or os.environ.get("OPENAI_API_KEY"),
-            model=model_name or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-            max_retries=0,
-        )
+        self._response_format = require_response_format(response_format)
+        if model is None:
+            if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
+                raise ValueError("Executor requires explicit base_url, api_key, and model_name when no model is injected")
+            model = ChatOpenAI(
+                base_url=base_url,
+                api_key=api_key,
+                model=model_name,
+                max_retries=0,
+            )
+        self._model = model
         self._connection = {
             "transport": "stdio",
             "command": command,
@@ -177,21 +192,35 @@ class Executor:
             operational_final = graph_result["messages"][-1]
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="tool round budget exhausted"))
+            completion_prompt = (
+                "Submit the JSON completion receipt now. `result` is the handoff and "
+                "evidence summary that subsequent Plan steps will receive. Derive it "
+                "only from the preceding messages: state the material outcome and the "
+                "supporting tool output, artifact path, resource identifier, or state "
+                "fact. Be concise; do not merely say it completed or reproduce the "
+                "message transcript. Return one top-level JSON object directly with "
+                "exactly these fields: completed, completion_criterion_met, result, "
+                "files_read, files_modified, and observations. Do not wrap the receipt "
+                'in `{"type":"json_object","result":...}`; `json_object` is only the '
+                "response format, not a field in your response. Do not include any other "
+                "fields, including step_id, revision, status, intent, artifact, outcome, "
+                "or type. Set completed and completion_criterion_met to true only if the "
+                "selected completion criterion was met: "
+                f"{step.completion_criterion}"
+            )
+            if self._response_format == "json_object":
+                completion_prompt += (
+                    " Follow this example exactly in shape (use facts from the preceding "
+                    "messages, not these example values): "
+                    '{"completed":true,"completion_criterion_met":true,"result":"The '
+                    'selected outcome is complete; supporting evidence is recorded.",'
+                    '"files_read":["docs/example.md"],"files_modified":["src/example.py"],'
+                    '"observations":["The completion criterion is satisfied."]}'
+                )
             final = await self._completion_model.ainvoke(
                 [
                     *graph_result["messages"],
-                    HumanMessage(
-                        content=(
-                            "Submit the JSON completion receipt now. `result` is the handoff and "
-                            "evidence summary that subsequent Plan steps will receive. Derive it "
-                            "only from the preceding messages: state the material outcome and the "
-                            "supporting tool output, artifact path, resource identifier, or state "
-                            "fact. Be concise; do not merely say it completed or reproduce the "
-                            "message transcript. Set completion_criterion_met to true only if the "
-                            "selected completion criterion was met: "
-                            f"{step.completion_criterion}"
-                        )
-                    ),
+                    HumanMessage(content=completion_prompt),
                 ]
             )
             if self._trace is not None:
@@ -237,9 +266,10 @@ class Executor:
             self._tools = tools
             # MCP hosts do not promise OpenAI's strict function-tool schema, so
             # operational tool use remains non-strict. Completion is instead a
-            # separate, strict JSON Schema response after MCP work ends.
+            # separate structured response after MCP work ends; local parsing
+            # and invariant validation apply in both provider modes.
             self._bound_model = self._model.bind_tools(tools)
-            self._completion_model = self._model.bind(response_format=_COMPLETION_RESPONSE_FORMAT)
+            self._completion_model = self._model.bind(response_format=_completion_response_format(self._response_format))
             # Tool errors are part of the model/tool conversation: a bad argument or
             # an MCP error must be returned to the model so it can correct its next
             # call, rather than aborting this Step and causing top-level replanning.

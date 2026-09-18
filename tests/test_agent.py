@@ -287,18 +287,6 @@ def test_agent_aborts_an_interrupted_step_without_executing_more_work():
     assert executor.calls == []
 
 
-def test_agent_rejects_retry_for_an_interrupted_non_idempotent_step():
-    plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish", "Released"),))
-    state = AgentState(
-        "Prepare release",
-        plan_history=(plan,),
-        step_executions=(StepExecution(1, "publish", "interrupted"),),
-    )
-
-    with pytest.raises(RecoveryDecisionError, match="retry"):
-        asyncio.run(Agent(object(), ControlledExecutor()).run(state, recovery="retry"))
-
-
 def test_agent_requires_recovery_for_a_running_step_instead_of_reexecuting_it():
     plan = Plan(
         1,

@@ -13,3 +13,5 @@
 ## Comments
 
 Implemented the safe interrupted Step-execution recovery path. Executor graphs can use a Checkpointer with either an explicit thread ID or the stable `{run_id}:r{revision}:s{step_id}` identity, and persist `running` before model/tool work. Agent and durable lifecycle seams now require explicit recovery for stale `running`/`interrupted` work: `fail` records failure for immutable replanning, `abort` returns a Blocked result retaining history, and `retry` is rejected for unannotated MCP tools. CLI resume accepts `--recovery` and maps invalid recovery to exit code 5. Controlled coverage passes; MySQL integration tests remain explicitly skipped unless `CODEX_TEST_MYSQL_URL` is configured.
+
+Superseded for interrupted-step recovery by issue 05 and ADR-0004. The original idempotency-gated, explicit-retry policy remains historical behavior until issue 05 is implemented.

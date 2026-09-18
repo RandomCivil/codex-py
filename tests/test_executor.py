@@ -231,6 +231,27 @@ def test_executor_checkpoints_running_before_model_work(monkeypatch):
     )
 
 
+def test_executor_recovery_uses_a_fresh_attempt_thread_and_reconciliation_marker(monkeypatch):
+    model = ControlledModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    saver = InMemorySaver()
+    plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish it", "Release is available"),))
+    state = AgentState("Prepare release", plan_history=(plan,))
+
+    async def run():
+        async with Executor(model=model, checkpointer=saver, run_id="run-1") as executor:
+            return await executor.execute(state, 1, "publish", recovery=True, attempt=2)
+
+    outcome = asyncio.run(run())
+
+    assert outcome.execution.status == "completed"
+    assert "fresh execution attempt" in model.calls[0][1].content
+    checkpoints = list(saver.list({"configurable": {"thread_id": "run-1:r1:spublish:a2"}}))
+    assert checkpoints
+
+
 def _load_tools(*tools):
     async def load(session, **kwargs):
         return list(tools)

@@ -129,3 +129,11 @@ def test_resume_accepts_an_explicit_recovery_decision(monkeypatch, capsys):
     assert main(["resume", "--run-id", str(uuid.uuid4()), "--recovery", "abort"]) == 1
     assert calls == ["abort"]
     assert json.loads(capsys.readouterr().out)["status"] == "blocked"
+
+
+def test_resume_rejects_redundant_retry_recovery_selection(monkeypatch, capsys):
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+
+    assert main(["resume", "--run-id", str(uuid.uuid4()), "--recovery", "retry"]) == 5
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "invalid"

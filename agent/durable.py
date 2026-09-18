@@ -29,17 +29,23 @@ from .registry import (
     RunBusyError,
     configuration_snapshot,
 )
+from .recovery import MySQLStepRecoveryStore
 
 
 class GraphState(TypedDict, total=False):
     agent_state: AgentState
     status: str
+    run_id: str
     # 发生变化的文件路径
     files_modified: list[str]
     # 读取过的文件路径
     files_read: list[str]
     # 对读取过的文件的总结出的关键发现
     observations: list[str]
+    persistence_version: int
+    recovery_attempt: int
+    recovery_step: tuple[int, str]
+    recovery_active: bool
 
 
 def new_run_id() -> str:
@@ -49,11 +55,19 @@ def new_run_id() -> str:
 class DurableAgent:
     """Run the existing Planner and Executor behind a durable LangGraph graph."""
 
-    def __init__(self, planner: Planner, executor: Executor, saver: Any, trace: Any | None = None) -> None:
+    def __init__(
+        self,
+        planner: Planner,
+        executor: Executor,
+        saver: Any,
+        trace: Any | None = None,
+        recovery_store: Any | None = None,
+    ) -> None:
         self._planner = planner
         self._executor = executor
         self._saver = saver
         self._trace = trace
+        self._recovery_store = recovery_store
 
     def _graph(self):
         graph = StateGraph(GraphState)
@@ -77,7 +91,18 @@ class DurableAgent:
             if current is not None and current.status == "failed":
                 return {}
             updated = agent_state.with_step_execution(StepExecution(revision, step_id, "running"))
-            return {"agent_state": updated}
+            version = state.get("persistence_version", 0) + 1
+            if self._recovery_store is not None:
+                await self._recovery_store.record(
+                    state.get("run_id", ""),
+                    updated.step_executions[-1],
+                    version=version,
+                )
+            return {
+                "agent_state": updated,
+                "persistence_version": version,
+                "recovery_active": state.get("recovery_active", False),
+            }
 
         async def execute(state: GraphState) -> GraphState:
             agent_state = state["agent_state"]
@@ -96,6 +121,8 @@ class DurableAgent:
                         files_modified=tuple(state.get("files_modified", [])),
                         observations=tuple(state.get("observations", [])),
                     ),
+                    recovery=state.get("recovery_active", False),
+                    attempt=state.get("recovery_attempt"),
                 )
                 execution = outcome.execution
             if self._trace is not None:
@@ -103,6 +130,17 @@ class DurableAgent:
             updates: GraphState = {"agent_state": agent_state.with_step_execution(execution)}
             if isinstance(outcome, ExecutionOutcome) and outcome.context_update is not None:
                 updates.update(_merge_context(state, outcome.context_update, revision, step_id))
+            version = state.get("persistence_version", 0) + 1
+            updates["persistence_version"] = version
+            updates["recovery_active"] = False
+            if self._recovery_store is not None:
+                await self._recovery_store.record(
+                    state.get("run_id", ""),
+                    execution,
+                    context_update=outcome.context_update if isinstance(outcome, ExecutionOutcome) else None,
+                    recovery=state.get("status") == "resuming",
+                    version=version,
+                )
             return updates
 
         async def replan(state: GraphState) -> GraphState:
@@ -151,13 +189,52 @@ class DurableAgent:
     ) -> dict[str, Any]:
         config = {"configurable": {"thread_id": run_id}}
         graph = self._graph()
+        recovery_attempt: int | None = None
+        recovery_active = False
+        restored_context: GraphState = {}
         if state is None:
             checkpoint = await graph.aget_state(config)
             values = checkpoint.values
+            if self._recovery_store is not None:
+                snapshot = await self._recovery_store.restore(
+                    run_id, values.get("persistence_version", 0)
+                )
+                if snapshot.latest_executions and values.get("agent_state"):
+                    restored = values["agent_state"]
+                    if isinstance(restored, dict):
+                        restored = deserialize_agent_state(restored)
+                    state = _restore_recovery_state(restored, snapshot.latest_executions)
+                    values = dict(values)
+                    values["agent_state"] = state
+                    values["files_read"] = list(snapshot.context.files_read)
+                    values["files_modified"] = list(snapshot.context.files_modified)
+                    values["observations"] = list(snapshot.context.observations)
+                    restored_context = {
+                        "files_read": values["files_read"],
+                        "files_modified": values["files_modified"],
+                        "observations": values["observations"],
+                    }
+                    interrupted = next(
+                        (item for item in snapshot.latest_executions if item.status == "interrupted"),
+                        None,
+                    )
+                    if interrupted is not None:
+                        recovery_active = True
+                        prior = [
+                            item for item in snapshot.attempts
+                            if (item.revision, item.step_id) == (interrupted.revision, interrupted.step_id)
+                        ]
+                        recovery_attempt = (prior[-1].attempt + 1) if prior else 1
             if values.get("agent_state"):
                 state = values["agent_state"]
                 if isinstance(state, dict):
                     state = deserialize_agent_state(state)
+                if self._trace is not None:
+                    self._trace.recovery_context(
+                        list(values.get("files_read", [])),
+                        list(values.get("files_modified", [])),
+                        list(values.get("observations", [])),
+                    )
                 if values.get("status") in {"completed", "blocked"}:
                     return {
                         "run_id": run_id,
@@ -165,14 +242,42 @@ class DurableAgent:
                         "state": serialize_agent_state(state),
                     }
         if state is not None:
-            state, abort = apply_recovery_decision(state, recovery)
+            abort = False
+            stale = mark_stale_execution_interrupted(state)
+            interrupted = next((item for item in stale.step_executions if item.status == "interrupted"), None)
+            was_running = any(item.status == "running" for item in state.step_executions)
+            if interrupted is not None and recovery is None:
+                state = stale
+                recovery_active = True
+                if self._recovery_store is not None:
+                    history = await self._recovery_store.history(run_id)
+                    prior = [
+                        item for item in history
+                        if (item.revision, item.step_id) == (interrupted.revision, interrupted.step_id)
+                    ]
+                    recovery_attempt = (prior[-1].attempt + 1) if prior else 1
+            else:
+                state, abort = apply_recovery_decision(stale, recovery)
+            if was_running and interrupted is not None and self._recovery_store is not None:
+                history = await self._recovery_store.history(run_id)
+                version = (history[-1].version + 1) if history else 1
+                interrupted_record = await self._recovery_store.record(run_id, interrupted, version=version)
+                recovery_active = recovery is None
+                recovery_attempt = interrupted_record.attempt + 1
             if abort:
                 result = await graph.ainvoke(
                     {"agent_state": state, "status": "blocked"}, config=config
                 )
                 return {"run_id": run_id, "status": "blocked", "state": serialize_agent_state(result["agent_state"])}
         result = await graph.ainvoke(
-            {"agent_state": state, "status": "resuming"} if state is not None else None,
+            ({
+                "agent_state": state,
+                "status": "resuming",
+                "run_id": run_id,
+                "recovery_active": recovery_active,
+                **restored_context,
+                **({"recovery_attempt": recovery_attempt} if recovery_attempt is not None else {}),
+            } if state is not None else {"run_id": run_id}),
             config=config,
         )
         return {
@@ -191,9 +296,20 @@ class DurableAgent:
             return
         if isinstance(state_payload, dict):
             state_payload = deserialize_agent_state(state_payload)
+        was_running = any(item.status == "running" for item in state_payload.step_executions)
         state = mark_stale_execution_interrupted(state_payload)
+        version = checkpoint.values.get("persistence_version", 0) + 1
+        if was_running and self._recovery_store is not None:
+            interrupted = next(item for item in state.step_executions if item.status == "interrupted")
+            await self._recovery_store.record(run_id, interrupted, version=version)
         await graph.ainvoke(
-            {"agent_state": state, "status": "interrupted"}, config=config
+            {
+                "agent_state": state,
+                "status": "interrupted",
+                "run_id": run_id,
+                "persistence_version": version,
+            },
+            config=config,
         )
 
 
@@ -258,7 +374,13 @@ async def _run(
                         tool_cwd=tool_cwd,
                     )
                     initial = AgentState(goal) if goal is not None else None
-                    durable = DurableAgent(planner, executor, saver, trace=trace)
+                    durable = DurableAgent(
+                        planner,
+                        executor,
+                        saver,
+                        trace=trace,
+                        recovery_store=MySQLStepRecoveryStore(pool),
+                    )
                     with _cancel_on_signals():
                         result = await durable.run(run_id, initial, recovery)
                 except (asyncio.CancelledError, KeyboardInterrupt):
@@ -332,6 +454,17 @@ def _next_step(state: AgentState) -> tuple[int | None, str | None]:
         if execution is None or execution.status != "completed":
             return plan.revision, step.id
     return None, None
+
+
+def _restore_recovery_state(
+    state: AgentState,
+    executions: tuple[StepExecution, ...],
+) -> AgentState:
+    """Overlay the latest project recovery projection on checkpointed plans."""
+    restored = state
+    for execution in executions:
+        restored = restored.with_step_execution(execution)
+    return restored
 
 
 def _after_plan(state: GraphState) -> str:

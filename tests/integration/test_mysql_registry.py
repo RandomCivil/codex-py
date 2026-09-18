@@ -7,7 +7,6 @@ import pytest
 from agent.migration import _connection_pool, _parse_url, migrate_database
 from agent.registry import ConfigurationMismatchError, MySQLRunRegistry, RunBusyError
 from agent.durable import DurableAgent, _mysql_saver
-from agent import RecoveryDecisionError
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, Plan, PlanStep, StepExecution, deserialize_agent_state, serialize_agent_state
 
 
@@ -65,7 +64,7 @@ def test_mysql_checkpoint_resumes_terminal_work_in_a_fresh_application_instance(
         async def __aexit__(self, *args):
             return None
 
-        async def execute(self, state, revision, step_id):
+        async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
             self.calls += 1
             return ExecutionOutcome(
                 StepExecution(revision, step_id, "completed", result="Inspected"),
@@ -95,10 +94,10 @@ def test_mysql_checkpoint_resumes_terminal_work_in_a_fresh_application_instance(
     MYSQL_URL is None,
     reason="CODEX_TEST_MYSQL_URL is not configured; skipping MySQL integration test",
 )
-def test_mysql_checkpoint_refuses_stale_running_work_without_recovery():
+def test_mysql_checkpoint_automatically_recovers_stale_running_work():
     class Planner:
         async def plan(self, state):
-            raise AssertionError("stale work must require a recovery decision")
+            raise AssertionError("the existing plan must be restored")
 
     class Executor:
         async def __aenter__(self):
@@ -107,8 +106,11 @@ def test_mysql_checkpoint_refuses_stale_running_work_without_recovery():
         async def __aexit__(self, *args):
             return None
 
-        async def execute(self, state, revision, step_id):
-            raise AssertionError("stale work must not execute")
+        async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
+            return ExecutionOutcome(
+                StepExecution(revision, step_id, "completed", result="Inspected"),
+                ContextUpdate(),
+            )
 
     run_id = str(uuid.uuid4())
     plan = Plan(1, "Inspect repo", (PlanStep("inspect", "Inspect", "Inspected"),))
@@ -121,9 +123,9 @@ def test_mysql_checkpoint_refuses_stale_running_work_without_recovery():
                 {"agent_state": serialize_agent_state(state), "status": "interrupted"},
                 config={"configurable": {"thread_id": run_id}},
             )
-        async with _mysql_saver(MYSQL_URL) as saver:
-            with pytest.raises(RecoveryDecisionError, match="requires --recovery"):
-                await DurableAgent(Planner(), Executor(), saver).run(run_id)
+            async with _mysql_saver(MYSQL_URL) as saver:
+                result = await DurableAgent(Planner(), Executor(), saver).run(run_id)
+                assert result["status"] == "completed"
 
     migrate_database(MYSQL_URL)
     asyncio.run(scenario())

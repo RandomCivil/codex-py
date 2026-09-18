@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 
 ExecutionStatus = Literal["pending", "running", "interrupted", "completed", "failed", "skipped"]
-RecoveryDecision = Literal["retry", "fail", "abort"]
+RecoveryDecision = Literal["fail", "abort"]
 _EXECUTION_STATUSES = frozenset({"pending", "running", "interrupted", "completed", "failed", "skipped"})
 
 

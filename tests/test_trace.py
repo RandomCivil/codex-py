@@ -69,3 +69,19 @@ def test_trace_prefixes_each_line_with_run_id():
     trace.plan("started", 1)
 
     assert output.getvalue() == "[run-123] [plan] started revision=1\n"
+
+
+def test_trace_prints_every_loaded_recovery_context_value():
+    output = StringIO()
+    trace = RunTrace(output, run_id="run-123")
+
+    trace.recovery_context(
+        ["README.md"],
+        ["agent/durable.py"],
+        ["The checkpointed work is trustworthy."],
+    )
+
+    assert output.getvalue() == (
+        '[run-123] [recovery context] data={"files_modified": ["agent/durable.py"], '
+        '"files_read": ["README.md"], "observations": ["The checkpointed work is trustworthy."]}\n'
+    )

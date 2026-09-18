@@ -54,8 +54,6 @@ def apply_recovery_decision(
         return state, False
     if recovery is None:
         raise RecoveryDecisionError("an interrupted Step execution requires --recovery")
-    if recovery == "retry":
-        raise RecoveryDecisionError("retry is unavailable for non-idempotent MCP tools")
     if recovery == "abort":
         return state, True
     if recovery != "fail":

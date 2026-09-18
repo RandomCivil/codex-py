@@ -35,7 +35,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("command", choices=("migrate", "run", "resume"))
     parser.add_argument("--goal")
     parser.add_argument("--run-id")
-    parser.add_argument("--recovery", choices=("retry", "fail", "abort"))
+    parser.add_argument("--recovery", choices=("fail", "abort"))
     parser.add_argument("--cwd", help="working directory supplied to Atom MCP tool calls")
     parser.add_argument("--log-level", "--level", dest="log_level", choices=("info", "error"))
     try:

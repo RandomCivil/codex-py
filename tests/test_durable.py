@@ -23,7 +23,7 @@ class Executor:
     async def __aexit__(self, *args):
         return None
 
-    async def execute(self, state, revision, step_id, step_context=None):
+    async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
         self.calls += 1
         return ExecutionOutcome(
             StepExecution(revision, step_id, "completed", result="Inspected"),
@@ -48,7 +48,7 @@ class ContextRecordingExecutor(Executor):
         super().__init__()
         self.contexts = []
 
-    async def execute(self, state, revision, step_id, step_context=None):
+    async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
         self.calls += 1
         self.contexts.append(step_context)
         if step_id == "inspect":
@@ -114,7 +114,7 @@ class FailOnSecondStepExecutor(Executor):
         super().__init__()
         self.contexts = []
 
-    async def execute(self, state, revision, step_id, step_context=None):
+    async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
         self.calls += 1
         self.contexts.append(step_context)
         if self.calls == 1:
@@ -134,7 +134,7 @@ class CompleteAfterResumeExecutor(Executor):
         super().__init__()
         self.contexts = []
 
-    async def execute(self, state, revision, step_id, step_context=None):
+    async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
         self.calls += 1
         self.contexts.append(step_context)
         return ExecutionOutcome(
@@ -148,7 +148,7 @@ class FailureDoesNotAddContextExecutor(Executor):
         super().__init__()
         self.contexts = []
 
-    async def execute(self, state, revision, step_id, step_context=None):
+    async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
         self.calls += 1
         self.contexts.append(step_context)
         if (revision, step_id) == (1, "inspect"):
@@ -239,7 +239,7 @@ class ReplanningPlanner:
 
 
 class FailOnceExecutor(Executor):
-    async def execute(self, state, revision, step_id, step_context=None):
+    async def execute(self, state, revision, step_id, step_context=None, *, recovery=False, attempt=None):
         self.calls += 1
         if self.calls == 1:
             return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="inspection failed"))
@@ -281,7 +281,7 @@ def test_durable_agent_replans_after_failure_and_retains_immutable_history():
     assert [(item.revision, item.status) for item in state.step_executions] == [(1, "failed"), (2, "completed")]
 
 
-def test_durable_agent_requires_recovery_for_a_stale_running_step():
+def test_durable_agent_automatically_recovers_a_stale_running_step():
     saver = InMemorySaver()
     plan = Plan(1, "Inspect repo", (PlanStep("inspect", "Inspect", "Inspected"),))
     state = AgentState(
@@ -290,8 +290,9 @@ def test_durable_agent_requires_recovery_for_a_stale_running_step():
         step_executions=(StepExecution(1, "inspect", "running"),),
     )
 
-    with pytest.raises(RecoveryDecisionError, match="requires --recovery"):
-        asyncio.run(DurableAgent(Planner(), Executor(), saver).run("run-3", state))
+    result = asyncio.run(DurableAgent(Planner(), Executor(), saver).run("run-3", state))
+
+    assert result["status"] == "completed"
 
 
 def test_durable_abort_is_checkpointed_as_a_terminal_result():

@@ -37,8 +37,12 @@ One sequentially executed unit of a Plan, with its intended outcome and completi
 _Avoid_: task, instruction, tool invocation
 
 **Step execution**:
-The Executor's single attempt to complete one Plan step in a Plan revision, recorded in Agent state by revision and step ID without changing the Plan. Its status is pending, running, completed, failed, skipped, or interrupted; an interrupted execution awaits an explicit recovery decision unless its tool side effects are known to be idempotent.
-_Avoid_: plan mutation, replanning, autonomous recovery
+The latest attempt to complete one Plan step in a Plan revision, recorded in Agent state by revision and step ID without changing the Plan. Its status is pending, running, completed, failed, skipped, or interrupted; an interrupted execution may be restarted as a fresh attempt that reconciles the intended outcome without treating unconfirmed prior tool output as fact.
+_Avoid_: plan mutation, replanning, continued transcript
+
+**Execution attempt**:
+One immutable, numbered effort to complete a specific Plan step. A new attempt begins when an interrupted Step execution is recovered; completed Plan steps do not receive another attempt.
+_Avoid_: transcript continuation, overwritten execution
 
 **Agent**:
 The top-level coordinator that owns the Plan–Execute loop, records execution results in state, and decides whether to invoke the Planner again.
@@ -65,12 +69,12 @@ A renewable 60-second MySQL claim granting one process exclusive authority to ex
 _Avoid_: lock, active session
 
 **Recovery decision**:
-The caller's explicit disposition of an interrupted Step execution: retry when its side effects are idempotent, record it as failed for replanning, or abort the Agent run as blocked.
-_Avoid_: automatic retry, crash recovery
+The caller's disposition of an interrupted Step execution: start a fresh recovery attempt, record it as failed for replanning, or abort the Agent run as blocked.
+_Avoid_: transcript continuation, crash recovery
 
 **Idempotent tool**:
-An MCP tool whose host registration explicitly declares that repeating the same invocation does not create an additional externally observable effect. An unannotated tool is non-idempotent, and an interrupted Step execution is retryable only when every tool it invoked is idempotent.
-_Avoid_: safe tool, retryable step
+An MCP tool whose host registration explicitly declares that repeating the same invocation does not create an additional externally observable effect. Idempotency may inform an Executor's reconciliation strategy, but does not determine whether an interrupted Step execution can start a fresh recovery attempt.
+_Avoid_: recovery gate, retryable step
 
 **Blocked result**:
 The terminal Agent result emitted when its Plan-revision budget is exhausted without completing the goal, or when the caller aborts an interrupted Agent run; it retains the Plan and execution history.
@@ -103,6 +107,10 @@ _Avoid_: message transcript, tool trace
 **Context update**:
 The strict structured portion of a successful Step execution's completion receipt that extends Step context with files read, files modified, and observations attributed to that Plan step.
 _Avoid_: inferred tool trace, raw tool output
+
+**Step recovery record**:
+The durable recovery-facing record for one Execution attempt, pairing its Step execution with the Context update produced on successful completion. Its immutable history is used to reconstruct trustworthy Step context when an interrupted run is resumed.
+_Avoid_: checkpoint internals, message transcript, tool trace
 
 **Tool-calling model**:
 A LangChain chat model configured for an OpenAI-compatible provider that can request tools from an MCP tool set during Step execution.

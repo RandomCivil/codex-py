@@ -77,6 +77,7 @@ class Executor:
         checkpointer: Any | None = None,
         thread_id: str | None = None,
         run_id: str | None = None,
+        attempt: int | None = None,
         trace: Any | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
@@ -104,6 +105,7 @@ class Executor:
         self._checkpointer = checkpointer
         self._thread_id = thread_id
         self._run_id = run_id
+        self._attempt = attempt
         self._trace = trace
         self._client = None
         self._session = None
@@ -139,6 +141,9 @@ class Executor:
         revision: int,
         step_id: str,
         step_context: StepContext | None = None,
+        *,
+        recovery: bool = False,
+        attempt: int | None = None,
     ) -> ExecutionOutcome:
         self._require_active()
         step = _resolve_step(state, revision, step_id)
@@ -148,7 +153,9 @@ class Executor:
         try:
             self._active_step = step
             self._active_revision = revision
-            graph_result = await self._execute_with_tools(state, revision, step, step_context)
+            graph_result = await self._execute_with_tools(
+                state, revision, step, step_context, recovery=recovery, attempt=attempt
+            )
         except Exception as error:
             if self._checkpointer is not None:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
@@ -215,6 +222,9 @@ class Executor:
         revision: int,
         step: PlanStep,
         step_context: StepContext | None = None,
+        *,
+        recovery: bool = False,
+        attempt: int | None = None,
     ) -> dict[str, Any]:
         if self._tools is None:
             self._client = MultiServerMCPClient({"atom": self._connection})
@@ -317,11 +327,26 @@ class Executor:
             HumanMessage(content=json.dumps(_request_payload(state, revision, step), sort_keys=True)),
             HumanMessage(content=_format_step_context(step_context or StepContext())),
         ]
+        if recovery:
+            messages.insert(
+                1,
+                HumanMessage(
+                    content=(
+                        "## Recovery attempt\n\n"
+                        "This is a fresh execution attempt after an earlier attempt was interrupted. "
+                        "The earlier attempt's messages and tool output are unconfirmed and are not facts. "
+                        "Inspect and reconcile the current external state before taking action, then pursue "
+                        "the original Plan step completion criterion."
+                    )
+                ),
+            )
         self._rounds = 0
         config = None
         thread_id = self._thread_id
         if thread_id is None and self._run_id is not None:
-            thread_id = f"{self._run_id}:r{revision}:s{step.id}"
+            selected_attempt = attempt if attempt is not None else self._attempt
+            suffix = f":a{selected_attempt}" if selected_attempt is not None else ""
+            thread_id = f"{self._run_id}:r{revision}:s{step.id}{suffix}"
         if thread_id is not None:
             config = {"configurable": {"thread_id": thread_id}}
         return await self._graph.ainvoke({"messages": messages}, config=config)

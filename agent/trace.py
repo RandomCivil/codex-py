@@ -69,6 +69,19 @@ class RunTrace:
         suffix = f" {detail}" if detail else ""
         self._line(f"[execute] {status} revision={revision} step={step_id}{suffix}")
 
+    def recovery_context(self, files_read: list[str], files_modified: list[str], observations: list[str]) -> None:
+        """Show every trustworthy Step-context value loaded for a resume."""
+        self._line(
+            "[recovery context] data="
+            + _compact(
+                {
+                    "files_read": files_read,
+                    "files_modified": files_modified,
+                    "observations": observations,
+                }
+            )
+        )
+
     def tool_call(self, name: str, arguments: Any, call_id: str | None = None) -> None:
         if self._level == "error":
             suffix = f" id={call_id}" if call_id else ""

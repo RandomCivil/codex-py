@@ -8,11 +8,74 @@ Agent 的顶层协调状态和每个 Step execution 都使用 LangGraph checkpoi
 
 - 异步 LLM 适配器，支持 OpenAI Responses API 的文本流和事件流。
 - 基于 `model → ToolNode → model` 的 MCP 工具执行图。
+- 同一模型响应中的 Tool-call batch 并发执行，等待全部调用完成后按请求顺序返回结果；单个调用失败不会丢弃同批的其他结果。
 - 不可变、可校验的 Plan revision 和可审计的 Step execution 历史。
 - MySQL checkpoint、运行登记和 60 秒独占 lease；lease 每 15 秒续租。
 - 配置指纹校验，避免恢复时静默更换模型或 MCP 配置。
 - 通过 CLI 以一行 JSON 输出运行结果，便于脚本调用。
 - 运行过程中将 LLM thought/output、Plan–Execute 状态以及 MCP tool call/result 实时输出到 stderr；最终结果仍只写到 stdout。
+
+### 工具调用批次
+
+模型在一次响应中发出的所有函数调用组成一个 Tool-call batch。Executor 会在同一个
+Step execution 内并发启动这些调用，并等待整个批次 settle 后才再次调用模型或处理完成结果。
+返回给模型的 ToolMessage 保留原始 tool-call ID 和请求顺序；单个工具失败会作为该调用的错误结果返回，
+不会提前结束同批的其他调用。调用被取消时，未完成的工具会被取消，后续模型调用也不会继续。
+
+Tool-call batch 只影响单个 Step 内的一轮工具调用，不会并行执行 Plan steps。同一批调用没有执行顺序保证；
+存在依赖关系的操作应由模型拆分到后续响应中。
+
+## 执行流程
+
+一次 run 由 DurableAgent 按以下顺序协调：
+
+1. 从 MySQL checkpoint 恢复状态；如果存在中断的 Step，先依据 `--recovery` 决定标记失败并重新规划，或直接进入 `blocked`。
+2. Planner 生成初始 Plan；每个 Plan revision 最多包含三个版本。
+3. 按 Plan 顺序逐个执行 Step。Step 开始前写入 `running` 状态，完成后保存 completion receipt 和上下文更新。
+4. Step 失败时生成新的 Plan revision；第三个 revision 仍失败则进入 `blocked`。
+5. 所有 Step 完成后进入 `completed`。每个关键节点通过 LangGraph checkpoint 持久化，进程重启后可以恢复。
+
+```mermaid
+flowchart TD
+    S([START]) --> R{恢复状态?}
+    R -->|blocked| B[blocked]
+    R -->|interrupted| I[interrupted]
+    R -->|正常| P[plan]
+    P -->|还有 Step| M[mark_running]
+    P -->|没有 Step| C[complete]
+    M -->|Step 已失败| RP[replan]
+    M -->|有待执行 Step| E[execute]
+    M -->|全部完成| C
+    E -->|成功且还有 Step| M
+    E -->|失败| RP
+    E -->|成功且全部完成| C
+    RP -->|revision < 3| M
+    RP -->|revision = 3| B
+    C --> END([END])
+    B --> END
+    I --> END
+```
+
+### 单个 Step 的 Executor 图
+
+Executor 为一个 Step 构建并运行独立的 LangGraph。`ToolNode` 会处理当前模型响应中的整个
+Tool-call batch；没有工具调用时直接结束工具图。工具图结束后，Executor 再单独请求严格 JSON
+格式的 completion receipt，用于判断 completion criterion 并生成后续 Step 的上下文。
+
+```mermaid
+flowchart LR
+    S([START]) --> M[mark_running]
+    M --> L[model]
+    L -->|有 tool_calls 且未超出轮数| T[tools / ToolNode]
+    T -->|等待整个 Tool-call batch| L
+    L -->|无 tool_calls 或达到轮数上限| E([END])
+    E --> Q[completion receipt]
+    Q --> X{criterion met?}
+    X -->|是| D[Step completed]
+    X -->|否或格式无效| F[Step failed]
+```
+
+Plan steps 始终串行；只有同一模型响应内相互独立的工具调用会在 `ToolNode` 中并发执行。
 
 ## 安装
 

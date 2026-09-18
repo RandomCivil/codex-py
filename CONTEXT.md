@@ -115,3 +115,7 @@ _Avoid_: checkpoint internals, message transcript, tool trace
 **Tool-calling model**:
 A LangChain chat model configured for an OpenAI-compatible provider that can request tools from an MCP tool set during Step execution.
 _Avoid_: text stream, planner model
+
+**Tool-call batch**:
+All function calls emitted in one response by a Tool-calling model. An Executor starts every call in the batch concurrently, waits until every call has settled, and returns their results in request order before continuing the Step execution.
+_Avoid_: parallel Plan execution, tool-call sequence

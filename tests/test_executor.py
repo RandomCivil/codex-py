@@ -108,6 +108,79 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert response_format["json_schema"]["strict"] is True
 
 
+def test_executor_runs_one_model_response_tool_call_batch_concurrently_and_waits(monkeypatch):
+    class BatchModel:
+        def __init__(self):
+            self.calls = []
+            self.completed_tools = []
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "first", "args": {}, "id": "first-call"},
+                        {"name": "second", "args": {}, "id": "second-call"},
+                    ],
+                )
+            if len(self.calls) == 2:
+                assert sorted(self.completed_tools) == ["first", "second"]
+                results = [message for message in messages if isinstance(message, ToolMessage)]
+                assert [(message.tool_call_id, message.content) for message in results] == [
+                    ("first-call", "first"),
+                    ("second-call", "second"),
+                ]
+                return AIMessage(content="MCP work is complete.")
+            return _completion_message()
+
+    model = BatchModel()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    started = []
+
+    async def invoke(name):
+        started.append(name)
+        if len(started) == 2:
+            both_started.set()
+            release.set()
+        await both_started.wait()
+        await release.wait()
+        model.completed_tools.append(name)
+        return name
+
+    async def first() -> str:
+        """Run the first independent operation."""
+        return await invoke("first")
+
+    async def second() -> str:
+        """Run the second independent operation."""
+        return await invoke("second")
+
+    tools = (
+        StructuredTool.from_function(coroutine=first, name="first"),
+        StructuredTool.from_function(coroutine=second, name="second"),
+    )
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(*tools))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await asyncio.wait_for(executor.execute(state, 1, "publish"), timeout=1)
+
+    execution = asyncio.run(run())
+
+    assert execution.execution.status == "completed", execution.execution.error
+    assert started == ["first", "second"]
+
+
 def test_executor_returns_context_update_and_sends_step_context_separately(monkeypatch):
     class ContextModel(ControlledModel):
         async def ainvoke(self, messages):

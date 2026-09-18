@@ -195,6 +195,7 @@ class Executor:
                 ]
             )
             if self._trace is not None:
+                self._trace.llm_usage(final)
                 self._trace.llm_complete(
                     revision,
                     step_id,
@@ -249,8 +250,10 @@ class Executor:
         async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
             message = await self._bound_model.ainvoke(state["messages"])
             message = self._with_tool_cwd(message)
-            if self._trace is not None and isinstance(message, AIMessage) and message.content:
-                self._trace.llm_text("output", message.content)
+            if self._trace is not None and isinstance(message, AIMessage):
+                self._trace.llm_usage(message)
+                if message.content:
+                    self._trace.llm_text("output", message.content)
             if isinstance(message, AIMessage) and message.tool_calls:
                 self._rounds += 1
                 if self._trace is not None:

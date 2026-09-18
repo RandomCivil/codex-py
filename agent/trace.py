@@ -28,9 +28,11 @@ class RunTrace:
                 self._output_buffer = ""
             elif event_type == "response.output_text.delta":
                 self._output_buffer += getattr(event, "delta", "")
-            elif event_type == "response.completed" and self._output_buffer:
-                self._write("output complete", self._output_buffer)
-                self._output_buffer = ""
+            elif event_type == "response.completed":
+                self._llm_usage(event)
+                if self._output_buffer:
+                    self._write("output complete", self._output_buffer)
+                    self._output_buffer = ""
             return
 
         # Keep the complete provider event available for debugging.  The
@@ -38,6 +40,8 @@ class RunTrace:
         # they intentionally omit fields such as ids, status, usage, and
         # provider-specific metadata.
         self._line(f"[llm event] data={_compact(event)}")
+        if event_type == "response.completed":
+            self._llm_usage(event)
         if event_type in {"response.reasoning.delta", "response.reasoning_summary_text.delta"}:
             self._write("thought", getattr(event, "delta", ""))
         elif event_type == "response.output_text.delta":
@@ -49,6 +53,53 @@ class RunTrace:
         elif event_type == "response.completed" and self._output_buffer:
             self._write("output complete", self._output_buffer)
             self._output_buffer = ""
+
+    def _llm_usage(self, event: Any) -> None:
+        response = getattr(event, "response", event)
+        usage = _get_field(response, "usage")
+        if usage is None:
+            usage = _get_field(event, "usage_metadata")
+        if usage is None:
+            metadata = _get_field(event, "response_metadata") or {}
+            usage = _get_field(metadata, "token_usage") or _get_field(metadata, "usage")
+        if usage is None:
+            return
+        self._write_llm_usage(usage)
+
+    def _write_llm_usage(self, usage: Any) -> None:
+        input_details = (
+            _get_field(usage, "input_tokens_details")
+            or _get_field(usage, "input_token_details")
+            or _get_field(usage, "prompt_tokens_details")
+            or {}
+        )
+        output_details = (
+            _get_field(usage, "output_tokens_details")
+            or _get_field(usage, "output_token_details")
+            or _get_field(usage, "completion_tokens_details")
+            or {}
+        )
+        input_tokens = _first_defined(
+            _get_field(usage, "input_tokens"), _get_field(usage, "prompt_tokens")
+        )
+        output_tokens = _first_defined(
+            _get_field(usage, "output_tokens"), _get_field(usage, "completion_tokens")
+        )
+        cached_tokens = _get_field(input_details, "cached_tokens")
+        if cached_tokens is None:
+            cached_tokens = _get_field(input_details, "cache_read")
+        self._line(
+            "[llm usage] "
+            f"input_tokens={input_tokens} "
+            f"output_tokens={output_tokens} "
+            f"total_tokens={_get_field(usage, 'total_tokens')} "
+            f"cached_tokens={cached_tokens} "
+            f"reasoning_tokens={_get_field(output_details, 'reasoning_tokens')}"
+        )
+
+    def llm_usage(self, message: Any) -> None:
+        """Print usage returned by a LangChain model message."""
+        self._llm_usage(message)
 
     def llm_text(self, label: str, value: Any) -> None:
         if self._level == "error":
@@ -132,3 +183,13 @@ def _as_serializable(value: Any) -> Any:
     if hasattr(value, "__dict__"):
         return vars(value)
     return value
+
+
+def _get_field(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _first_defined(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)

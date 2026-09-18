@@ -29,9 +29,70 @@ def test_error_level_suppresses_streaming_llm_events_but_keeps_final_output():
 
     trace.llm_event(SimpleNamespace(type="response.created"))
     trace.llm_event(SimpleNamespace(type="response.output_text.delta", delta="partial"))
-    trace.llm_event(SimpleNamespace(type="response.completed"))
+    trace.llm_event(
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                usage={
+                    "input_tokens": 10,
+                    "input_tokens_details": {"cached_tokens": 4},
+                    "output_tokens": 3,
+                    "output_tokens_details": {"reasoning_tokens": 1},
+                    "total_tokens": 13,
+                }
+            ),
+        )
+    )
 
-    assert output.getvalue().splitlines() == ["[llm output complete] partial"]
+    assert output.getvalue().splitlines() == [
+        "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 cached_tokens=4 reasoning_tokens=1",
+        "[llm output complete] partial",
+    ]
+
+
+def test_llm_usage_is_printed_from_completion_event_at_info_level():
+    output = StringIO()
+    trace = RunTrace(output)
+
+    trace.llm_event(
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                usage={
+                    "input_tokens": 10,
+                    "input_tokens_details": {"cached_tokens": 4},
+                    "output_tokens": 3,
+                    "total_tokens": 13,
+                }
+            ),
+        )
+    )
+
+    assert output.getvalue().splitlines()[-1] == (
+        "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 "
+        "cached_tokens=4 reasoning_tokens=None"
+    )
+
+
+def test_llm_usage_supports_langchain_message_metadata_and_cached_tokens():
+    output = StringIO()
+    trace = RunTrace(output)
+
+    trace.llm_usage(
+        SimpleNamespace(
+            usage_metadata={
+                "input_tokens": 20,
+                "output_tokens": 5,
+                "total_tokens": 25,
+                "input_token_details": {"cache_read": 8},
+            }
+        )
+    )
+
+    assert output.getvalue() == (
+        "[llm usage] input_tokens=20 output_tokens=5 total_tokens=25 "
+        "cached_tokens=8 reasoning_tokens=None\n"
+    )
 
 
 def test_error_level_keeps_tool_results_and_only_names_tool_calls():

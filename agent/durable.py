@@ -61,7 +61,7 @@ class DurableAgent:
         executor: Executor,
         saver: Any,
         trace: Any | None = None,
-        recovery_store: Any | None = None,
+        recovery_store: MySQLStepRecoveryStore | None = None,
     ) -> None:
         self._planner = planner
         self._executor = executor

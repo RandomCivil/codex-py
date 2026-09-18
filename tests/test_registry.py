@@ -90,6 +90,7 @@ def test_effective_component_snapshot_excludes_keys_and_allows_key_rotation():
 
     assert first["planner"] == {"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"}
     assert first["executor"] == {"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object"}
+    assert first["task_analyzer"] == first["planner"]
     assert "api_key" not in str(first)
     assert configuration_fingerprint(first) == configuration_fingerprint(rotated)
 

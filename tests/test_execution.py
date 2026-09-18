@@ -57,6 +57,7 @@ class TerminalStructuredModel:
     def __init__(self):
         self.operational_calls = []
         self.completion_calls = []
+        self.operational_response_formats = []
         self.response_format_bindings = []
         self._operational_responses = iter(
             [
@@ -65,8 +66,9 @@ class TerminalStructuredModel:
             ]
         )
 
-    def bind_tools(self, tools):
+    def bind_tools(self, tools, *, response_format=None):
         self.tools = tools
+        self.operational_response_formats.append(response_format)
         return self
 
     async def ainvoke(self, input):
@@ -257,6 +259,25 @@ def test_react_completes_only_from_a_structured_goal_satisfied_response():
     assert runtime.closed is True
 
 
+def test_react_prepends_a_few_shot_prompt_to_the_goal():
+    model = ControlledToolModel(
+        AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
+    )
+    runtime = ToolRuntime("unused")
+
+    async def run():
+        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Do it")
+
+    answer = asyncio.run(run())
+
+    assert answer == ExecutionAnswer("Done.", "completed")
+    prompt, goal = model.calls[0][:2]
+    assert prompt.type == "system"
+    assert "Examples:" in prompt.content
+    assert "call the available file-reading tool" in prompt.content
+    assert goal.content == "Do it"
+
+
 def test_react_uses_configured_structured_output_mode_for_its_final_response(tmp_path):
     path = tmp_path / "agent.yaml"
     path.write_text(
@@ -312,6 +333,7 @@ model:
     assert answer == ExecutionAnswer("Done.", "completed")
     assert len(model.operational_calls) == 2
     assert len(model.completion_calls) == 1
+    assert model.operational_response_formats == [None]
     response_format = model.response_format_bindings[0]["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["name"] == "react_goal_completion"

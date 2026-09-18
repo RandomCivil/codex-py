@@ -111,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             EXIT_PERSISTENCE,
         )
     result.pop("state", None)
-    status = EXIT_BLOCKED if result.get("status") == "blocked" else EXIT_COMPLETED
+    status = EXIT_BLOCKED if result.get("status") in {"blocked", "failed"} else EXIT_COMPLETED
     return _emit(result, status)
 
 

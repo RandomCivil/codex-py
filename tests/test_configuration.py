@@ -56,6 +56,8 @@ executor:
     assert configuration.executor.api_key == "shared-secret"
     assert configuration.executor.model_name == "shared-model"
     assert configuration.executor.response_format == "json_object"
+    assert configuration.task_analyzer.model_name == "planner-model"
+    assert configuration.task_analyzer.response_format == "json_schema"
 
 
 def test_load_configuration_requires_structured_output_only_for_react(tmp_path):

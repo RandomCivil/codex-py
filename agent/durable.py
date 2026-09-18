@@ -5,6 +5,7 @@ import os
 import signal
 import uuid
 from contextlib import asynccontextmanager, contextmanager, suppress
+from dataclasses import asdict
 from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
@@ -24,6 +25,8 @@ from .configuration import ComponentProviderConfiguration
 from .executor import Executor
 from .migration import _connection_pool, _parse_url, ensure_schema_initialized
 from .planner import Planner
+from .execution import ToolRuntime, create_execution_mode
+from .task_analyzer import RoutedExecutionAnswer, TaskAnalyzer, TaskRouter
 from .registry import (
     ConfigurationMismatchError,
     MySQLRunRegistry,
@@ -335,10 +338,12 @@ async def _run(
         raise ValueError("an explicit component provider configuration is required")
     planner_configuration = configuration.planner
     executor_configuration = configuration.executor
+    analyzer_configuration = configuration.task_analyzer
     tool_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     snapshot = configuration_snapshot(
         planner=planner_configuration.__dict__,
         executor=executor_configuration.__dict__,
+        task_analyzer=analyzer_configuration.__dict__,
         mcp={
             "command": "poetry",
             "args": ["run", "atom-mcp"],
@@ -354,7 +359,7 @@ async def _run(
             await registry.create(run_id, snapshot)
         else:
             existing = await registry.ensure_compatible(run_id, snapshot)
-            if existing.status in {"completed", "blocked"} and existing.terminal_result is not None:
+            if existing.status in {"completed", "blocked", "failed"} and existing.terminal_result is not None:
                 return dict(existing.terminal_result)
         await registry.acquire(run_id, owner)
         renewal = asyncio.create_task(_renew_lease(registry, run_id, owner))
@@ -391,7 +396,30 @@ async def _run(
                         recovery_store=MySQLStepRecoveryStore(pool),
                     )
                     with _cancel_on_signals():
-                        result = await durable.run(run_id, initial, recovery)
+                        if goal is None:
+                            result = await durable.run(run_id, initial, recovery)
+                        else:
+                            analyzer_llm = LLM(
+                                analyzer_configuration.base_url,
+                                analyzer_configuration.api_key,
+                                analyzer_configuration.model_name,
+                                response_format=analyzer_configuration.response_format,
+                                on_event=trace.llm_event,
+                            )
+                            try:
+                                router = _task_router(
+                                    TaskAnalyzer(
+                                        analyzer_llm,
+                                        response_format=analyzer_configuration.response_format,
+                                    ),
+                                    configuration=configuration,
+                                    durable_agent=durable,
+                                    tool_cwd=tool_cwd,
+                                    trace=trace,
+                                )
+                                result = _routed_result(run_id, await router.run(goal))
+                            finally:
+                                await analyzer_llm.close()
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     try:
                         await asyncio.wait_for(durable.interrupt(run_id), timeout=5)
@@ -400,8 +428,8 @@ async def _run(
                     raise
                 finally:
                     await llm.close()
-            if result["status"] in {"completed", "blocked"}:
-                await registry.set_terminal(run_id, owner, {"run_id": run_id, "status": result["status"]})
+            if result["status"] in {"completed", "blocked", "failed"}:
+                await registry.set_terminal(run_id, owner, result)
             return result
         finally:
             renewal.cancel()
@@ -431,6 +459,39 @@ def resume_agent(
     configuration: ComponentProviderConfiguration | None = None,
 ) -> dict[str, Any]:
     return asyncio.run(_run(url, run_id, None, recovery, cwd, log_level, configuration))
+
+
+def _routed_result(run_id: str, routed: RoutedExecutionAnswer) -> dict[str, Any]:
+    """Serialize the Task Router outcome for the CLI-facing run lifecycle."""
+    return {
+        "run_id": run_id,
+        "status": routed.execution.status,
+        "execution_mode": routed.execution_mode,
+        "execution": asdict(routed.execution),
+        "analysis": asdict(routed.analysis) if routed.analysis is not None else None,
+        "analysis_error": routed.analysis_error,
+    }
+
+
+def _task_router(
+    analyzer: TaskAnalyzer,
+    *,
+    configuration: ComponentProviderConfiguration,
+    durable_agent: DurableAgent,
+    tool_cwd: str,
+    trace: Any,
+) -> TaskRouter:
+    """Compose the one run-entry router with the existing mode-factory seam."""
+    return TaskRouter(
+        analyzer,
+        lambda mode: create_execution_mode(
+            mode,
+            configuration=configuration,
+            durable_agent=durable_agent,
+            tool_runtime=ToolRuntime(tool_cwd=tool_cwd, trace=trace),
+            trace=trace,
+        ),
+    )
 
 
 async def _renew_lease(registry: Any, run_id: str, owner: str) -> None:

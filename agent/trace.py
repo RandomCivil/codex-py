@@ -29,7 +29,11 @@ class RunTrace:
             elif event_type == "response.output_text.delta":
                 self._output_buffer += getattr(event, "delta", "")
             elif event_type == "response.completed":
+                # A completed response is the durable audit record for a model
+                # invocation.  Keep it and its token accounting at every level;
+                # log levels control progress noise, not these terminal facts.
                 self._llm_usage(event)
+                self.llm_final(getattr(event, "response", event))
                 if self._output_buffer:
                     self._write("output complete", self._output_buffer)
                     self._output_buffer = ""
@@ -40,8 +44,6 @@ class RunTrace:
         # they intentionally omit fields such as ids, status, usage, and
         # provider-specific metadata.
         self._line(f"[llm event] data={_compact(event)}")
-        if event_type == "response.completed":
-            self._llm_usage(event)
         if event_type in {"response.reasoning.delta", "response.reasoning_summary_text.delta"}:
             self._write("thought", getattr(event, "delta", ""))
         elif event_type == "response.output_text.delta":
@@ -53,6 +55,9 @@ class RunTrace:
         elif event_type == "response.completed" and self._output_buffer:
             self._write("output complete", self._output_buffer)
             self._output_buffer = ""
+        if event_type == "response.completed":
+            self._llm_usage(event)
+            self.llm_final(getattr(event, "response", event))
 
     def _llm_usage(self, event: Any) -> None:
         response = getattr(event, "response", event)
@@ -100,6 +105,15 @@ class RunTrace:
     def llm_usage(self, message: Any) -> None:
         """Print usage returned by a LangChain model message."""
         self._llm_usage(message)
+
+    def llm_final(self, response: Any) -> None:
+        """Print a model's terminal response regardless of the log level."""
+        self._line(f"[llm final] data={_compact(response)}")
+
+    def llm_response(self, response: Any) -> None:
+        """Record the terminal response and its usage from a non-streaming model."""
+        self._llm_usage(response)
+        self.llm_final(response)
 
     def llm_text(self, label: str, value: Any) -> None:
         if self._level == "error":

@@ -5,14 +5,14 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Protocol
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 
 from agent.configuration import ComponentProviderConfiguration
 from llm.llm import LLM
-from llm.response_format import ResponseFormat
+from llm.response_format import ResponseFormat, chat_response_format, responses_text_format, require_response_format
 
 
 ExecutionStatus = Literal["completed", "failed"]
@@ -36,7 +36,75 @@ _REACT_RESPONSE_SCHEMA = {
     },
 }
 
+_GENERAL_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["response"],
+    "properties": {"response": {"type": "string"}},
+}
 
+
+_REACT_FEW_SHOT_PROMPT = """You are an execution agent. Work iteratively: use an available tool when
+evidence or an external action is needed, inspect each result, and correct course when a
+tool fails. Do not claim the goal is complete until the available evidence supports it.
+When the goal is complete, reply with exactly one JSON object containing a concise
+evidence-based `answer` and `goal_satisfied: true`.
+
+Examples:
+
+User goal: "Find the version in the project configuration."
+Assistant: I need project evidence, so I call the available file-reading tool.
+Tool result: The configuration reports version 1.4.0.
+Assistant: {"answer":"The project version is 1.4.0, as recorded in the configuration.","goal_satisfied":true}
+
+User goal: "Summarize the text supplied in this conversation."
+Assistant: {"answer":"Here is the requested summary based on the supplied text.","goal_satisfied":true}
+
+Use the tools and facts for the current goal, never the example values above."""
+
+
+def _general_chat_response_format(response_format: ResponseFormat) -> dict[str, Any]:
+    return chat_response_format(response_format, name="model_response", schema=_GENERAL_RESPONSE_SCHEMA)
+
+
+def _direct_text_format(response_format: ResponseFormat) -> dict[str, Any]:
+    return responses_text_format(
+        response_format,
+        name="direct_response",
+        schema={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["response"],
+            "properties": {"response": {"type": "string"}},
+        },
+    )
+
+
+def _bind_tools_with_response_format(model: Any, tools: Any, response_format: ResponseFormat | None) -> Any:
+    """Bind tools and the configured output format at the same model seam."""
+    if response_format is None:
+        return model.bind_tools(tools)
+    try:
+        return model.bind_tools(
+            tools,
+            response_format=_general_chat_response_format(response_format),
+        )
+    except TypeError as error:
+        # Small injected test/double models may expose the older two-argument
+        # seam; real ChatOpenAI accepts response_format as a keyword.
+        if "response_format" not in str(error) and "unexpected keyword" not in str(error):
+            raise
+        return model.bind_tools(tools)
+
+
+def _bind_response_format(model: Any, response_format: dict[str, Any]) -> Any:
+    """Apply a terminal response format while retaining lightweight doubles."""
+    try:
+        return model.bind(response_format=response_format)
+    except (AttributeError, TypeError) as error:
+        if isinstance(error, TypeError) and "response_format" not in str(error):
+            raise
+        return model
 @dataclass(frozen=True, slots=True)
 class ExecutionAnswer:
     """The terminal result shared by whole-task Execution modes."""
@@ -64,18 +132,38 @@ class ExecutionMode(Protocol):
 class DirectMode:
     """Obtain one tool-free answer from a language model."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, *, response_format: ResponseFormat | None = None) -> None:
         self._model = model
+        self._response_format = (
+            require_response_format(response_format) if response_format is not None else None
+        )
 
     async def run(self, goal: str) -> ExecutionAnswer:
         try:
             output = "".join(
-                [chunk async for chunk in self._model.stream_text(goal, tools=None)]
+                [
+                    chunk
+                    async for chunk in self._model.stream_text(
+                        goal,
+                        tools=None,
+                        **(
+                            {"text_format": _direct_text_format(self._response_format)}
+                            if self._response_format is not None
+                            else {}
+                        ),
+                    )
+                ]
             )
         except Exception:
             return ExecutionAnswer(None, "failed", error="direct model invocation failed")
         if not output.strip():
             return ExecutionAnswer(None, "failed", error="direct model returned an empty response")
+        try:
+            document = json.loads(output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            document = None
+        if isinstance(document, dict) and isinstance(document.get("response"), str):
+            output = document["response"]
         return ExecutionAnswer(output, "completed")
 
 
@@ -152,16 +240,22 @@ class ToolRuntime:
 class ToolAgentMode:
     """Make one model request and, at most, one host tool invocation."""
 
-    def __init__(self, model: Any, tool_runtime: Any, trace: Any | None = None) -> None:
+    def __init__(self, model: Any, tool_runtime: Any, trace: Any | None = None, *, response_format: ResponseFormat | None = None) -> None:
         self._model = model
         self._runtime = tool_runtime
         self._trace = trace
+        self._response_format = (
+            require_response_format(response_format) if response_format is not None else None
+        )
 
     async def run(self, goal: str) -> ExecutionAnswer:
         try:
             async with self._runtime as runtime:
-                bound = self._model.bind_tools(runtime.tools)
+                bound = _bind_tools_with_response_format(
+                    self._model, runtime.tools, self._response_format
+                )
                 response = await bound.ainvoke(goal)
+                _trace_llm_response(self._trace, response)
                 calls = list(getattr(response, "tool_calls", []) or [])
                 if not calls:
                     text = _message_text(response)
@@ -195,21 +289,32 @@ class ReactMode:
         self._runtime = tool_runtime
         self._trace = trace
         self._max_rounds = max_rounds
-        self._response_format = response_format
+        self._response_format = (
+            require_response_format(response_format) if response_format is not None else None
+        )
 
     async def run(self, goal: str) -> ExecutionAnswer:
         try:
             async with self._runtime as runtime:
+                # Tool-use rounds must remain unconstrained: some
+                # OpenAI-compatible providers reject a response format when
+                # it is combined with tool definitions.  The structured
+                # completion contract is applied only after tool use stops.
                 model = self._model.bind_tools(runtime.tools)
-                messages: list[Any] = [HumanMessage(content=goal)]
+                messages: list[Any] = [
+                    SystemMessage(content=_REACT_FEW_SHOT_PROMPT),
+                    HumanMessage(content=goal),
+                ]
                 for round_number in range(1, self._max_rounds + 1):
                     response = await model.ainvoke(messages)
+                    _trace_llm_response(self._trace, response)
                     calls = list(getattr(response, "tool_calls", []) or [])
                     messages.append(response)
                     if not calls:
                         if self._response_format is not None:
-                            completion_model = self._model.bind(
-                                response_format=_react_response_format(self._response_format)
+                            completion_model = _bind_response_format(
+                                self._model,
+                                _react_response_format(self._response_format),
                             )
                             response = await completion_model.ainvoke(
                                 [
@@ -222,6 +327,7 @@ class ReactMode:
                                     ),
                                 ]
                             )
+                            _trace_llm_response(self._trace, response)
                             if getattr(response, "tool_calls", []):
                                 return ExecutionAnswer(
                                     None,
@@ -330,6 +436,12 @@ def _trace_ignored(trace: Any, call: Mapping[str, Any]) -> None:
         trace.tool_call(call.get("name", "unknown"), call.get("args", {}), call.get("id"))
 
 
+def _trace_llm_response(trace: Any | None, response: Any) -> None:
+    """Record a Chat-model response through the same terminal trace contract."""
+    if trace is not None:
+        trace.llm_response(response)
+
+
 class PlanExecuteMode:
     """Adapt the existing durable Plan–Execute lifecycle to ExecutionAnswer."""
 
@@ -379,6 +491,7 @@ def create_execution_mode(
     base_url: str | None = None,
     api_key: str | None = None,
     model_name: str | None = None,
+    response_format: ResponseFormat | None = None,
     tool_runtime: Any | None = None,
     trace: Any | None = None,
     durable_agent: Any | None = None,
@@ -397,6 +510,13 @@ def create_execution_mode(
             return _UnavailableMode(mode)
         return PlanExecuteMode(durable_agent)
     provider = getattr(configuration, mode, None) if configuration is not None else None
+    selected_response_format = (
+        (provider.response_format or "json_schema")
+        if provider is not None
+        else response_format
+    )
+    if selected_response_format is not None:
+        selected_response_format = require_response_format(selected_response_format)
     if provider is not None and model is None:
         if mode == "direct":
             model = LLM(
@@ -404,6 +524,7 @@ def create_execution_mode(
                 provider.api_key,
                 provider.model_name,
                 response_format=provider.response_format or "json_schema",
+                on_event=getattr(trace, "llm_event", None),
             )
         else:
             model = ChatOpenAI(
@@ -415,7 +536,12 @@ def create_execution_mode(
     if mode == "tool_agent":
         if model is None:
             return _UnavailableMode(mode)
-        return ToolAgentMode(model, tool_runtime or ToolRuntime(trace=trace), trace=trace)
+        return ToolAgentMode(
+            model,
+            tool_runtime or ToolRuntime(trace=trace),
+            trace=trace,
+            response_format=selected_response_format,
+        )
     if mode == "react":
         if model is None:
             return _UnavailableMode(mode)
@@ -424,10 +550,16 @@ def create_execution_mode(
             tool_runtime or ToolRuntime(trace=trace),
             trace=trace,
             max_rounds=max_rounds,
-            response_format=provider.response_format if provider is not None else None,
+            response_format=selected_response_format,
         )
     if model is None:
         if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
             raise ValueError("direct mode requires an injected model or explicit provider values")
-        model = LLM(base_url, api_key, model_name)
-    return DirectMode(model)
+        model = LLM(
+            base_url,
+            api_key,
+            model_name,
+            response_format=selected_response_format,
+            on_event=getattr(trace, "llm_event", None),
+        )
+    return DirectMode(model, response_format=selected_response_format)

@@ -21,9 +21,13 @@ def test_llm_event_prints_complete_event_payload():
         '[llm event] data={"id": "resp_123", "status": "completed", '
         '"type": "response.completed", "usage": {"total_tokens": 7}}'
     )
+    assert output.getvalue().splitlines()[1:] == [
+        "[llm usage] input_tokens=None output_tokens=None total_tokens=7 cached_tokens=None reasoning_tokens=None",
+        '[llm final] data={"id": "resp_123", "status": "completed", "type": "response.completed", "usage": {"total_tokens": 7}}',
+    ]
 
 
-def test_error_level_suppresses_streaming_llm_events_but_keeps_final_output():
+def test_error_level_suppresses_streaming_llm_events_but_keeps_usage_and_final_response():
     output = StringIO()
     trace = RunTrace(output, level="error")
 
@@ -46,6 +50,7 @@ def test_error_level_suppresses_streaming_llm_events_but_keeps_final_output():
 
     assert output.getvalue().splitlines() == [
         "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 cached_tokens=4 reasoning_tokens=1",
+        '[llm final] data={"usage": {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 4}, "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 1}, "total_tokens": 13}}',
         "[llm output complete] partial",
     ]
 
@@ -69,9 +74,25 @@ def test_llm_usage_is_printed_from_completion_event_at_info_level():
     )
 
     assert output.getvalue().splitlines()[-1] == (
-        "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 "
-        "cached_tokens=4 reasoning_tokens=None"
+        '[llm final] data={"usage": {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 4}, "output_tokens": 3, "total_tokens": 13}}'
     )
+
+
+def test_llm_response_keeps_usage_and_final_response_at_error_level():
+    output = StringIO()
+    trace = RunTrace(output, level="error")
+
+    trace.llm_response(
+        SimpleNamespace(
+            content="final answer",
+            usage_metadata={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+        )
+    )
+
+    assert output.getvalue().splitlines() == [
+        "[llm usage] input_tokens=2 output_tokens=1 total_tokens=3 cached_tokens=None reasoning_tokens=None",
+        '[llm final] data={"content": "final answer", "usage_metadata": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}}',
+    ]
 
 
 def test_llm_usage_supports_langchain_message_metadata_and_cached_tokens():

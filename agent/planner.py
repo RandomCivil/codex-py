@@ -1,20 +1,9 @@
 import json
-from collections.abc import AsyncIterator
-from typing import Any, Mapping, Protocol
+from typing import Any
 
 from llm.response_format import ResponseFormat, require_response_format
+from llm.text_stream import TextStream
 from memory.state import AgentState, Plan, PlanStep
-
-
-class TextStream(Protocol):
-    def stream_text(
-        self,
-        input: str,
-        *,
-        instructions: str | None = None,
-        tools: Any = None,
-        text_format: Mapping[str, Any],
-    ) -> AsyncIterator[str]: ...
 
 
 class PlanningValidationError(ValueError):

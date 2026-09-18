@@ -14,6 +14,7 @@ Agent 的顶层协调状态和每个 Step execution 都使用 LangGraph checkpoi
 - 配置指纹校验，避免恢复时静默更换模型或 MCP 配置。
 - 通过 CLI 以一行 JSON 输出运行结果，便于脚本调用。
 - 运行过程中将 LLM thought/output、Plan–Execute 状态以及 MCP tool call/result 实时输出到 stderr；最终结果仍只写到 stdout。
+- `run` 先由 Task Router 描述性分析目标，再确定性地选择 direct、tool-agent、ReAct 或 Plan–execute。
 
 ### 工具调用批次
 
@@ -126,10 +127,15 @@ tool_agent:
 
 react:
   response_format: json_schema
+
+# Optional; inherits the effective planner configuration.
+task_analyzer:
+  model_name: task-analysis-model
 ```
 
-`response_format` 只能是 `json_schema` 或 `json_object`。前者要求 provider 强制执行 Plan 或 completion receipt 的 schema；后者只要求返回 JSON object，Agent 仍会在本地严格校验 Plan 和 completion receipt。Executor 的 MCP tool call 仍由 host 定义，不会变成 structured-output 响应。
-`direct` 和 `tool_agent` 只要求有效的 endpoint、credential 和 model；`react` 还要求有效的 `response_format`，用于最终的 goal-satisfaction 响应。现有 CLI 仍运行 durable Plan–Execute，不增加 mode selector；新 mode 通过 Python factory 组合。
+`response_format` 只能是 `json_schema` 或 `json_object`。每一次 LLM 请求都会使用所属组件的有效格式；`json_schema` 请求使用该调用的严格 schema，`json_object` 请求只要求返回 JSON object，Agent 仍会在本地严格校验结果。Executor 的 MCP tool call 同样携带该格式，工具 schema 仍由 host 定义。
+`direct`、`tool_agent` 和 `react` 使用各自 provider 的有效 `response_format`（未显式配置时继承共享模型配置，最终回退为 `json_schema`）。CLI 不提供 mode selector；Task Router 通过 Python factory 组合并选择模式。
+`task_analyzer` 使用 Structured-output mode，并默认继承 Planner 的有效配置；它只描述任务特征，不能选择 Execution mode。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
 
 YAML 中的 `api_key` 是明文配置。请限制配置文件的文件权限，例如：
 
@@ -163,6 +169,8 @@ poetry run agent migrate
 poetry run agent run --goal '检查项目中的待办事项并整理摘要' --config agent.yaml --cwd /path/to/project
 ```
 
+`run` 的 JSON 结果中的 `status` 是所选 Execution mode 的 `completed` 或 `failed` 状态；`plan_execute` 的失败同样会作为失败的 Execution answer 返回。
+
 `--cwd` 指定 Agent 操作的项目目录。它会被强制写入每一个 Atom MCP 工具调用的 `cwd` 参数；未指定时使用启动 `agent` 命令时的当前目录。恢复 run 时应使用与原 run 相同的 `--cwd`，该目录属于持久化配置的一部分。
 
 命令会输出 UUIDv4 `run_id`，例如：
@@ -190,7 +198,7 @@ CLI 输出包含 `command`、`status`、`run_id` 等字段；发生错误时还�
 
 运行过程日志使用带有 `[llm thought]`、`[llm output]`、`[plan]`、`[execute]`、`[tool call]` 和 `[tool result]` 前缀的文本格式写入 stderr，因此不会污染 stdout 中的一行 JSON 结果。
 
-每行运行日志都会以 `run_id` 作为前缀。默认日志级别为 `info`。需要降低输出量时可使用 `--log-level error`：隐藏 LLM 流式输出，只保留最终 LLM 返回、Plan/Execute 状态和工具调用信息；tool result 只显示工具名，tool call 保留传入参数。
+每行运行日志都会以 `run_id` 作为前缀。默认日志级别为 `info`。无论日志级别为何，每次 LLM 调用完成都会输出 `[llm usage]` token usage 和 `[llm final]` 最终返回。需要降低输出量时可使用 `--log-level error`：隐藏 LLM 的流式事件与中间 thought/output，只保留这些完成记录、Plan/Execute 状态和工具调用信息；tool result 只显示工具名，tool call 保留传入参数。
 
 | 退出码 | 含义 |
 | ---: | --- |

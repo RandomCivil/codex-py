@@ -24,6 +24,7 @@ class ProviderConfiguration:
 class ComponentProviderConfiguration:
     planner: ProviderConfiguration
     executor: ProviderConfiguration
+    task_analyzer: ProviderConfiguration
     direct: ProviderConfiguration | None = None
     tool_agent: ProviderConfiguration | None = None
     react: ProviderConfiguration | None = None
@@ -42,18 +43,20 @@ def load_configuration(path: str | Path) -> ComponentProviderConfiguration:
         raise ConfigurationError("configuration must be a YAML mapping")
     _check_keys(
         document,
-        {"model", "planner", "executor", "direct", "tool_agent", "react"},
+        {"model", "planner", "executor", "task_analyzer", "direct", "tool_agent", "react"},
         "configuration",
     )
     shared = _mapping(document.get("model"), "model")
     planner = _resolve(shared, document.get("planner"), "planner")
     executor = _resolve(shared, document.get("executor"), "executor")
+    task_analyzer = _resolve(planner, document.get("task_analyzer"), "task_analyzer")
     direct = _resolve(shared, document.get("direct"), "direct")
     tool_agent = _resolve(shared, document.get("tool_agent"), "tool_agent")
     react = _resolve(shared, document.get("react"), "react")
     return ComponentProviderConfiguration(
         planner=_provider(planner, "planner", require_output_format=True),
         executor=_provider(executor, "executor", require_output_format=True),
+        task_analyzer=_provider(task_analyzer, "task_analyzer", require_output_format=True),
         direct=_provider(direct, "direct", require_output_format=False),
         tool_agent=_provider(tool_agent, "tool_agent", require_output_format=False),
         react=_provider(react, "react", require_output_format=True),

@@ -37,6 +37,7 @@ def configuration_snapshot(
     mcp: Mapping[str, Any],
     planner: Mapping[str, Any] | None = None,
     executor: Mapping[str, Any] | None = None,
+    task_analyzer: Mapping[str, Any] | None = None,
     base_url: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
@@ -45,9 +46,12 @@ def configuration_snapshot(
         planner = {"base_url": base_url or "", "model_name": model or "", "response_format": "json_schema"}
     if executor is None:
         executor = planner
+    if task_analyzer is None:
+        task_analyzer = planner
     return {
         "planner": _provider_snapshot(planner),
         "executor": _provider_snapshot(executor),
+        "task_analyzer": _provider_snapshot(task_analyzer),
         "mcp": _without_secrets(mcp),
     }
 

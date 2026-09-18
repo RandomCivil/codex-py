@@ -5,6 +5,7 @@ import pytest
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent import Executor, PersistenceError
@@ -37,6 +38,22 @@ class ControlledModel:
         if len(self.calls) == 2:
             return AIMessage(content="MCP work is complete.")
         return _completion_message()
+
+
+class ChatOpenAIToolBindingModel(ControlledModel):
+    """Exercise ChatOpenAI's real tool-schema conversion without network I/O."""
+
+    def __init__(self):
+        super().__init__()
+        self._validator = ChatOpenAI(
+            base_url="http://127.0.0.1:1/v1",
+            api_key="test-key",
+            model="test-model",
+        )
+
+    def bind_tools(self, tools, **kwargs):
+        self._validator.bind_tools(tools, **kwargs)
+        return super().bind_tools(tools, **kwargs)
 
 
 class ControlledClient:
@@ -108,6 +125,24 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["name"] == "step_completion"
     assert response_format["json_schema"]["strict"] is True
+
+
+def test_executor_tool_selection_is_compatible_with_chat_openai_tool_binding(monkeypatch):
+    model = ChatOpenAIToolBindingModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish it", "Release is available"),))
+    state = AgentState("Prepare release", plan_history=(plan,))
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.execution.status == "completed", execution.execution.error
+    assert model.bindings[0][1] == {}
 
 
 def test_executor_json_object_mode_keeps_local_completion_validation(monkeypatch):

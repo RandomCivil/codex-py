@@ -10,7 +10,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, ConfigDict, Field
 
-from llm.response_format import ResponseFormat, chat_response_format, require_response_format
+from llm.response_format import ResponseFormat, require_response_format
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
 
 
@@ -43,13 +43,6 @@ _COMPLETION_RESPONSE_FORMAT = {
     },
 }
 
-_OPERATIONAL_RESPONSE_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["response"],
-    "properties": {"response": {"type": "string"}},
-}
-
 
 def _completion_response_format(response_format: ResponseFormat) -> dict[str, Any]:
     if response_format == "json_schema":
@@ -57,14 +50,6 @@ def _completion_response_format(response_format: ResponseFormat) -> dict[str, An
     if response_format == "json_object":
         return {"type": "json_object"}
     raise ValueError("response_format must be json_schema or json_object")
-
-
-def _operational_response_format(response_format: ResponseFormat) -> dict[str, Any]:
-    return chat_response_format(
-        response_format,
-        name="executor_response",
-        schema=_OPERATIONAL_RESPONSE_SCHEMA,
-    )
 
 
 class ExecutorGraphState(MessagesState, total=False):
@@ -283,10 +268,7 @@ class Executor:
             # operational tool use remains non-strict. Completion is instead a
             # separate structured response after MCP work ends; local parsing
             # and invariant validation apply in both provider modes.
-            self._bound_model = self._model.bind_tools(
-                tools,
-                response_format=_operational_response_format(self._response_format),
-            )
+            self._bound_model = self._model.bind_tools(tools)
             self._completion_model = self._model.bind(response_format=_completion_response_format(self._response_format))
             # Tool errors are part of the model/tool conversation: a bad argument or
             # an MCP error must be returned to the model so it can correct its next

@@ -412,6 +412,7 @@ async def _run(
                                         analyzer_llm,
                                         response_format=analyzer_configuration.response_format,
                                     ),
+                                    run_id=run_id,
                                     configuration=configuration,
                                     durable_agent=durable,
                                     tool_cwd=tool_cwd,
@@ -476,6 +477,7 @@ def _routed_result(run_id: str, routed: RoutedExecutionAnswer) -> dict[str, Any]
 def _task_router(
     analyzer: TaskAnalyzer,
     *,
+    run_id: str,
     configuration: ComponentProviderConfiguration,
     durable_agent: DurableAgent,
     tool_cwd: str,
@@ -488,6 +490,7 @@ def _task_router(
             mode,
             configuration=configuration,
             durable_agent=durable_agent,
+            run_id=run_id,
             tool_runtime=ToolRuntime(tool_cwd=tool_cwd, trace=trace),
             trace=trace,
         ),

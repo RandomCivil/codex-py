@@ -187,6 +187,7 @@ def test_run_entry_router_uses_the_existing_mode_factory(monkeypatch):
     result = asyncio.run(
         _task_router(
             analyzer,
+            run_id="run-entry-id",
             configuration=configuration,
             durable_agent=durable_agent,
             tool_cwd="/workspace/project",
@@ -198,7 +199,63 @@ def test_run_entry_router_uses_the_existing_mode_factory(monkeypatch):
     assert selected[0][0] == "direct"
     assert selected[0][1]["configuration"] is configuration
     assert selected[0][1]["durable_agent"] is durable_agent
+    assert selected[0][1]["run_id"] == "run-entry-id"
     assert selected[0][1]["tool_runtime"]._tool_cwd == "/workspace/project"
+
+
+def test_run_entry_plan_execute_reuses_the_cli_run_id():
+    analyzer = ControlledAnalyzer(analysis(expected_horizon="long"))
+
+    class DurableAgent:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, run_id, state):
+            self.calls.append((run_id, state))
+            return {
+                "status": "completed",
+                "state": {
+                    "goal": state.goal,
+                    "plan_history": [
+                        {
+                            "revision": 1,
+                            "goal": state.goal,
+                            "steps": [
+                                {
+                                    "id": "inspect",
+                                    "intent": "Inspect",
+                                    "completion_criterion": "Inspected",
+                                }
+                            ],
+                        }
+                    ],
+                    "step_executions": [
+                        {
+                            "revision": 1,
+                            "step_id": "inspect",
+                            "status": "completed",
+                            "result": "Inspected.",
+                            "error": None,
+                        }
+                    ],
+                    "memory_summary": None,
+                },
+            }
+
+    durable = DurableAgent()
+    result = asyncio.run(
+        _task_router(
+            analyzer,
+            configuration=object(),
+            durable_agent=durable,
+            tool_cwd="/workspace/project",
+            trace=object(),
+            run_id="run-entry-id",
+        ).run("Inspect the project")
+    )
+
+    assert result.execution == ExecutionAnswer("Inspected.", "completed")
+    assert durable.calls[0][0] == "run-entry-id"
 
 
 def test_run_result_exposes_the_router_outcome_without_changing_execution_answer():

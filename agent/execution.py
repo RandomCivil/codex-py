@@ -445,14 +445,21 @@ def _trace_llm_response(trace: Any | None, response: Any) -> None:
 class PlanExecuteMode:
     """Adapt the existing durable Plan–Execute lifecycle to ExecutionAnswer."""
 
-    def __init__(self, durable_agent: Any, *, run_id_factory: Any = uuid.uuid4) -> None:
+    def __init__(
+        self,
+        durable_agent: Any,
+        *,
+        run_id: str | None = None,
+        run_id_factory: Any = uuid.uuid4,
+    ) -> None:
         self._durable_agent = durable_agent
+        self._run_id = run_id
         self._run_id_factory = run_id_factory
 
     async def run(self, goal: str) -> ExecutionAnswer:
         from memory.state import AgentState, deserialize_agent_state
 
-        run_id = str(self._run_id_factory())
+        run_id = self._run_id or str(self._run_id_factory())
         try:
             result = await self._durable_agent.run(run_id, AgentState(goal))
             status = result.get("status")
@@ -495,6 +502,7 @@ def create_execution_mode(
     tool_runtime: Any | None = None,
     trace: Any | None = None,
     durable_agent: Any | None = None,
+    run_id: str | None = None,
     max_rounds: int = 50,
     configuration: ComponentProviderConfiguration | None = None,
 ) -> ExecutionMode:
@@ -508,7 +516,7 @@ def create_execution_mode(
     if mode == "plan_execute":
         if durable_agent is None:
             return _UnavailableMode(mode)
-        return PlanExecuteMode(durable_agent)
+        return PlanExecuteMode(durable_agent, run_id=run_id)
     provider = getattr(configuration, mode, None) if configuration is not None else None
     selected_response_format = (
         (provider.response_format or "json_schema")

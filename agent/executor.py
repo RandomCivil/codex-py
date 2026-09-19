@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from llm.response_format import ResponseFormat, require_response_format
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
+from agent.runtime_context import RuntimeContextPolicy
 
 
 class _StepCompletion(BaseModel):
@@ -89,6 +90,10 @@ class Executor:
         run_id: str | None = None,
         attempt: int | None = None,
         trace: Any | None = None,
+        context_policy: RuntimeContextPolicy | None = None,
+        context_budget: int = 128_000,
+        context_model: Any | None = None,
+        context_response_format: ResponseFormat | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
@@ -122,6 +127,12 @@ class Executor:
         self._run_id = run_id
         self._attempt = attempt
         self._trace = trace
+        self._context_policy = context_policy
+        self._context_budget = context_budget
+        self._context_model = context_model
+        self._context_response_format = context_response_format
+        self._active_context_policy: RuntimeContextPolicy | None = None
+        self._active_durable_state: Any = None
         self._client = None
         self._session = None
         self._tools = None
@@ -168,6 +179,18 @@ class Executor:
         try:
             self._active_step = step
             self._active_revision = revision
+            self._active_durable_state = _durable_context_payload(state, revision, step, step_context)
+            self._active_context_policy = self._context_policy
+            policy_model = self._context_model or self._model
+            if self._active_context_policy is None and (
+                self._context_model is not None or isinstance(self._model, ChatOpenAI)
+            ):
+                self._active_context_policy = RuntimeContextPolicy(
+                    policy_model,
+                    budget=self._context_budget,
+                    response_format=self._context_response_format or self._response_format,
+                    trace=self._trace,
+                )
             graph_result = await self._execute_with_tools(
                 state, revision, step, step_context, recovery=recovery, attempt=attempt
             )
@@ -218,10 +241,7 @@ class Executor:
                     '"observations":["The completion criterion is satisfied."]}'
                 )
             final = await self._completion_model.ainvoke(
-                [
-                    *graph_result["messages"],
-                    HumanMessage(content=completion_prompt),
-                ]
+                await self._completion_messages(graph_result["messages"], completion_prompt)
             )
             if self._trace is not None:
                 self._trace.llm_response(final)
@@ -278,7 +298,13 @@ class Executor:
             tool_node = ToolNode(self._tools, handle_tool_errors=True)
 
         async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
-            message = await self._bound_model.ainvoke(state["messages"])
+            request = state["messages"]
+            if self._active_context_policy is not None:
+                self._active_context_policy.record_model_use()
+                context = await self._active_context_policy.maintain(self._active_durable_state)
+                request = [SystemMessage(content=self._INSTRUCTIONS), *context.as_messages()]
+            _trace_llm_context(self._trace, request)
+            message = await self._bound_model.ainvoke(request)
             message = self._with_tool_cwd(message)
             if self._trace is not None and isinstance(message, AIMessage):
                 self._trace.llm_response(message)
@@ -333,6 +359,8 @@ class Executor:
                         )
                 # A tool failure is actionable model context, not a reason for
                 # the Executor to end this step and make the Agent replan.
+                if self._active_context_policy is not None:
+                    await self._record_executor_round(state["messages"][-1], messages)
                 return {"messages": messages}
             messages = [
                 _as_error_tool_message(message)
@@ -345,6 +373,8 @@ class Executor:
                         message.content,
                         error=_tool_error(message) is not None,
                     )
+            if self._active_context_policy is not None:
+                await self._record_executor_round(state["messages"][-1], messages)
             return {**result, "messages": messages}
 
         graph.add_node("tools", call_tools)
@@ -353,7 +383,10 @@ class Executor:
         graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
         graph.add_conditional_edges("tools", route_after_tools, {"model": "model", END: END})
         if self._graph is None:
-            self._graph = graph.compile(checkpointer=self._checkpointer)
+            # Tool messages are transient Runtime context.  The checkpointed
+            # graph therefore deliberately has no saver; only the tiny
+            # pre-work marker below is persisted for recovery diagnostics.
+            self._graph = graph.compile(checkpointer=None)
 
         messages: list[BaseMessage] = [
             SystemMessage(content=self._INSTRUCTIONS),
@@ -382,7 +415,48 @@ class Executor:
             thread_id = f"{self._run_id}:r{revision}:s{step.id}{suffix}"
         if thread_id is not None:
             config = {"configurable": {"thread_id": thread_id}}
+        if self._checkpointer is not None and config is not None:
+            await self._checkpoint_running(config)
         return await self._graph.ainvoke({"messages": messages}, config=config)
+
+    async def _checkpoint_running(self, config: dict[str, Any]) -> None:
+        graph = StateGraph(ExecutorGraphState)
+
+        async def mark_running(_: ExecutorGraphState) -> ExecutorGraphState:
+            return {
+                "execution": StepExecution(
+                    self._active_revision,
+                    self._active_step.id,
+                    "running",
+                )
+            }
+
+        graph.add_node("running", mark_running)
+        graph.add_edge(START, "running")
+        graph.add_edge("running", END)
+        await graph.compile(checkpointer=self._checkpointer).ainvoke({}, config=config)
+
+    async def _record_executor_round(self, response: BaseMessage, results: list[BaseMessage]) -> None:
+        if not isinstance(response, AIMessage):
+            return
+        await self._active_context_policy.record_tool_round(
+            self._rounds,
+            response.tool_calls,
+            [message.content for message in results],
+            [_tool_error(message) for message in results],
+        )
+
+    async def _completion_messages(self, messages: list[BaseMessage], prompt: str) -> list[BaseMessage]:
+        result = [*messages]
+        if self._active_context_policy is not None:
+            self._active_context_policy.record_model_use()
+            # The final receipt sees the same Durable State and layered evidence
+            # as the last operational request; it never receives trace data.
+            context = await self._active_context_policy.maintain(self._active_durable_state)
+            result = [SystemMessage(content=self._INSTRUCTIONS), context.as_messages()[0]]
+        result.append(HumanMessage(content=prompt))
+        _trace_llm_context(self._trace, result)
+        return result
 
     def _require_active(self) -> None:
         if not self._active:
@@ -447,6 +521,24 @@ def _request_payload(state: AgentState, revision: int, step: PlanStep) -> dict[s
             }
             for execution in state.step_executions
         ],
+    }
+
+
+def _durable_context_payload(
+    state: AgentState,
+    revision: int,
+    step: PlanStep,
+    step_context: StepContext | None,
+) -> dict[str, Any]:
+    """Serialize the durable execution inputs without leaking transient graph state."""
+    context = step_context or StepContext()
+    return {
+        "agent_state": _request_payload(state, revision, step),
+        "step_context": {
+            "files_read": list(context.files_read),
+            "files_modified": list(context.files_modified),
+            "observations": list(context.observations),
+        },
     }
 
 
@@ -539,3 +631,10 @@ def _exit_code(content: Any) -> int | None:
                 except (TypeError, ValueError):
                     return None
     return None
+
+
+def _trace_llm_context(trace: Any | None, context: Any) -> None:
+    if trace is not None:
+        callback = getattr(trace, "llm_context", None)
+        if callback is not None:
+            callback(context)

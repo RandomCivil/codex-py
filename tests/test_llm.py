@@ -62,6 +62,48 @@ def test_json_object_mode_uses_provider_json_object_format(monkeypatch):
     assert observed["text"] == {"format": {"type": "json_object"}}
 
 
+def test_event_stream_reports_the_provider_request(monkeypatch):
+    observed = {}
+
+    class Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class Responses:
+        def stream(self, **kwargs):
+            return Stream()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.responses = Responses()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("llm.llm.AsyncOpenAI", Client)
+
+    async def consume():
+        llm = LLM(
+            "https://provider.test",
+            "secret",
+            "model",
+            on_request=lambda request: observed.update(request),
+        )
+        return [event async for event in llm.stream_events("hello", instructions="Be concise")]
+
+    assert asyncio.run(consume()) == []
+    assert observed == {"model": "model", "input": "hello", "instructions": "Be concise"}
+
+
 def test_text_stream_yields_only_text_deltas_in_provider_order(monkeypatch):
     events = [
         SimpleNamespace(type="response.output_text.delta", delta="Hello"),

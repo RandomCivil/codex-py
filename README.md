@@ -128,6 +128,12 @@ tool_agent:
 react:
   response_format: json_schema
 
+# Optional; when omitted, Observation calls use the owning ReAct/Executor model.
+# When present, it inherits model and generates and compacts tool-round Observations.
+runtime_context:
+  model_name: context-summary-model
+  response_format: json_object
+
 # Optional; inherits the effective planner configuration.
 task_analyzer:
   model_name: task-analysis-model
@@ -135,7 +141,7 @@ task_analyzer:
 
 `response_format` 只能是 `json_schema` 或 `json_object`。需要结构化结果的请求会使用所属组件的有效格式；`json_schema` 请求使用该调用的严格 schema，`json_object` 请求只要求返回 JSON object，Agent 仍会在本地严格校验结果。Executor 的工具选择请求不绑定结构化输出，以保留 MCP function call 能力；最终 completion receipt 使用 Executor 的有效格式。
 `direct`、`tool_agent` 和 `react` 使用各自 provider 的有效 `response_format`（未显式配置时继承共享模型配置，最终回退为 `json_schema`）。CLI 不提供 mode selector；Task Router 通过 Python factory 组合并选择模式。
-`task_analyzer` 使用 Structured-output mode，并默认继承 Planner 的有效配置；它只描述任务特征，不能选择 Execution mode。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
+`runtime_context` 使用 Structured-output mode，默认继承共享模型配置；它只负责生成与合并 Tool-round Observation，可单独指定 provider、模型和 `response_format`。`task_analyzer` 使用 Structured-output mode，并默认继承 Planner 的有效配置；它只描述任务特征，不能选择 Execution mode。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
 
 YAML 中的 `api_key` 是明文配置。请限制配置文件的文件权限，例如：
 
@@ -198,7 +204,7 @@ CLI 输出包含 `command`、`status`、`run_id` 等字段；发生错误时还�
 
 运行过程日志使用带有 `[llm thought]`、`[llm output]`、`[plan]`、`[execute]`、`[tool call]` 和 `[tool result]` 前缀的文本格式写入 stderr，因此不会污染 stdout 中的一行 JSON 结果。
 
-每行运行日志都会以 `run_id` 作为前缀。默认日志级别为 `info`。无论日志级别为何，每次 LLM 调用完成都会输出 `[llm usage]` token usage 和 `[llm final]` 最终返回。需要降低输出量时可使用 `--log-level error`：隐藏 LLM 的流式事件与中间 thought/output，只保留这些完成记录、Plan/Execute 状态和工具调用信息；tool result 只显示工具名，tool call 保留传入参数。
+每行运行日志都会以 `run_id` 作为前缀。默认日志级别为 `info`。`[llm context]` 请求上下文与 `[llm final]` 最终返回仅在 `info` 级别输出；每次 LLM 调用完成都会在所有级别输出 `[llm usage]` token usage。需要降低输出量时可使用 `--log-level error`：隐藏 LLM 的请求/响应详情、流式事件与中间 thought/output，只保留 usage、Plan/Execute 状态和工具调用信息；tool result 只显示工具名，tool call 保留传入参数。
 
 | 退出码 | 含义 |
 | ---: | --- |

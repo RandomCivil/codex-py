@@ -15,10 +15,12 @@ class LLM:
         *,
         response_format: ResponseFormat = "json_schema",
         on_event: Callable[[ResponseStreamEvent], None] | None = None,
+        on_request: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         self._model_name = model_name
         self._response_format = require_response_format(response_format)
         self._on_event = on_event
+        self._on_request = on_request
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -59,6 +61,9 @@ class LLM:
             request["instructions"] = instructions
         if tools is not None:
             request["tools"] = tools
+
+        if self._on_request is not None:
+            self._on_request(request)
 
         async with self._client.responses.stream(**request) as stream:
             async for event in stream:

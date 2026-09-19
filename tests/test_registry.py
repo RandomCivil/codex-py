@@ -95,6 +95,37 @@ def test_effective_component_snapshot_excludes_keys_and_allows_key_rotation():
     assert configuration_fingerprint(first) == configuration_fingerprint(rotated)
 
 
+def test_runtime_context_snapshot_excludes_credentials_and_tracks_effective_configuration():
+    original = configuration_snapshot(
+        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
+        runtime_context={
+            "base_url": "https://context.test",
+            "model_name": "context-model",
+            "response_format": "json_object",
+            "api_key": "secret",
+        },
+        mcp={},
+    )
+    changed = configuration_snapshot(
+        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
+        runtime_context={
+            "base_url": "https://context.test",
+            "model_name": "changed-context-model",
+            "response_format": "json_object",
+            "api_key": "rotated-secret",
+        },
+        mcp={},
+    )
+
+    assert original["runtime_context"] == {
+        "base_url": "https://context.test",
+        "model_name": "context-model",
+        "response_format": "json_object",
+    }
+    assert "api_key" not in str(original)
+    assert configuration_fingerprint(original) != configuration_fingerprint(changed)
+
+
 @pytest.mark.parametrize(
     "change",
     [

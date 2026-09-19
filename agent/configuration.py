@@ -25,6 +25,7 @@ class ComponentProviderConfiguration:
     planner: ProviderConfiguration
     executor: ProviderConfiguration
     task_analyzer: ProviderConfiguration
+    runtime_context: ProviderConfiguration | None = None
     direct: ProviderConfiguration | None = None
     tool_agent: ProviderConfiguration | None = None
     react: ProviderConfiguration | None = None
@@ -43,13 +44,18 @@ def load_configuration(path: str | Path) -> ComponentProviderConfiguration:
         raise ConfigurationError("configuration must be a YAML mapping")
     _check_keys(
         document,
-        {"model", "planner", "executor", "task_analyzer", "direct", "tool_agent", "react"},
+        {"model", "planner", "executor", "task_analyzer", "runtime_context", "direct", "tool_agent", "react"},
         "configuration",
     )
     shared = _mapping(document.get("model"), "model")
     planner = _resolve(shared, document.get("planner"), "planner")
     executor = _resolve(shared, document.get("executor"), "executor")
     task_analyzer = _resolve(planner, document.get("task_analyzer"), "task_analyzer")
+    runtime_context = (
+        _resolve(shared, document["runtime_context"], "runtime_context")
+        if "runtime_context" in document
+        else None
+    )
     direct = _resolve(shared, document.get("direct"), "direct")
     tool_agent = _resolve(shared, document.get("tool_agent"), "tool_agent")
     react = _resolve(shared, document.get("react"), "react")
@@ -57,6 +63,11 @@ def load_configuration(path: str | Path) -> ComponentProviderConfiguration:
         planner=_provider(planner, "planner", require_output_format=True),
         executor=_provider(executor, "executor", require_output_format=True),
         task_analyzer=_provider(task_analyzer, "task_analyzer", require_output_format=True),
+        runtime_context=(
+            _provider(runtime_context, "runtime_context", require_output_format=True)
+            if runtime_context is not None
+            else None
+        ),
         direct=_provider(direct, "direct", require_output_format=False),
         tool_agent=_provider(tool_agent, "tool_agent", require_output_format=False),
         react=_provider(react, "react", require_output_format=True),

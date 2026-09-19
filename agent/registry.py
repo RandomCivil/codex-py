@@ -38,6 +38,7 @@ def configuration_snapshot(
     planner: Mapping[str, Any] | None = None,
     executor: Mapping[str, Any] | None = None,
     task_analyzer: Mapping[str, Any] | None = None,
+    runtime_context: Mapping[str, Any] | None = None,
     base_url: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
@@ -52,6 +53,7 @@ def configuration_snapshot(
         "planner": _provider_snapshot(planner),
         "executor": _provider_snapshot(executor),
         "task_analyzer": _provider_snapshot(task_analyzer),
+        "runtime_context": _provider_snapshot(runtime_context) if runtime_context is not None else None,
         "mcp": _without_secrets(mcp),
     }
 

@@ -17,6 +17,10 @@ tool_agent:
   base_url: https://tools.example/v1
 react:
   response_format: json_schema
+runtime_context:
+  base_url: https://context.example/v1
+  model_name: context-model
+  response_format: json_object
 """
     )
 
@@ -28,6 +32,10 @@ react:
     assert configuration.tool_agent.base_url == "https://tools.example/v1"
     assert configuration.tool_agent.model_name == "shared-model"
     assert configuration.react.response_format == "json_schema"
+    assert configuration.runtime_context.base_url == "https://context.example/v1"
+    assert configuration.runtime_context.api_key == "shared-secret"
+    assert configuration.runtime_context.model_name == "context-model"
+    assert configuration.runtime_context.response_format == "json_object"
 
 
 def test_load_configuration_resolves_shared_defaults_and_component_overrides(tmp_path):

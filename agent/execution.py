@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from agent.configuration import ComponentProviderConfiguration
 from llm.llm import LLM
 from llm.response_format import ResponseFormat, chat_response_format, responses_text_format, require_response_format
+from agent.runtime_context import RuntimeContextPolicy
 
 
 ExecutionStatus = Literal["completed", "failed"]
@@ -132,25 +133,33 @@ class ExecutionMode(Protocol):
 class DirectMode:
     """Obtain one tool-free answer from a language model."""
 
-    def __init__(self, model: Any, *, response_format: ResponseFormat | None = None) -> None:
+    def __init__(self, model: Any, *, response_format: ResponseFormat | None = None, trace: Any | None = None) -> None:
         self._model = model
+        self._trace = trace
         self._response_format = (
             require_response_format(response_format) if response_format is not None else None
         )
 
     async def run(self, goal: str) -> ExecutionAnswer:
         try:
+            request = {
+                "input": goal,
+                "tools": None,
+                **(
+                    {"text_format": _direct_text_format(self._response_format)}
+                    if self._response_format is not None
+                    else {}
+                ),
+            }
+            if not callable(getattr(self._model, "_on_request", None)):
+                _trace_llm_context(self._trace, request)
             output = "".join(
                 [
                     chunk
                     async for chunk in self._model.stream_text(
                         goal,
                         tools=None,
-                        **(
-                            {"text_format": _direct_text_format(self._response_format)}
-                            if self._response_format is not None
-                            else {}
-                        ),
+                        **{key: value for key, value in request.items() if key not in {"input", "tools"}},
                     )
                 ]
             )
@@ -233,8 +242,16 @@ class ToolRuntime:
         if self._trace is not None:
             self._trace.tool_result(name, result, error=_tool_result_failed(result))
         if _tool_result_failed(result):
-            raise RuntimeError("tool returned a non-success result")
+            raise _ToolExecutionError("tool returned a non-success result", result)
         return result
+
+
+class _ToolExecutionError(RuntimeError):
+    """Carry a failed tool's original result into the ReAct context policy."""
+
+    def __init__(self, message: str, result: Any) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 class ToolAgentMode:
@@ -254,6 +271,7 @@ class ToolAgentMode:
                 bound = _bind_tools_with_response_format(
                     self._model, runtime.tools, self._response_format
                 )
+                _trace_llm_context(self._trace, goal)
                 response = await bound.ainvoke(goal)
                 _trace_llm_response(self._trace, response)
                 calls = list(getattr(response, "tool_calls", []) or [])
@@ -282,6 +300,10 @@ class ReactMode:
         *,
         max_rounds: int = 50,
         response_format: ResponseFormat | None = None,
+        context_policy: RuntimeContextPolicy | None = None,
+        context_budget: int = 128_000,
+        context_model: Any | None = None,
+        context_response_format: ResponseFormat | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
@@ -292,6 +314,10 @@ class ReactMode:
         self._response_format = (
             require_response_format(response_format) if response_format is not None else None
         )
+        self._context_policy = context_policy
+        self._context_budget = context_budget
+        self._context_model = context_model
+        self._context_response_format = context_response_format
 
     async def run(self, goal: str) -> ExecutionAnswer:
         try:
@@ -301,12 +327,33 @@ class ReactMode:
                 # it is combined with tool definitions.  The structured
                 # completion contract is applied only after tool use stops.
                 model = self._model.bind_tools(runtime.tools)
+                # Injected doubles can predate the no-tool Observation seam.  The
+                # production ChatOpenAI path always enables it; tests and embedders
+                # may provide a policy explicitly when their model supports that
+                # additional structured request.
+                policy = self._context_policy
+                policy_model = self._context_model or self._model
+                if policy is None and (self._context_model is not None or isinstance(self._model, ChatOpenAI)):
+                    policy = RuntimeContextPolicy(
+                        policy_model, budget=self._context_budget,
+                        response_format=self._context_response_format or self._response_format or "json_schema",
+                        trace=self._trace,
+                    )
                 messages: list[Any] = [
                     SystemMessage(content=_REACT_FEW_SHOT_PROMPT),
                     HumanMessage(content=goal),
                 ]
                 for round_number in range(1, self._max_rounds + 1):
-                    response = await model.ainvoke(messages)
+                    request_messages = messages
+                    if policy is not None:
+                        policy.record_model_use()
+                        context = await policy.maintain({"goal": goal})
+                        # The policy-owned window is the sole historical source
+                        # once it is active; old AI/Tool messages must not become
+                        # an undocumented second memory channel.
+                        request_messages = [messages[0], messages[1], *context.as_messages()]
+                    _trace_llm_context(self._trace, request_messages)
+                    response = await model.ainvoke(request_messages)
                     _trace_llm_response(self._trace, response)
                     calls = list(getattr(response, "tool_calls", []) or [])
                     messages.append(response)
@@ -316,16 +363,23 @@ class ReactMode:
                                 self._model,
                                 _react_response_format(self._response_format),
                             )
+                            completion_messages = [*messages]
+                            if policy is not None:
+                                policy.record_model_use()
+                                context = await policy.maintain({"goal": goal})
+                                completion_messages = [messages[0], messages[1], context.as_messages()[0]]
+                            final_request = [
+                                *completion_messages,
+                                HumanMessage(
+                                    content=(
+                                        "Return the final goal-completion response now. "
+                                        "It must satisfy the configured structured contract."
+                                    )
+                                ),
+                            ]
+                            _trace_llm_context(self._trace, final_request)
                             response = await completion_model.ainvoke(
-                                [
-                                    *messages,
-                                    HumanMessage(
-                                        content=(
-                                            "Return the final goal-completion response now. "
-                                            "It must satisfy the configured structured contract."
-                                        )
-                                    ),
-                                ]
+                                final_request
                             )
                             _trace_llm_response(self._trace, response)
                             if getattr(response, "tool_calls", []):
@@ -340,6 +394,13 @@ class ReactMode:
                     results = await asyncio.gather(
                         *(self._invoke_for_react(runtime, call) for call in calls)
                     )
+                    if policy is not None:
+                        await policy.record_tool_round(
+                            round_number,
+                            calls,
+                            [raw_result for _, _, raw_result in results],
+                            [content if is_error else None for content, is_error, _ in results],
+                        )
                     messages.extend(
                         ToolMessage(
                             content=content,
@@ -347,16 +408,17 @@ class ReactMode:
                             name=str(call.get("name") or "unknown"),
                             status="error" if is_error else "success",
                         )
-                        for call, (content, is_error) in zip(calls, results)
+                        for call, (content, is_error, _) in zip(calls, results)
                     )
         except Exception:
             return ExecutionAnswer(None, "failed", error="react execution failed")
 
         return ExecutionAnswer(None, "failed", error="react execution failed")
 
-    async def _invoke_for_react(self, runtime: Any, call: Mapping[str, Any]) -> tuple[str, bool]:
+    async def _invoke_for_react(self, runtime: Any, call: Mapping[str, Any]) -> tuple[str, bool, Any]:
         try:
-            return render_tool_result(await runtime.invoke(call)), False
+            result = await runtime.invoke(call)
+            return render_tool_result(result), False, result
         except Exception as error:
             if self._trace is not None:
                 self._trace.tool_result(
@@ -364,7 +426,7 @@ class ReactMode:
                     str(error),
                     error=True,
                 )
-            return f"MCP tool failed: {error}", True
+            return f"MCP tool failed: {error}", True, getattr(error, "result", {"error": str(error)})
 
 
 def _react_answer(response: Any) -> ExecutionAnswer:
@@ -504,6 +566,8 @@ def create_execution_mode(
     durable_agent: Any | None = None,
     run_id: str | None = None,
     max_rounds: int = 50,
+    context_budget: int = 128_000,
+    context_policy: RuntimeContextPolicy | None = None,
     configuration: ComponentProviderConfiguration | None = None,
 ) -> ExecutionMode:
     """Select a whole-task Execution mode explicitly.
@@ -533,6 +597,7 @@ def create_execution_mode(
                 provider.model_name,
                 response_format=provider.response_format or "json_schema",
                 on_event=getattr(trace, "llm_event", None),
+                on_request=getattr(trace, "llm_context", None),
             )
         else:
             model = ChatOpenAI(
@@ -553,11 +618,26 @@ def create_execution_mode(
     if mode == "react":
         if model is None:
             return _UnavailableMode(mode)
+        context_configuration = configuration.runtime_context if configuration is not None else None
+        context_model = None
+        if context_configuration is not None:
+            context_model = ChatOpenAI(
+                base_url=context_configuration.base_url,
+                api_key=context_configuration.api_key,
+                model=context_configuration.model_name,
+                max_retries=0,
+            )
         return ReactMode(
             model,
             tool_runtime or ToolRuntime(trace=trace),
             trace=trace,
             max_rounds=max_rounds,
+            context_budget=context_budget,
+            context_policy=context_policy,
+            context_model=context_model,
+            context_response_format=(
+                context_configuration.response_format if context_configuration is not None else None
+            ),
             response_format=selected_response_format,
         )
     if model is None:
@@ -569,5 +649,13 @@ def create_execution_mode(
             model_name,
             response_format=selected_response_format,
             on_event=getattr(trace, "llm_event", None),
+            on_request=getattr(trace, "llm_context", None),
         )
-    return DirectMode(model, response_format=selected_response_format)
+    return DirectMode(model, response_format=selected_response_format, trace=trace)
+
+
+def _trace_llm_context(trace: Any | None, context: Any) -> None:
+    if trace is not None:
+        callback = getattr(trace, "llm_context", None)
+        if callback is not None:
+            callback(context)

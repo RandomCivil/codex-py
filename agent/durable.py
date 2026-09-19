@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict
 from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
+from langchain_openai import ChatOpenAI
 
 from llm import LLM
 from memory.state import (
@@ -339,11 +340,13 @@ async def _run(
     planner_configuration = configuration.planner
     executor_configuration = configuration.executor
     analyzer_configuration = configuration.task_analyzer
+    runtime_context_configuration = configuration.runtime_context
     tool_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     snapshot = configuration_snapshot(
         planner=planner_configuration.__dict__,
         executor=executor_configuration.__dict__,
         task_analyzer=analyzer_configuration.__dict__,
+        runtime_context=(runtime_context_configuration.__dict__ if runtime_context_configuration else None),
         mcp={
             "command": "poetry",
             "args": ["run", "atom-mcp"],
@@ -375,6 +378,7 @@ async def _run(
                         planner_configuration.model_name,
                         response_format=planner_configuration.response_format,
                         on_event=trace.llm_event,
+                        on_request=trace.llm_context,
                     )
                     planner = Planner(llm, trace=trace, response_format=planner_configuration.response_format)
                     executor = Executor(
@@ -386,6 +390,21 @@ async def _run(
                         run_id=run_id,
                         trace=trace,
                         tool_cwd=tool_cwd,
+                        context_model=(
+                            ChatOpenAI(
+                                base_url=runtime_context_configuration.base_url,
+                                api_key=runtime_context_configuration.api_key,
+                                model=runtime_context_configuration.model_name,
+                                max_retries=0,
+                            )
+                            if runtime_context_configuration
+                            else None
+                        ),
+                        context_response_format=(
+                            runtime_context_configuration.response_format
+                            if runtime_context_configuration
+                            else None
+                        ),
                     )
                     initial = AgentState(goal) if goal is not None else None
                     durable = DurableAgent(
@@ -405,6 +424,7 @@ async def _run(
                                 analyzer_configuration.model_name,
                                 response_format=analyzer_configuration.response_format,
                                 on_event=trace.llm_event,
+                                on_request=trace.llm_context,
                             )
                             try:
                                 router = _task_router(

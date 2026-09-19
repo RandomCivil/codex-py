@@ -9,6 +9,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent import Executor, PersistenceError
+from agent.executor import _durable_context_payload
+from agent.runtime_context import RuntimeContext
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, Plan, PlanStep, StepContext
 
 
@@ -417,6 +419,29 @@ def test_executor_recovery_uses_a_fresh_attempt_thread_and_reconciliation_marker
     assert checkpoints
 
 
+def test_executor_checkpoint_keeps_running_marker_but_not_transient_tool_messages(monkeypatch):
+    model = ControlledModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    saver = InMemorySaver()
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model, checkpointer=saver, run_id="run-ctx") as executor:
+            return await executor.execute(state, 1, "publish")
+
+    outcome = asyncio.run(run())
+    assert outcome.execution.status == "completed"
+    checkpoints = list(saver.list({"configurable": {"thread_id": "run-ctx:r1:spublish"}}))
+    assert checkpoints
+    assert all("messages" not in checkpoint.checkpoint["channel_values"] for checkpoint in checkpoints)
+    assert any(
+        checkpoint.checkpoint["channel_values"].get("execution").status == "running"
+        for checkpoint in checkpoints
+    )
+
+
 def _load_tools(*tools):
     async def load(session, **kwargs):
         return list(tools)
@@ -468,6 +493,20 @@ class ToolThenToolModel:
 def _plan_and_state():
     plan = Plan(1, "Prepare release", (PlanStep("publish", "Publish it", "Release is available"),))
     return plan, AgentState("Prepare release", plan_history=(plan,))
+
+
+def test_executor_runtime_durable_state_is_structured_and_json_serializable():
+    plan, state = _plan_and_state()
+    payload = _durable_context_payload(
+        state,
+        1,
+        plan.steps[0],
+        StepContext(files_read=["README.md"], observations=["release inspected"]),
+    )
+
+    assert payload["agent_state"]["goal"] == "Prepare release"
+    assert payload["step_context"]["files_read"] == ["README.md"]
+    assert json.loads(json.dumps(payload)) == payload
 
 
 def test_executor_fails_when_tool_round_budget_is_exhausted(monkeypatch):

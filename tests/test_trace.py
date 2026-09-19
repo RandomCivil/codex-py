@@ -27,7 +27,7 @@ def test_llm_event_prints_complete_event_payload():
     ]
 
 
-def test_error_level_suppresses_streaming_llm_events_but_keeps_usage_and_final_response():
+def test_error_level_suppresses_streaming_llm_events_and_final_response_but_keeps_usage():
     output = StringIO()
     trace = RunTrace(output, level="error")
 
@@ -50,7 +50,6 @@ def test_error_level_suppresses_streaming_llm_events_but_keeps_usage_and_final_r
 
     assert output.getvalue().splitlines() == [
         "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 cached_tokens=4 reasoning_tokens=1",
-        '[llm final] data={"usage": {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 4}, "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 1}, "total_tokens": 13}}',
         "[llm output complete] partial",
     ]
 
@@ -78,7 +77,7 @@ def test_llm_usage_is_printed_from_completion_event_at_info_level():
     )
 
 
-def test_llm_response_keeps_usage_and_final_response_at_error_level():
+def test_llm_response_at_error_level_keeps_usage_but_hides_final_response():
     output = StringIO()
     trace = RunTrace(output, level="error")
 
@@ -91,7 +90,6 @@ def test_llm_response_keeps_usage_and_final_response_at_error_level():
 
     assert output.getvalue().splitlines() == [
         "[llm usage] input_tokens=2 output_tokens=1 total_tokens=3 cached_tokens=None reasoning_tokens=None",
-        '[llm final] data={"content": "final answer", "usage_metadata": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}}',
     ]
 
 
@@ -151,6 +149,26 @@ def test_trace_prefixes_each_line_with_run_id():
     trace.plan("started", 1)
 
     assert output.getvalue() == "[run-123] [plan] started revision=1\n"
+
+
+def test_trace_prints_llm_context():
+    output = StringIO()
+    trace = RunTrace(output, run_id="run-123")
+
+    trace.llm_context({"input": [{"role": "user", "content": "hello"}]})
+
+    assert output.getvalue() == (
+        '[run-123] [llm context] data={"input": [{"content": "hello", "role": "user"}]}\n'
+    )
+
+
+def test_error_level_hides_llm_context():
+    output = StringIO()
+    trace = RunTrace(output, level="error")
+
+    trace.llm_context({"input": [{"role": "user", "content": "hello"}]})
+
+    assert output.getvalue() == ""
 
 
 def test_trace_prints_every_loaded_recovery_context_value():

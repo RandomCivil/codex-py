@@ -16,6 +16,10 @@ _Avoid_: JSON mode, response type
 The effective OpenAI-compatible provider credentials, endpoint, model name, and, where structured output is required, Structured-output mode used by a named language-model component. Components may inherit shared values, then apply component-specific overrides.
 _Avoid_: global model configuration, executor tool configuration
 
+**Runtime-context component**:
+The named language-model component that generates and compacts Observations for tool-capable execution modes. It may use a separately configured OpenAI-compatible provider and Structured-output mode, while ReAct and the Plan-step Executor retain ownership of their tool loops.
+_Avoid_: tool-loop model, observation provider
+
 **Text stream**:
 An asynchronous sequence containing only successive generated text deltas; it ends after the model response completes.
 _Avoid_: response stream, event stream
@@ -163,3 +167,19 @@ _Avoid_: text stream, planner model
 **Tool-call batch**:
 All function calls emitted in one response by a Tool-calling model. An Executor starts every call in the batch concurrently, waits until every call has settled, and returns their results in request order before continuing the Step execution.
 _Avoid_: parallel Plan execution, tool-call sequence
+
+**Tool round**:
+One tool-capable Model request together with the resulting Tool-call batch, if any. A final no-tool completion request is not a Tool round.
+_Avoid_: individual tool call, model turn
+
+**Raw tool result**:
+The complete request parameters and ordered results, including errors, for one Tool round's Tool-call batch. Raw tool results are transient Model context, never Step context or Durable State; complete diagnostic tracing may record them outside that state.
+_Avoid_: durable tool trace, observation
+
+**Observation**:
+A schema-validated, concise historical record generated after one Tool round. It records the round number plus tool-call-ID-attributed confirmed facts, reported errors, and model inferences; generation or validation failure fails the active execution.
+_Avoid_: raw tool output, durable fact
+
+**Runtime context window**:
+The context supplied to every Model request within a tool loop: the three most recent Tool rounds' Raw tool results, compressed Observations for earlier Tool rounds, and the applicable Durable State. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit the required Durable State and Raw tool results, execution fails.
+_Avoid_: Durable State, message transcript

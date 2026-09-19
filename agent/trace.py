@@ -29,9 +29,8 @@ class RunTrace:
             elif event_type == "response.output_text.delta":
                 self._output_buffer += getattr(event, "delta", "")
             elif event_type == "response.completed":
-                # A completed response is the durable audit record for a model
-                # invocation.  Keep it and its token accounting at every level;
-                # log levels control progress noise, not these terminal facts.
+                # Token accounting remains useful at every level.  The full
+                # request/response payload is reserved for info-level tracing.
                 self._llm_usage(event)
                 self.llm_final(getattr(event, "response", event))
                 if self._output_buffer:
@@ -107,13 +106,21 @@ class RunTrace:
         self._llm_usage(message)
 
     def llm_final(self, response: Any) -> None:
-        """Print a model's terminal response regardless of the log level."""
+        """Print a model's terminal response at info level."""
+        if self._level != "info":
+            return
         self._line(f"[llm final] data={_compact(response)}")
 
     def llm_response(self, response: Any) -> None:
         """Record the terminal response and its usage from a non-streaming model."""
         self._llm_usage(response)
         self.llm_final(response)
+
+    def llm_context(self, context: Any) -> None:
+        """Print the exact request context submitted to a model at info level."""
+        if self._level != "info":
+            return
+        self._line(f"[llm context] data={_compact(context)}")
 
     def llm_text(self, label: str, value: Any) -> None:
         if self._level == "error":
@@ -193,13 +200,17 @@ def _as_serializable(value: Any) -> Any:
     model_dump = getattr(value, "model_dump", None)
     if callable(model_dump):
         try:
-            return model_dump(mode="json")
+            return _as_serializable(model_dump(mode="json"))
         except (TypeError, ValueError):
-            return model_dump()
-    if isinstance(value, Mapping | list | tuple):
-        return value
+            return _as_serializable(model_dump())
+    if isinstance(value, Mapping):
+        return {key: _as_serializable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_as_serializable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_as_serializable(item) for item in value]
     if hasattr(value, "__dict__"):
-        return vars(value)
+        return _as_serializable(vars(value))
     return value
 
 

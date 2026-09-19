@@ -4,6 +4,7 @@ import json
 from langchain_core.messages import AIMessage
 
 from agent import ExecutionAnswer, create_execution_mode
+from agent.runtime_context import RuntimeContext
 from agent.configuration import load_configuration
 
 
@@ -437,6 +438,82 @@ def test_react_rejects_a_non_positive_round_budget():
         assert str(error) == "max_rounds must be a positive integer"
     else:
         raise AssertionError("non-positive React budget should be rejected")
+
+
+def test_react_sends_the_layered_context_to_operational_and_final_requests():
+    class CapturingPolicy:
+        def __init__(self):
+            self.requests = []
+            self.rounds = []
+
+        def record_model_use(self):
+            pass
+
+        async def maintain(self, durable_state):
+            self.requests.append(durable_state)
+            return RuntimeContext(durable_state, (), ())
+
+        async def record_tool_round(self, round, calls, results, errors):
+            self.rounds.append((round, calls, results, errors))
+
+    model = TerminalStructuredModel()
+    policy = CapturingPolicy()
+    runtime = ToolRuntime("observed")
+
+    async def run():
+        return await create_execution_mode(
+            "react", model=model, tool_runtime=runtime,
+            context_policy=policy,
+            response_format="json_schema",
+        ).run("Do it")
+
+    answer = asyncio.run(run())
+
+    assert answer == ExecutionAnswer("Done.", "completed")
+    assert len(policy.requests) == 3
+    assert policy.rounds[0][0] == 1
+    assert model.completion_calls[0][-2].content.startswith("## Runtime context")
+
+
+def test_react_uses_the_runtime_context_component_model_when_configured(tmp_path, monkeypatch):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """
+model:
+  base_url: https://shared.example/v1
+  api_key: shared-key
+  model_name: shared-model
+  response_format: json_schema
+runtime_context:
+  base_url: https://context.example/v1
+  api_key: context-key
+  model_name: context-model
+  response_format: json_object
+"""
+    )
+    created = []
+
+    class ContextModel:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr("agent.execution.ChatOpenAI", ContextModel)
+    mode = create_execution_mode(
+        "react",
+        model=ControlledToolModel(AIMessage(content="{}")),
+        tool_runtime=ToolRuntime("unused"),
+        configuration=load_configuration(path),
+    )
+
+    assert created == [
+        {
+            "base_url": "https://context.example/v1",
+            "api_key": "context-key",
+            "model": "context-model",
+            "max_retries": 0,
+        }
+    ]
+    assert mode._context_response_format == "json_object"
 
 
 def test_direct_mode_fails_when_the_model_returns_only_whitespace():

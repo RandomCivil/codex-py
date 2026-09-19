@@ -1,7 +1,68 @@
 from io import StringIO
 from types import SimpleNamespace
+import re
 
 from agent.trace import RunTrace
+
+
+def test_model_request_usage_is_attributed_to_a_safe_deterministic_request_family():
+    first_output = StringIO()
+    first = RunTrace(first_output, level="error")
+
+    first.llm_request(
+        "planner",
+        {
+            "model": "test-model",
+            "instructions": "Return a plan.",
+            "input": "secret goal one",
+            "tools": None,
+            "text": {"format": {"type": "json_schema", "name": "agent_plan"}},
+        },
+    )
+    first.llm_event(
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                usage={
+                    "input_tokens": 10,
+                    "input_tokens_details": {"cached_tokens": 4},
+                    "total_tokens": 10,
+                }
+            ),
+        )
+    )
+
+    second_output = StringIO()
+    second = RunTrace(second_output, level="error")
+    second.llm_request(
+        "planner",
+        {
+            "model": "test-model",
+            "instructions": "Return a plan.",
+            "input": "different secret goal",
+            "tools": None,
+            "text": {"format": {"type": "json_schema", "name": "agent_plan"}},
+        },
+    )
+    second.llm_usage(
+        SimpleNamespace(
+            usage_metadata={
+                "input_tokens": 11,
+                "input_token_details": {"cache_read": 5},
+                "total_tokens": 11,
+            }
+        )
+    )
+
+    first_line = first_output.getvalue().strip()
+    second_line = second_output.getvalue().strip()
+    family = re.search(r"request_family=(sha256:[0-9a-f]{64})", first_line).group(1)
+
+    assert "component=planner" in first_line
+    assert "secret goal one" not in first_line
+    assert re.search(r"request_family=(sha256:[0-9a-f]{64})", second_line).group(1) == family
+    assert "cached_tokens=4" in first_line
+    assert "cached_tokens=5" in second_line
 
 
 def test_llm_event_prints_complete_event_payload():

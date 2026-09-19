@@ -11,9 +11,11 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 
 from agent.configuration import ComponentProviderConfiguration
+from agent.model_request import tool_request_shape, trace_llm_context, trace_llm_request
 from llm.llm import LLM
 from llm.response_format import ResponseFormat, chat_response_format, responses_text_format, require_response_format
 from agent.runtime_context import RuntimeContextPolicy
+from agent.tool_binding import canonical_mcp_tool_set
 
 
 ExecutionStatus = Literal["completed", "failed"]
@@ -45,11 +47,15 @@ _GENERAL_RESPONSE_SCHEMA = {
 }
 
 
-_REACT_FEW_SHOT_PROMPT = """You are an execution agent. Work iteratively: use an available tool when
+_REACT_TOOL_LOOP_PROMPT = """You are an execution agent. Work iteratively: use an available tool when
 evidence or an external action is needed, inspect each result, and correct course when a
 tool fails. Do not claim the goal is complete until the available evidence supports it.
-When the goal is complete, reply with exactly one JSON object containing a concise
-evidence-based `answer` and `goal_satisfied: true`.
+When the goal is complete, stop requesting tools so the terminal response can be returned.
+"""
+
+_REACT_JSON_OBJECT_PROMPT = _REACT_TOOL_LOOP_PROMPT + """
+The terminal response must be exactly one JSON object containing a concise evidence-based
+`answer` and `goal_satisfied: true`.
 
 Examples:
 
@@ -152,7 +158,7 @@ class DirectMode:
                 ),
             }
             if not callable(getattr(self._model, "_on_request", None)):
-                _trace_llm_context(self._trace, request)
+                trace_llm_context(self._trace, request)
             output = "".join(
                 [
                     chunk
@@ -268,10 +274,19 @@ class ToolAgentMode:
     async def run(self, goal: str) -> ExecutionAnswer:
         try:
             async with self._runtime as runtime:
+                tools = canonical_mcp_tool_set(runtime.tools)
                 bound = _bind_tools_with_response_format(
-                    self._model, runtime.tools, self._response_format
+                    self._model, tools, self._response_format
                 )
-                _trace_llm_context(self._trace, goal)
+                trace_llm_request(
+                    self._trace,
+                    "tool_agent",
+                    goal,
+                    static_shape={
+                        "tools": tool_request_shape(tools),
+                        "response_format": self._response_format,
+                    },
+                )
                 response = await bound.ainvoke(goal)
                 _trace_llm_response(self._trace, response)
                 calls = list(getattr(response, "tool_calls", []) or [])
@@ -326,7 +341,8 @@ class ReactMode:
                 # OpenAI-compatible providers reject a response format when
                 # it is combined with tool definitions.  The structured
                 # completion contract is applied only after tool use stops.
-                model = self._model.bind_tools(runtime.tools)
+                tools = canonical_mcp_tool_set(runtime.tools)
+                model = self._model.bind_tools(tools)
                 # Injected doubles can predate the no-tool Observation seam.  The
                 # production ChatOpenAI path always enables it; tests and embedders
                 # may provide a policy explicitly when their model supports that
@@ -340,7 +356,13 @@ class ReactMode:
                         trace=self._trace,
                     )
                 messages: list[Any] = [
-                    SystemMessage(content=_REACT_FEW_SHOT_PROMPT),
+                    SystemMessage(
+                        content=(
+                            _REACT_TOOL_LOOP_PROMPT
+                            if self._response_format == "json_schema"
+                            else _REACT_JSON_OBJECT_PROMPT
+                        )
+                    ),
                     HumanMessage(content=goal),
                 ]
                 for round_number in range(1, self._max_rounds + 1):
@@ -352,7 +374,16 @@ class ReactMode:
                         # once it is active; old AI/Tool messages must not become
                         # an undocumented second memory channel.
                         request_messages = [messages[0], messages[1], *context.as_messages()]
-                    _trace_llm_context(self._trace, request_messages)
+                    trace_llm_request(
+                        self._trace,
+                        "react",
+                        request_messages,
+                        static_shape={
+                            "instructions": getattr(request_messages[0], "content", ""),
+                            "tools": tool_request_shape(tools),
+                            "request_kind": "tool_round",
+                        },
+                    )
                     response = await model.ainvoke(request_messages)
                     _trace_llm_response(self._trace, response)
                     calls = list(getattr(response, "tool_calls", []) or [])
@@ -372,12 +403,27 @@ class ReactMode:
                                 *completion_messages,
                                 HumanMessage(
                                     content=(
-                                        "Return the final goal-completion response now. "
-                                        "It must satisfy the configured structured contract."
+                                        "Return the final goal-completion response now."
+                                        if self._response_format == "json_schema"
+                                        else (
+                                            "Return the final goal-completion response now. "
+                                            "It must be one JSON object with exactly an evidence-based "
+                                            "answer and goal_satisfied: true."
+                                        )
                                     )
                                 ),
                             ]
-                            _trace_llm_context(self._trace, final_request)
+                            trace_llm_request(
+                                self._trace,
+                                "react",
+                                final_request,
+                                static_shape={
+                                    "instructions": getattr(final_request[0], "content", ""),
+                                    "terminal_instruction": getattr(final_request[-1], "content", ""),
+                                    "request_kind": "goal_completion",
+                                    "response_format": _react_response_format(self._response_format),
+                                },
+                            )
                             response = await completion_model.ainvoke(
                                 final_request
                             )
@@ -597,7 +643,11 @@ def create_execution_mode(
                 provider.model_name,
                 response_format=provider.response_format or "json_schema",
                 on_event=getattr(trace, "llm_event", None),
-                on_request=getattr(trace, "llm_context", None),
+                on_request=(
+                    (lambda request: trace.llm_request("direct", request))
+                    if trace is not None
+                    else None
+                ),
             )
         else:
             model = ChatOpenAI(
@@ -649,13 +699,10 @@ def create_execution_mode(
             model_name,
             response_format=selected_response_format,
             on_event=getattr(trace, "llm_event", None),
-            on_request=getattr(trace, "llm_context", None),
+            on_request=(
+                (lambda request: trace.llm_request("direct", request))
+                if trace is not None
+                else None
+            ),
         )
     return DirectMode(model, response_format=selected_response_format, trace=trace)
-
-
-def _trace_llm_context(trace: Any | None, context: Any) -> None:
-    if trace is not None:
-        callback = getattr(trace, "llm_context", None)
-        if callback is not None:
-            callback(context)

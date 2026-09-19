@@ -378,7 +378,7 @@ async def _run(
                         planner_configuration.model_name,
                         response_format=planner_configuration.response_format,
                         on_event=trace.llm_event,
-                        on_request=trace.llm_context,
+                        on_request=lambda request: trace.llm_request("planner", request),
                     )
                     planner = Planner(llm, trace=trace, response_format=planner_configuration.response_format)
                     executor = Executor(
@@ -424,7 +424,7 @@ async def _run(
                                 analyzer_configuration.model_name,
                                 response_format=analyzer_configuration.response_format,
                                 on_event=trace.llm_event,
-                                on_request=trace.llm_context,
+                                on_request=lambda request: trace.llm_request("task_analyzer", request),
                             )
                             try:
                                 router = _task_router(

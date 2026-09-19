@@ -163,6 +163,31 @@ def test_tool_agent_executes_only_the_first_call_and_renders_its_result():
     assert runtime.closed is True
 
 
+def test_tool_agent_binds_the_effective_mcp_tool_set_in_canonical_name_order():
+    class ServerTool:
+        def __init__(self, name):
+            self.name = name
+
+    class EnumeratingRuntime(ToolRuntime):
+        @property
+        def tools(self):
+            return [ServerTool("zebra"), ServerTool("alpha")]
+
+    model = ControlledToolModel(
+        AIMessage(content="", tool_calls=[{"name": "alpha", "args": {}, "id": "call-1"}])
+    )
+    runtime = EnumeratingRuntime("accepted")
+
+    async def run():
+        return await create_execution_mode("tool_agent", model=model, tool_runtime=runtime).run("Do it")
+
+    answer = asyncio.run(run())
+
+    assert answer == ExecutionAnswer("accepted", "completed")
+    assert [tool.name for tool in model.tools] == ["alpha", "zebra"]
+    assert runtime.calls == [model.response.tool_calls[0]]
+
+
 def test_tool_agent_returns_model_text_without_opening_tool_runtime_when_no_tool_is_selected():
     model = ControlledToolModel(AIMessage(content="Nothing else is needed."))
     runtime = ToolRuntime("unused")
@@ -258,6 +283,34 @@ def test_react_completes_only_from_a_structured_goal_satisfied_response():
     assert answer == ExecutionAnswer("The release is ready.", "completed")
     assert len(model.calls) == 1
     assert runtime.closed is True
+
+
+def test_react_binds_the_effective_mcp_tool_set_in_canonical_name_order():
+    class ServerTool:
+        def __init__(self, name):
+            self.name = name
+
+    class EnumeratingRuntime(ToolRuntime):
+        @property
+        def tools(self):
+            return [ServerTool("zebra"), ServerTool("alpha")]
+
+    model = SequencedToolModel(
+        [
+            AIMessage(content="", tool_calls=[{"name": "alpha", "args": {}, "id": "call-1"}]),
+            AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True})),
+        ]
+    )
+    runtime = EnumeratingRuntime("accepted")
+
+    async def run():
+        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Do it")
+
+    answer = asyncio.run(run())
+
+    assert answer == ExecutionAnswer("Done.", "completed")
+    assert [tool.name for tool in model.tools] == ["alpha", "zebra"]
+    assert [call["name"] for call in runtime.calls] == ["alpha"]
 
 
 def test_react_prepends_a_few_shot_prompt_to_the_goal():
@@ -473,6 +526,23 @@ def test_react_sends_the_layered_context_to_operational_and_final_requests():
     assert len(policy.requests) == 3
     assert policy.rounds[0][0] == 1
     assert model.completion_calls[0][-2].content.startswith("## Runtime context")
+
+
+def test_react_strict_schema_uses_tool_guidance_without_repeating_terminal_shape():
+    model = TerminalStructuredModel()
+    runtime = ToolRuntime("observed")
+
+    async def run():
+        return await create_execution_mode(
+            "react", model=model, tool_runtime=runtime,
+            response_format="json_schema",
+        ).run("Do it")
+
+    assert asyncio.run(run()) == ExecutionAnswer("Done.", "completed")
+    assert "use an available tool" in model.operational_calls[0][0].content
+    assert "exactly one JSON object" not in model.operational_calls[0][0].content
+    assert "Return the final goal-completion response now." in model.completion_calls[0][-1].content
+    assert "configured structured contract" not in model.completion_calls[0][-1].content
 
 
 def test_react_uses_the_runtime_context_component_model_when_configured(tmp_path, monkeypatch):

@@ -77,9 +77,12 @@ class SequencedObservationModel(ObservationModel):
 class MergeObservationModel(SequencedObservationModel):
     async def ainvoke(self, messages):
         self.calls.append(messages)
-        if "merge_observations" in messages[0].content:
-            payload = json.loads(messages[0].content)
-            second_round = payload["merge_observations"][1]["round"]
+        if "merge_observations" in messages[0].content or (
+            len(messages) == 2 and "Merge the Observations" in messages[0].content
+        ):
+            payload = json.loads(messages[-1].content)
+            observations = payload if isinstance(payload, list) else payload["merge_observations"]
+            second_round = observations[1]["round"]
             return AIMessage(
                 content=json.dumps(
                     {
@@ -97,7 +100,9 @@ class MergeObservationModel(SequencedObservationModel):
             content=json.dumps(
                 {
                     "round": self.round,
-                    "confirmed_facts": [],
+                    "confirmed_facts": [
+                        {"text": f"fact-{self.round}", "tool_call_ids": [f"call-{self.round}"]}
+                    ],
                     "reported_errors": [],
                     "model_inferences": [],
                 }
@@ -192,10 +197,52 @@ def test_observation_request_uses_the_component_response_format():
     asyncio.run(run())
 
     assert model.bind_options == {"tools": [], "response_format": {"type": "json_object"}}
-    prompt = json.loads(model.calls[0][0].content)["instruction"]
-    assert "Return exactly one JSON object" in prompt
-    assert '"round": 7' in prompt
-    assert '"tool_call_ids": ["call-7"]' in prompt
+    contract, evidence = model.calls[0]
+    assert "Return exactly one JSON object" in contract.content
+    assert "round, confirmed_facts, reported_errors, and model_inferences" in contract.content
+    assert json.loads(evidence.content)["calls"][0]["id"] == "call-1"
+
+
+def test_observation_request_puts_its_fixed_contract_before_settled_raw_evidence():
+    model = ObservationModel(
+        {
+            "round": 1,
+            "confirmed_facts": [
+                {"text": "version is 1.4.0", "tool_call_ids": ["call-1"]}
+            ],
+            "reported_errors": [],
+            "model_inferences": [],
+        }
+    )
+    policy = RuntimeContextPolicy(model)
+
+    asyncio.run(
+        policy.record_tool_round(
+            1,
+            [{"id": "call-1", "name": "read", "args": {"path": "VERSION"}}],
+            ["1.4.0"],
+        )
+    )
+
+    contract, evidence = model.calls[0]
+
+    assert "Create the Observation" in contract.content
+    assert "call-1" not in contract.content
+    assert "VERSION" not in contract.content
+    assert "Return exactly one JSON object" not in contract.content
+    assert json.loads(evidence.content) == {
+        "round": 1,
+        "calls": [
+            {
+                "id": "call-1",
+                "name": "read",
+                "args": {"path": "VERSION"},
+                "result": "1.4.0",
+                "error": None,
+            }
+        ],
+    }
+    assert policy.observations[0].confirmed_facts[0].tool_call_ids == ("call-1",)
 
 
 def test_policy_moves_only_the_fourth_oldest_round_to_observation_context():
@@ -276,10 +323,65 @@ def test_policy_merges_oldest_expired_observations_and_preserves_source_range(mo
     assert context.observations[0].source_round_end == 2
     assert context.observations[0].source_tool_call_ids == ("call-1", "call-2")
     assert [item.round for item in context.raw_tool_results] == [3, 4, 5]
-    merge_request = next(
-        json.loads(call[0].content) for call in model.calls if "merge_observations" in call[0].content
+    merge_contract, merge_evidence = next(
+        call for call in model.calls if len(call) == 2 and "Merge the Observations" in call[0].content
     )
-    assert "Return exactly one JSON object" in merge_request["instruction"]
+    assert "Return exactly one JSON object" not in merge_contract.content
+    assert [item["round"] for item in json.loads(merge_evidence.content)] == [1, 2]
+
+
+def test_observation_merge_request_puts_fixed_contract_before_observations(monkeypatch):
+    monkeypatch.setattr("agent.runtime_context._estimate_tokens", lambda context: 2 if len(context.observations) > 1 else 1)
+    model = MergeObservationModel()
+    policy = RuntimeContextPolicy(model, budget=1)
+
+    async def run():
+        for round_number in range(1, 6):
+            await policy.record_tool_round(
+                round_number,
+                [{"id": f"call-{round_number}", "name": "read", "args": {}}],
+                [f"result-{round_number}"],
+            )
+        return await policy.maintain({"goal": "inspect"})
+
+    asyncio.run(run())
+
+    contract, evidence = model.calls[-1]
+
+    assert "Merge the Observations" in contract.content
+    assert "call-1" not in contract.content
+    assert "call-2" not in contract.content
+    assert "Return exactly one JSON object" not in contract.content
+    assert [item["round"] for item in json.loads(evidence.content)] == [1, 2]
+    assert [item["confirmed_facts"][0]["tool_call_ids"] for item in json.loads(evidence.content)] == [
+        ["call-1"],
+        ["call-2"],
+    ]
+
+
+def test_observation_merge_request_keeps_json_object_shape_guarantees_in_its_contract(monkeypatch):
+    monkeypatch.setattr("agent.runtime_context._estimate_tokens", lambda context: 2 if len(context.observations) > 1 else 1)
+    model = MergeObservationModel()
+    policy = RuntimeContextPolicy(model, budget=1, response_format="json_object")
+
+    async def run():
+        for round_number in range(1, 6):
+            await policy.record_tool_round(
+                round_number,
+                [{"id": f"call-{round_number}", "name": "read", "args": {}}],
+                [f"result-{round_number}"],
+            )
+        await policy.maintain({"goal": "inspect"})
+
+    asyncio.run(run())
+
+    contract, evidence = model.calls[-1]
+
+    assert "Return exactly one JSON object" in contract.content
+    assert "round, confirmed_facts, reported_errors, and model_inferences" in contract.content
+    assert "call-1" not in contract.content
+    assert [item["round"] for item in json.loads(evidence.content)] == [1, 2]
+    assert model.bind_options == {"tools": [], "response_format": {"type": "json_object"}}
 
 
 def test_policy_fails_instead_of_merging_an_observation_with_a_recent_raw_round(monkeypatch):

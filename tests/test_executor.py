@@ -118,8 +118,9 @@ def test_executor_completes_a_plan_step_after_a_successful_tool_round(monkeypatc
     assert "handoff and evidence summary" in completion_prompt
     assert "subsequent Plan steps will receive" in completion_prompt
     assert "message transcript" in completion_prompt
-    assert "top-level JSON object" in completion_prompt
-    assert 'Do not wrap the receipt in `{"type":"json_object","result":...}`' in completion_prompt
+    assert "top-level JSON object" not in completion_prompt
+    assert 'Do not wrap the receipt in `{"type":"json_object","result":...}`' not in completion_prompt
+    assert "Return the completion receipt" in completion_prompt
     # MCP tools remain non-strict; the separate completion reply uses JSON Schema.
     completion_tools, completion_options = model.bindings[1]
     assert completion_tools is None
@@ -570,6 +571,44 @@ class FinalModel:
         if len(self.calls) == 2:
             return AIMessage(content="MCP work is complete.")
         return _completion_message(self.completion_result, criterion_met=self.criterion_met)
+
+
+def test_executor_binds_the_effective_mcp_tool_set_in_canonical_name_order(monkeypatch):
+    class CapturingFinalModel(FinalModel):
+        def bind_tools(self, tools, **kwargs):
+            self.tools = tools
+            return super().bind_tools(tools, **kwargs)
+
+    executed = []
+
+    def alpha(value: str) -> str:
+        """Record that the allowed tool executed."""
+        executed.append(value)
+        return value
+
+    model = CapturingFinalModel(
+        "Published the release. Completion criterion met: Release is available",
+        tool_name="alpha",
+    )
+    zebra = StructuredTool.from_function(record, name="zebra")
+    outside_allowlist = StructuredTool.from_function(record, name="outside_allowlist")
+    alpha_tool = StructuredTool.from_function(alpha, name="alpha")
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr(
+        "agent.executor.load_mcp_tools", _load_tools(zebra, outside_allowlist, alpha_tool)
+    )
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(model=model, tool_allowlist=("zebra", "alpha")) as executor:
+            return await executor.execute(state, 1, "publish")
+
+    execution = asyncio.run(run())
+
+    assert execution.execution.status == "completed", execution.execution.error
+    assert execution.execution.result == "Published the release. Completion criterion met: Release is available"
+    assert [tool.name for tool in model.tools] == ["alpha", "zebra"]
+    assert executed == ["done"]
 
 
 def test_executor_returns_an_mcp_tool_error_to_the_model(monkeypatch):

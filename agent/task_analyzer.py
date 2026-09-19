@@ -64,10 +64,10 @@ class RoutedExecutionAnswer:
     analysis_error: str | None = None
 
 
-_TASK_ANALYZER_PROMPT="""
+_TASK_ANALYZER_INSTRUCTIONS = """
 You are a Task Analyzer in an agent runtime.
 
-Your job is NOT to solve the user's task and NOT to choose an agent architecture directly.
+Your job is not to solve the user's task and not to choose an agent architecture directly.
 
 Your only job is to analyze the task and produce structured task characteristics that a deterministic router can use to select the appropriate execution architecture.
 
@@ -292,6 +292,11 @@ Then typically:
 * expected_horizon = long
 * need_replanning = high
 
+Do not recommend an architecture, expose chain-of-thought, or include implementation details.
+"""
+
+
+_TASK_ANALYZER_JSON_OBJECT_CONTRACT = """
 ## Output requirements
 
 Return JSON only.
@@ -394,12 +399,17 @@ class TaskAnalyzer:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
         text_format = _TEXT_FORMAT if self._response_format == "json_schema" else {"type": "json_object"}
+        instructions = (
+            _TASK_ANALYZER_INSTRUCTIONS
+            if self._response_format == "json_schema"
+            else _TASK_ANALYZER_INSTRUCTIONS + _TASK_ANALYZER_JSON_OBJECT_CONTRACT
+        )
         output = "".join(
             [
                 chunk
                 async for chunk in self._text_stream.stream_text(
                     goal,
-                    instructions=_TASK_ANALYZER_PROMPT,
+                    instructions=instructions,
                     tools=None,
                     text_format=text_format,
                 )

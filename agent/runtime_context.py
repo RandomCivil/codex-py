@@ -20,19 +20,36 @@ DEFAULT_CONTEXT_BUDGET = 128_000
 RAW_ROUND_WINDOW = 3
 
 
-_OBSERVATION_JSON_FEW_SHOT = """Return exactly one JSON object and no Markdown.
+_OBSERVATION_CONTRACT = """Create the Observation for the settled Tool round in the next message.
+Classify tool-confirmed output as confirmed_facts, every raw error as reported_errors,
+and interpretations as model_inferences. Every evidence entry must retain its relevant
+tool_call_ids."""
 
-Example input tool round:
-{"round": 7, "calls": [{"id": "call-7", "name": "read_file", "args": {"path": "VERSION"}, "result": "1.4.0", "error": null}]}
+_MERGE_OBSERVATION_CONTRACT = """Merge the Observations in the next message into one Observation.
+Preserve every source tool-call ID and report the latest source round."""
 
-Example JSON output:
-{"round": 7, "confirmed_facts": [{"text": "VERSION is 1.4.0", "tool_call_ids": ["call-7"]}], "reported_errors": [], "model_inferences": []}
-
-Keep the output fields exactly as shown by the configured schema."""
+_JSON_OBJECT_SHAPE_GUARANTEE = """Return exactly one JSON object and no Markdown.
+It must contain exactly round, confirmed_facts, reported_errors, and model_inferences.
+Each evidence entry must contain exactly text and tool_call_ids. Preserve the source
+round and every source tool-call ID."""
 
 
 class ContextMaintenanceError(RuntimeError):
     """The Runtime context contract could not be maintained."""
+
+
+def _observation_contract(response_format: ResponseFormat) -> str:
+    return _structured_contract(_OBSERVATION_CONTRACT, response_format)
+
+
+def _merge_observation_contract(response_format: ResponseFormat) -> str:
+    return _structured_contract(_MERGE_OBSERVATION_CONTRACT, response_format)
+
+
+def _structured_contract(contract: str, response_format: ResponseFormat) -> str:
+    if response_format == "json_schema":
+        return contract
+    return f"{contract}\n\n{_JSON_OBJECT_SHAPE_GUARANTEE}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,41 +231,25 @@ class RuntimeContextPolicy:
     async def _request_observation(self, raw: RawToolResult) -> Observation:
         response = await self._structured_invoke(
             [
-                HumanMessage(
-                    content=json.dumps(
-                        {
-                            "instruction": (
-                                "Create the Observation for this settled Tool round. "
-                                "Classify tool-confirmed output as confirmed_facts, every raw "
-                                "error as reported_errors, and interpretations as model_inferences. "
-                                "Every entry must retain the relevant tool_call_ids.\n\n"
-                                + _OBSERVATION_JSON_FEW_SHOT
-                            ),
-                            "tool_round": _raw_payload(raw),
-                        },
-                        default=str,
-                    )
-                )
-            ]
+                HumanMessage(content=_observation_contract(self._response_format)),
+                HumanMessage(content=json.dumps(_raw_payload(raw), default=str)),
+            ],
+            request_kind="observation",
         )
         return _parse_observation(response, expected_round=raw.round)
 
     async def _merge_observations(self, first: Observation, second: Observation) -> Observation:
         response = await self._structured_invoke(
             [
+                HumanMessage(content=_merge_observation_contract(self._response_format)),
                 HumanMessage(
                     content=json.dumps(
-                        {
-                            "instruction": (
-                                "Merge these Observations while retaining every source tool-call ID.\n\n"
-                                + _OBSERVATION_JSON_FEW_SHOT
-                            ),
-                            "merge_observations": [_observation_payload(first), _observation_payload(second)],
-                        },
+                        [_observation_payload(first), _observation_payload(second)],
                         default=str,
                     )
-                )
-            ]
+                ),
+            ],
+            request_kind="observation_merge",
         )
         merged = _parse_observation(response, expected_round=second.round)
         expected_ids = set(first.source_tool_call_ids) | set(second.source_tool_call_ids)
@@ -263,15 +264,29 @@ class RuntimeContextPolicy:
             source_round_end=second.source_round_end or second.round,
         )
 
-    async def _structured_invoke(self, messages: list[HumanMessage]) -> Any:
+    async def _structured_invoke(
+        self, messages: list[HumanMessage], *, request_kind: str
+    ) -> Any:
         self._model_uses += 1
         schema = _observation_response_format(self._response_format)
         try:
             bound = self.model.bind(tools=[], response_format=schema)
             if self._trace is not None:
-                callback = getattr(self._trace, "llm_context", None)
+                callback = getattr(self._trace, "llm_request", None)
                 if callback is not None:
-                    callback(messages)
+                    callback(
+                        "runtime_context",
+                        messages,
+                        static_shape={
+                            "instructions": getattr(messages[0], "content", ""),
+                            "request_kind": request_kind,
+                            "response_format": schema,
+                        },
+                    )
+                else:
+                    callback = getattr(self._trace, "llm_context", None)
+                    if callback is not None:
+                        callback(messages)
             response = await bound.ainvoke(messages)
             if self._trace is not None:
                 callback = getattr(self._trace, "llm_response", None)

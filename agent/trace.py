@@ -4,6 +4,7 @@ Tracing is deliberately sent to stderr so the CLI's final JSON result remains
 safe for callers that consume stdout as a machine-readable interface.
 """
 
+import hashlib
 import json
 import sys
 from collections.abc import Mapping
@@ -20,6 +21,25 @@ class RunTrace:
         self._level = level
         self._run_id = run_id
         self._output_buffer = ""
+        self._llm_attribution: tuple[str, str] | None = None
+
+    def llm_request(
+        self,
+        component: str,
+        request: Any,
+        *,
+        static_shape: Any | None = None,
+    ) -> None:
+        """Associate the next model usage record with a safe request family.
+
+        The request itself is still emitted only through the existing info-level
+        context trace.  Usage records retain just a digest of the static shape,
+        never the dynamic input or provider credentials.
+        """
+        label = component.strip() if isinstance(component, str) and component.strip() else "unknown"
+        shape = _cache_relevant_shape(request) if static_shape is None else static_shape
+        self._llm_attribution = (label, _request_family(shape))
+        self.llm_context(request)
 
     def llm_event(self, event: Any) -> None:
         event_type = getattr(event, "type", "")
@@ -36,6 +56,7 @@ class RunTrace:
                 if self._output_buffer:
                     self._write("output complete", self._output_buffer)
                     self._output_buffer = ""
+                self._llm_attribution = None
             return
 
         # Keep the complete provider event available for debugging.  The
@@ -57,6 +78,7 @@ class RunTrace:
         if event_type == "response.completed":
             self._llm_usage(event)
             self.llm_final(getattr(event, "response", event))
+            self._llm_attribution = None
 
     def _llm_usage(self, event: Any) -> None:
         response = getattr(event, "response", event)
@@ -92,9 +114,14 @@ class RunTrace:
         cached_tokens = _get_field(input_details, "cached_tokens")
         if cached_tokens is None:
             cached_tokens = _get_field(input_details, "cache_read")
+        attribution = ""
+        if self._llm_attribution is not None:
+            component, family = self._llm_attribution
+            attribution = f"component={component} request_family={family} "
         self._line(
             "[llm usage] "
-            f"input_tokens={input_tokens} "
+            + attribution
+            + f"input_tokens={input_tokens} "
             f"output_tokens={output_tokens} "
             f"total_tokens={_get_field(usage, 'total_tokens')} "
             f"cached_tokens={cached_tokens} "
@@ -104,6 +131,7 @@ class RunTrace:
     def llm_usage(self, message: Any) -> None:
         """Print usage returned by a LangChain model message."""
         self._llm_usage(message)
+        self._llm_attribution = None
 
     def llm_final(self, response: Any) -> None:
         """Print a model's terminal response at info level."""
@@ -111,10 +139,19 @@ class RunTrace:
             return
         self._line(f"[llm final] data={_compact(response)}")
 
-    def llm_response(self, response: Any) -> None:
+    def llm_response(
+        self,
+        response: Any,
+        *,
+        component: str | None = None,
+        static_shape: Any | None = None,
+    ) -> None:
         """Record the terminal response and its usage from a non-streaming model."""
+        if component is not None:
+            self.llm_request(component, {}, static_shape=static_shape or {})
         self._llm_usage(response)
         self.llm_final(response)
+        self._llm_attribution = None
 
     def llm_context(self, context: Any) -> None:
         """Print the exact request context submitted to a model at info level."""
@@ -222,3 +259,26 @@ def _get_field(value: Any, name: str) -> Any:
 
 def _first_defined(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
+
+
+def _cache_relevant_shape(request: Any) -> dict[str, Any]:
+    """Select only invariant Responses request fields for request-family IDs."""
+    if not isinstance(request, Mapping):
+        return {}
+    return {
+        key: _as_serializable(request[key])
+        for key in ("model", "instructions", "tools", "text", "response_format")
+        if key in request
+    }
+
+
+def _request_family(shape: Any) -> str:
+    """Return a deterministic, non-reversible identifier for static request shape."""
+    encoded = json.dumps(
+        _as_serializable(shape),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"

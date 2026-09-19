@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from llm.response_format import ResponseFormat, require_response_format
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
 from agent.runtime_context import RuntimeContextPolicy
+from agent.model_request import tool_request_shape, trace_llm_request
+from agent.tool_binding import canonical_mcp_tool_set
 
 
 class _StepCompletion(BaseModel):
@@ -216,23 +218,22 @@ class Executor:
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="tool round budget exhausted"))
             completion_prompt = (
-                "Submit the JSON completion receipt now. `result` is the handoff and "
+                "Return the completion receipt now. `result` is the handoff and "
                 "evidence summary that subsequent Plan steps will receive. Derive it "
                 "only from the preceding messages: state the material outcome and the "
                 "supporting tool output, artifact path, resource identifier, or state "
                 "fact. Be concise; do not merely say it completed or reproduce the "
-                "message transcript. Return one top-level JSON object directly with "
-                "exactly these fields: completed, completion_criterion_met, result, "
-                "files_read, files_modified, and observations. Do not wrap the receipt "
-                'in `{"type":"json_object","result":...}`; `json_object` is only the '
-                "response format, not a field in your response. Do not include any other "
-                "fields, including step_id, revision, status, intent, artifact, outcome, "
-                "or type. Set completed and completion_criterion_met to true only if the "
+                "message transcript. Set completed and completion_criterion_met to true only if the "
                 "selected completion criterion was met: "
                 f"{step.completion_criterion}"
             )
             if self._response_format == "json_object":
                 completion_prompt += (
+                    " Return one top-level JSON object directly with exactly these fields: completed, "
+                    "completion_criterion_met, result, files_read, files_modified, and observations. "
+                    'Do not wrap the receipt in `{"type":"json_object","result":...}`; `json_object` '
+                    "is only the response format, not a field in your response. Do not include any other "
+                    "fields, including step_id, revision, status, intent, artifact, outcome, or type."
                     " Follow this example exactly in shape (use facts from the preceding "
                     "messages, not these example values): "
                     '{"completed":true,"completion_criterion_met":true,"result":"The '
@@ -241,7 +242,11 @@ class Executor:
                     '"observations":["The completion criterion is satisfied."]}'
                 )
             final = await self._completion_model.ainvoke(
-                await self._completion_messages(graph_result["messages"], completion_prompt)
+                await self._completion_messages(
+                    graph_result["messages"],
+                    completion_prompt,
+                    step.completion_criterion,
+                )
             )
             if self._trace is not None:
                 self._trace.llm_response(final)
@@ -283,17 +288,17 @@ class Executor:
             tools = await load_mcp_tools(session)
             if self._tool_allowlist is not None:
                 tools = [tool for tool in tools if tool.name in self._tool_allowlist]
-            self._tools = tools
+            self._tools = canonical_mcp_tool_set(tools)
             # MCP hosts do not promise OpenAI's strict function-tool schema, so
             # operational tool use remains non-strict. Completion is instead a
             # separate structured response after MCP work ends; local parsing
             # and invariant validation apply in both provider modes.
-            self._bound_model = self._model.bind_tools(tools)
+            self._bound_model = self._model.bind_tools(self._tools)
             self._completion_model = self._model.bind(response_format=_completion_response_format(self._response_format))
             # Tool errors are part of the model/tool conversation: a bad argument or
             # an MCP error must be returned to the model so it can correct its next
             # call, rather than aborting this Step and causing top-level replanning.
-            tool_node = ToolNode(tools, handle_tool_errors=True)
+            tool_node = ToolNode(self._tools, handle_tool_errors=True)
         else:
             tool_node = ToolNode(self._tools, handle_tool_errors=True)
 
@@ -303,7 +308,16 @@ class Executor:
                 self._active_context_policy.record_model_use()
                 context = await self._active_context_policy.maintain(self._active_durable_state)
                 request = [SystemMessage(content=self._INSTRUCTIONS), *context.as_messages()]
-            _trace_llm_context(self._trace, request)
+            trace_llm_request(
+                self._trace,
+                "executor",
+                request,
+                static_shape={
+                    "instructions": self._INSTRUCTIONS,
+                    "tools": tool_request_shape(self._tools),
+                    "request_kind": "tool_round",
+                },
+            )
             message = await self._bound_model.ainvoke(request)
             message = self._with_tool_cwd(message)
             if self._trace is not None and isinstance(message, AIMessage):
@@ -446,7 +460,12 @@ class Executor:
             [_tool_error(message) for message in results],
         )
 
-    async def _completion_messages(self, messages: list[BaseMessage], prompt: str) -> list[BaseMessage]:
+    async def _completion_messages(
+        self,
+        messages: list[BaseMessage],
+        prompt: str,
+        completion_criterion: str,
+    ) -> list[BaseMessage]:
         result = [*messages]
         if self._active_context_policy is not None:
             self._active_context_policy.record_model_use()
@@ -455,7 +474,16 @@ class Executor:
             context = await self._active_context_policy.maintain(self._active_durable_state)
             result = [SystemMessage(content=self._INSTRUCTIONS), context.as_messages()[0]]
         result.append(HumanMessage(content=prompt))
-        _trace_llm_context(self._trace, result)
+        trace_llm_request(
+            self._trace,
+            "executor",
+            result,
+            static_shape={
+                "request_kind": "completion_receipt",
+                "instructions": _completion_prompt_shape(prompt, completion_criterion),
+                "response_format": _completion_response_format(self._response_format),
+            },
+        )
         return result
 
     def _require_active(self) -> None:
@@ -633,8 +661,6 @@ def _exit_code(content: Any) -> int | None:
     return None
 
 
-def _trace_llm_context(trace: Any | None, context: Any) -> None:
-    if trace is not None:
-        callback = getattr(trace, "llm_context", None)
-        if callback is not None:
-            callback(context)
+def _completion_prompt_shape(prompt: str, completion_criterion: str) -> str:
+    """Replace the per-step criterion before deriving a request-family ID."""
+    return prompt.replace(completion_criterion, "<completion_criterion>")

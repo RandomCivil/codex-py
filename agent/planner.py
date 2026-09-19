@@ -39,7 +39,8 @@ class Planner:
             },
         },
     }
-    _INSTRUCTIONS = (
+    _SCHEMA_INSTRUCTIONS = "Create a complete Plan from the provided Agent state."
+    _JSON_OBJECT_INSTRUCTIONS = (
         "Return only strict JSON for the complete Plan. Do not use markdown or prose. "
         "The JSON must contain exactly revision, goal, and steps. Each step must "
         "contain exactly id, intent, and completion_criterion."
@@ -60,12 +61,17 @@ class Planner:
             )
         request = json.dumps(_state_payload(state), ensure_ascii=False, sort_keys=True)
         text_format = self._TEXT_FORMAT if self._response_format == "json_schema" else {"type": "json_object"}
+        instructions = (
+            self._SCHEMA_INSTRUCTIONS
+            if self._response_format == "json_schema"
+            else self._JSON_OBJECT_INSTRUCTIONS
+        )
         output = "".join(
             [
                 chunk
                 async for chunk in self._text_stream.stream_text(
                     request,
-                    instructions=self._INSTRUCTIONS,
+                    instructions=instructions,
                     tools=None,
                     text_format=text_format,
                 )

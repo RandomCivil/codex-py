@@ -87,6 +87,32 @@ def test_planner_passes_selected_response_format_to_text_stream():
     assert text_stream.request["text_format"]["type"] == "json_object"
 
 
+@pytest.mark.parametrize(
+    ("response_format", "contains", "omits"),
+    [
+        ("json_schema", "complete Plan", "Return only strict JSON"),
+        ("json_object", "Return only strict JSON", None),
+    ],
+)
+def test_planner_uses_structured_output_mode_appropriate_static_instructions(
+    response_format, contains, omits
+):
+    text_stream = TextStream(
+        '{"revision":1,"goal":"Prepare release","steps":['
+        '{"id":"one","intent":"Do one","completion_criterion":"One is done"}]}'
+    )
+
+    asyncio.run(
+        Planner(text_stream, response_format=response_format).plan(AgentState("Prepare release"))
+    )
+
+    instructions = text_stream.request["instructions"]
+    assert contains in instructions
+    if omits is not None:
+        assert omits not in instructions
+    assert "Prepare release" not in instructions
+
+
 def test_planner_builds_next_revision_without_mutating_prior_plan_or_executions():
     first = Plan(1, "Prepare release", (PlanStep("inspect", "Inspect", "Risks listed"),))
     state = AgentState(

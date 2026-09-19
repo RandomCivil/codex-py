@@ -68,8 +68,8 @@ def test_task_analyzer_requests_the_goal_with_the_strict_analysis_contract():
     assert text_stream.request["text_format"]["type"] == "json_schema"
     assert text_stream.request["text_format"]["strict"] is True
     assert text_stream.request["text_format"]["name"] == "task_analysis"
-    assert "Return JSON only" in text_stream.request["instructions"]
-    assert "choose an agent architecture directly" in text_stream.request["instructions"]
+    assert "not to choose an agent architecture directly" in text_stream.request["instructions"]
+    assert "Use exactly this schema" not in text_stream.request["instructions"]
 
 
 def test_task_analyzer_supports_json_object_structured_output_mode():
@@ -81,6 +81,29 @@ def test_task_analyzer_supports_json_object_structured_output_mode():
 
     assert analysis.task_type == "research"
     assert text_stream.request["text_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize(
+    ("response_format", "contains", "omits"),
+    [
+        ("json_schema", "not to choose an agent architecture", "Use exactly this schema"),
+        ("json_object", "Use exactly this schema", None),
+    ],
+)
+def test_task_analyzer_uses_structured_output_mode_appropriate_static_instructions(
+    response_format, contains, omits
+):
+    text_stream = TextStream(valid_analysis())
+
+    asyncio.run(
+        TaskAnalyzer(text_stream, response_format=response_format).run("Investigate the report")
+    )
+
+    instructions = text_stream.request["instructions"]
+    assert contains in instructions
+    if omits is not None:
+        assert omits not in instructions
+    assert "Investigate the report" not in instructions
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import uuid
@@ -18,8 +19,19 @@ from agent.runtime_context import RuntimeContextPolicy
 from agent.tool_binding import canonical_mcp_tool_set
 
 
-ExecutionStatus = Literal["completed", "failed"]
+ExecutionStatus = Literal["completed", "failed", "blocked"]
 ExecutionModeName = Literal["direct", "tool_agent", "react", "plan_execute"]
+
+
+def conversation_model_input(value: Any) -> Any:
+    """Render the public Conversation contract for a model-facing request."""
+    if not hasattr(value, "history") or not hasattr(value, "current_input"):
+        return value
+    return json.dumps(
+        {"history": list(value.history), "current_input": value.current_input},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 _REACT_RESPONSE_SCHEMA = {
@@ -45,6 +57,8 @@ _GENERAL_RESPONSE_SCHEMA = {
     "required": ["response"],
     "properties": {"response": {"type": "string"}},
 }
+
+_DIRECT_JSON_OBJECT_INSTRUCTIONS = "Return exactly one valid JSON object with a response field."
 
 
 _REACT_TOOL_LOOP_PROMPT = """You are an execution agent. Work iteratively: use an available tool when
@@ -121,8 +135,8 @@ class ExecutionAnswer:
     error: str | None = None
 
     def __post_init__(self) -> None:
-        if self.status not in {"completed", "failed"}:
-            raise ValueError("execution answer status must be completed or failed")
+        if self.status not in {"completed", "failed", "blocked"}:
+            raise ValueError("execution answer status must be completed, failed, or blocked")
         if self.status == "completed":
             if not isinstance(self.answer, str) or not self.answer.strip():
                 raise ValueError("a completed execution answer requires nonempty answer text")
@@ -146,11 +160,17 @@ class DirectMode:
             require_response_format(response_format) if response_format is not None else None
         )
 
-    async def run(self, goal: str) -> ExecutionAnswer:
+    async def run(self, goal: Any) -> ExecutionAnswer:
+        goal = conversation_model_input(goal)
         try:
             request = {
                 "input": goal,
                 "tools": None,
+                **(
+                    {"instructions": _DIRECT_JSON_OBJECT_INSTRUCTIONS}
+                    if self._response_format == "json_object"
+                    else {}
+                ),
                 **(
                     {"text_format": _direct_text_format(self._response_format)}
                     if self._response_format is not None
@@ -271,7 +291,8 @@ class ToolAgentMode:
             require_response_format(response_format) if response_format is not None else None
         )
 
-    async def run(self, goal: str) -> ExecutionAnswer:
+    async def run(self, goal: Any) -> ExecutionAnswer:
+        goal = conversation_model_input(goal)
         try:
             async with self._runtime as runtime:
                 tools = canonical_mcp_tool_set(runtime.tools)
@@ -334,7 +355,8 @@ class ReactMode:
         self._context_model = context_model
         self._context_response_format = context_response_format
 
-    async def run(self, goal: str) -> ExecutionAnswer:
+    async def run(self, goal: Any) -> ExecutionAnswer:
+        goal = conversation_model_input(goal)
         try:
             async with self._runtime as runtime:
                 # Tool-use rounds must remain unconstrained: some
@@ -564,12 +586,24 @@ class PlanExecuteMode:
         self._run_id = run_id
         self._run_id_factory = run_id_factory
 
-    async def run(self, goal: str) -> ExecutionAnswer:
+    async def run(self, goal: Any) -> ExecutionAnswer:
         from memory.state import AgentState, deserialize_agent_state
 
         run_id = self._run_id or str(self._run_id_factory())
         try:
-            result = await self._durable_agent.run(run_id, AgentState(goal))
+            state = AgentState(goal.current_input) if hasattr(goal, "current_input") else AgentState(goal)
+            accepts_conversation_input = (
+                "conversation_input" in inspect.signature(self._durable_agent.run).parameters
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in inspect.signature(self._durable_agent.run).parameters.values()
+                )
+            )
+            result = await self._durable_agent.run(
+                run_id,
+                state,
+                **({"conversation_input": goal} if accepts_conversation_input and hasattr(goal, "current_input") else {}),
+            )
             status = result.get("status")
             if status == "completed":
                 state = result.get("state")
@@ -582,6 +616,8 @@ class PlanExecuteMode:
                 if completed is not None and completed.result:
                     return ExecutionAnswer(completed.result, "completed")
                 return ExecutionAnswer(None, "failed", error="plan-execute run completed without a step handoff")
+            if status == "blocked":
+                return ExecutionAnswer(None, "blocked", error="plan-execute run blocked")
             return ExecutionAnswer(None, "failed", error="plan-execute run did not complete")
         except Exception:
             return ExecutionAnswer(None, "failed", error="plan-execute execution failed")

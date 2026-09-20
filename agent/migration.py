@@ -9,7 +9,7 @@ from urllib.parse import unquote, urlparse
 
 MIN_MYSQL_VERSION = (8, 0, 19)
 MAX_MYSQL_VERSION = (9, 5, 99)
-PROJECT_SCHEMA_VERSION = 2
+PROJECT_SCHEMA_VERSION = 3
 
 
 class MigrationConfigurationError(Exception):
@@ -97,6 +97,36 @@ async def _migrate_database(
                 )
                 await cursor.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS conversations (
+                        conv_id CHAR(36) NOT NULL PRIMARY KEY,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    )
+                    """
+                )
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversation_turns (
+                        conv_id CHAR(36) NOT NULL,
+                        sequence INT UNSIGNED NOT NULL,
+                        run_id CHAR(36) NOT NULL,
+                        execution_mode VARCHAR(32) NOT NULL,
+                        user_input TEXT NOT NULL,
+                        status VARCHAR(16) NOT NULL,
+                        answer TEXT NULL,
+                        error TEXT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                            ON UPDATE CURRENT_TIMESTAMP(6),
+                        PRIMARY KEY (conv_id, sequence),
+                        UNIQUE KEY conversation_turn_run (run_id),
+                        INDEX conversation_active (conv_id, status),
+                        CONSTRAINT conversation_turn_conversation
+                            FOREIGN KEY (conv_id) REFERENCES conversations(conv_id)
+                    )
+                    """
+                )
+                await cursor.execute(
+                    """
                     INSERT INTO codex_migration_history (version)
                     VALUES (%s)
                     ON DUPLICATE KEY UPDATE version=VALUES(version)
@@ -123,6 +153,8 @@ async def ensure_schema_initialized(pool) -> None:
                     raise MigrationConfigurationError("persistence schema is not initialized; run agent migrate")
                 await cursor.execute("SELECT 1 FROM agent_runs LIMIT 1")
                 await cursor.execute("SELECT 1 FROM step_recovery_attempts LIMIT 1")
+                await cursor.execute("SELECT 1 FROM conversations LIMIT 1")
+                await cursor.execute("SELECT 1 FROM conversation_turns LIMIT 1")
                 # The third-party saver records its completed setup in this table.
                 await cursor.execute("SELECT 1 FROM checkpoint_migrations LIMIT 1")
     except MigrationConfigurationError:

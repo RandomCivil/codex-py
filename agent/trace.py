@@ -174,6 +174,10 @@ class RunTrace:
         suffix = f" revision={revision}" if revision is not None else ""
         self._line(f"[plan] {status}{suffix}")
 
+    def task_route(self, mode: str, *, analysis_failed: bool = False) -> None:
+        suffix = " reason=task_analysis_failed" if analysis_failed else ""
+        self._line(f"[task route] mode={mode}{suffix}")
+
     def execute(self, status: str, revision: int, step_id: str, detail: str | None = None) -> None:
         suffix = f" {detail}" if detail else ""
         self._line(f"[execute] {status} revision={revision} step={step_id}{suffix}")

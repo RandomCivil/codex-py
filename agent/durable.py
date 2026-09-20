@@ -1,12 +1,13 @@
 """Checkpointed top-level Agent graph and its CLI-facing lifecycle."""
 
 import asyncio
+import inspect
 import os
 import signal
 import uuid
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict
-from typing import Any, TypedDict
+from typing import Any, Mapping, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI
 
@@ -26,7 +27,7 @@ from .configuration import ComponentProviderConfiguration
 from .executor import Executor
 from .migration import _connection_pool, _parse_url, ensure_schema_initialized
 from .planner import Planner
-from .execution import ToolRuntime, create_execution_mode
+from .execution import ExecutionAnswer, ToolRuntime, create_execution_mode
 from .task_analyzer import RoutedExecutionAnswer, TaskAnalyzer, TaskRouter
 from .registry import (
     ConfigurationMismatchError,
@@ -39,6 +40,7 @@ from .recovery import MySQLStepRecoveryStore
 
 class GraphState(TypedDict, total=False):
     agent_state: AgentState
+    conversation_input: Any
     status: str
     run_id: str
     # 发生变化的文件路径
@@ -51,6 +53,60 @@ class GraphState(TypedDict, total=False):
     recovery_attempt: int
     recovery_step: tuple[int, str]
     recovery_active: bool
+
+
+class DurableConversationRunner:
+    """Adapt one durable Agent run to the Conversation execution seam."""
+
+    def __init__(self, durable_agent: Any, run_id: str) -> None:
+        self._durable_agent = durable_agent
+        self._run_id = run_id
+
+    async def run(self, conversation_input: Any) -> ExecutionAnswer:
+        accepts_conversation_input = (
+            "conversation_input" in inspect.signature(self._durable_agent.run).parameters
+            or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in inspect.signature(self._durable_agent.run).parameters.values()
+            )
+        )
+        return _durable_answer(
+            await self._durable_agent.run(
+                self._run_id,
+                AgentState(conversation_input.current_input),
+                **({"conversation_input": conversation_input} if accepts_conversation_input else {}),
+            )
+        )
+
+    async def resume(self, recovery: str | None = None) -> ExecutionAnswer:
+        return _durable_answer(await self._durable_agent.run(self._run_id, recovery=recovery))
+
+
+def _conversation_input_payload(value: Any) -> dict[str, Any] | None:
+    """Keep the Conversation contract checkpoint-serializable and out of ``goal``."""
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {"history": list(value["history"]), "current_input": value["current_input"]}
+    return {"history": list(value.history), "current_input": value.current_input}
+
+
+def _durable_answer(result: Mapping[str, Any]) -> ExecutionAnswer:
+    status = result.get("status")
+    if status == "blocked":
+        return ExecutionAnswer(None, "blocked", error="plan-execute run blocked")
+    if status != "completed":
+        return ExecutionAnswer(None, "failed", error="plan-execute run did not complete")
+    state = result.get("state")
+    if isinstance(state, dict):
+        state = deserialize_agent_state(state)
+    completed = next(
+        (item for item in reversed(state.step_executions) if item.status == "completed"),
+        None,
+    ) if state is not None else None
+    if completed is not None and completed.result:
+        return ExecutionAnswer(completed.result, "completed")
+    return ExecutionAnswer(None, "failed", error="plan-execute run completed without a step handoff")
 
 
 def new_run_id() -> str:
@@ -81,7 +137,7 @@ class DurableAgent:
             agent_state = state["agent_state"]
             if agent_state.plan_history:
                 return {}
-            return {"agent_state": agent_state.with_plan(await self._planner.plan(agent_state))}
+            return {"agent_state": agent_state.with_plan(await self._plan(agent_state, state.get("conversation_input")))}
 
         async def mark_running(state: GraphState) -> GraphState:
             agent_state = state["agent_state"]
@@ -156,7 +212,7 @@ class DurableAgent:
                 return {"status": "blocked"}
             if self._trace is not None:
                 self._trace.plan("replanning", len(agent_state.plan_history) + 1)
-            return {"agent_state": agent_state.with_plan(await self._planner.plan(agent_state))}
+            return {"agent_state": agent_state.with_plan(await self._plan(agent_state, state.get("conversation_input")))}
 
         async def terminal(state: GraphState) -> GraphState:
             return {"status": "completed"}
@@ -191,9 +247,11 @@ class DurableAgent:
         run_id: str,
         state: AgentState | None = None,
         recovery: str | None = None,
+        conversation_input: Any = None,
     ) -> dict[str, Any]:
         config = {"configurable": {"thread_id": run_id}}
         graph = self._graph()
+        conversation_payload = _conversation_input_payload(conversation_input)
         recovery_attempt: int | None = None
         recovery_active = False
         restored_context: GraphState = {}
@@ -280,6 +338,7 @@ class DurableAgent:
                 "status": "resuming",
                 "run_id": run_id,
                 "recovery_active": recovery_active,
+                **({"conversation_input": conversation_payload} if conversation_payload is not None else {}),
                 **restored_context,
                 **({"recovery_attempt": recovery_attempt} if recovery_attempt is not None else {}),
             } if state is not None else {"run_id": run_id}),
@@ -290,6 +349,11 @@ class DurableAgent:
             "status": result.get("status", "completed"),
             "state": serialize_agent_state(result["agent_state"]) if result.get("agent_state") else None,
         }
+
+    async def _plan(self, state: AgentState, conversation_input: Any = None):
+        if conversation_input is None:
+            return await self._planner.plan(state)
+        return await self._planner.plan(state, conversation_input=conversation_input)
 
     async def interrupt(self, run_id: str) -> None:
         """Durably mark in-progress work uncertain after cancellation."""
@@ -334,6 +398,8 @@ async def _run(
     cwd: str | None = None,
     log_level: str = "info",
     configuration: ComponentProviderConfiguration | None = None,
+    execution_mode: str | None = None,
+    conversation_input: Any = None,
 ) -> dict[str, Any]:
     if configuration is None:
         raise ValueError("an explicit component provider configuration is required")
@@ -415,8 +481,10 @@ async def _run(
                         recovery_store=MySQLStepRecoveryStore(pool),
                     )
                     with _cancel_on_signals():
-                        if goal is None:
-                            result = await durable.run(run_id, initial, recovery)
+                        if goal is None or execution_mode == "plan_execute":
+                            result = await durable.run(
+                                run_id, initial, recovery, conversation_input=conversation_input
+                            )
                         else:
                             analyzer_llm = LLM(
                                 analyzer_configuration.base_url,

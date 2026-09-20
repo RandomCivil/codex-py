@@ -212,6 +212,19 @@ def test_trace_prefixes_each_line_with_run_id():
     assert output.getvalue() == "[run-123] [plan] started revision=1\n"
 
 
+def test_trace_reports_task_routing_and_safe_analysis_fallback():
+    output = StringIO()
+    trace = RunTrace(output, level="error", run_id="run-123")
+
+    trace.task_route("react")
+    trace.task_route("plan_execute", analysis_failed=True)
+
+    assert output.getvalue().splitlines() == [
+        "[run-123] [task route] mode=react",
+        "[run-123] [task route] mode=plan_execute reason=task_analysis_failed",
+    ]
+
+
 def test_trace_prints_llm_context():
     output = StringIO()
     trace = RunTrace(output, run_id="run-123")

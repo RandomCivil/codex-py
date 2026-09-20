@@ -1,7 +1,6 @@
 """Structured task analysis and deterministic execution-mode routing."""
 
 import json
-import logging
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
@@ -9,9 +8,6 @@ from typing import Any, Literal
 from agent.execution import ExecutionAnswer, ExecutionMode, ExecutionModeName
 from llm.response_format import ResponseFormat, require_response_format
 from llm.text_stream import TextStream
-
-
-logger = logging.getLogger(__name__)
 
 
 TaskType = Literal[
@@ -333,6 +329,14 @@ Do not include:
 """
 
 
+_TASK_ANALYZER_RETRY_INSTRUCTIONS = """
+Your preceding response did not satisfy the task-analysis contract. Return the
+complete task analysis again as JSON only, exactly as required. Include every
+required field, including reasoning_summary. Do not wrap the JSON in Markdown
+or a code fence.
+"""
+
+
 _TASK_ANALYSIS_FIELDS = {
     "task_type",
     "goal_clarity",
@@ -399,23 +403,32 @@ class TaskAnalyzer:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
         text_format = _TEXT_FORMAT if self._response_format == "json_schema" else {"type": "json_object"}
-        instructions = (
-            _TASK_ANALYZER_INSTRUCTIONS
-            if self._response_format == "json_schema"
-            else _TASK_ANALYZER_INSTRUCTIONS + _TASK_ANALYZER_JSON_OBJECT_CONTRACT
-        )
-        output = "".join(
-            [
-                chunk
-                async for chunk in self._text_stream.stream_text(
-                    goal,
-                    instructions=instructions,
-                    tools=None,
-                    text_format=text_format,
-                )
-            ]
-        )
-        return _parse_analysis(output)
+        # The provider-side schema is authoritative when supported, but repeat
+        # the contract in the prompt because compatible endpoints may ignore a
+        # json_schema request and otherwise have no field-level guidance.
+        instructions = _TASK_ANALYZER_INSTRUCTIONS + _TASK_ANALYZER_JSON_OBJECT_CONTRACT
+        for attempt in range(3):
+            output = "".join(
+                [
+                    chunk
+                    async for chunk in self._text_stream.stream_text(
+                        goal,
+                        instructions=(
+                            instructions
+                            if attempt == 0
+                            else f"{instructions} {_TASK_ANALYZER_RETRY_INSTRUCTIONS}"
+                        ),
+                        tools=None,
+                        text_format=text_format,
+                    )
+                ]
+            )
+            try:
+                return _parse_analysis(output)
+            except TaskAnalysisValidationError:
+                if attempt == 2:
+                    raise
+        raise AssertionError("task analysis retry loop exited unexpectedly")
 
 
 def route(analysis: TaskAnalysis | Mapping[str, Any]) -> ExecutionModeName:
@@ -433,7 +446,6 @@ def route(analysis: TaskAnalysis | Mapping[str, Any]) -> ExecutionModeName:
         mode = "plan_execute"
     else:
         mode = "react"
-    logger.error("route() result: %s", mode)
     return mode
 
 
@@ -463,7 +475,7 @@ class TaskRouter:
 
 def _parse_analysis(output: str) -> TaskAnalysis:
     try:
-        document = json.loads(output)
+        document = json.loads(_unfence_json(output))
     except json.JSONDecodeError as error:
         raise TaskAnalysisValidationError("task analysis output must be strict JSON") from error
     if not isinstance(document, dict) or set(document) != _TASK_ANALYSIS_FIELDS:
@@ -484,6 +496,22 @@ def _parse_analysis(output: str) -> TaskAnalysis:
     if not isinstance(document["reasoning_summary"], str) or not document["reasoning_summary"].strip():
         raise TaskAnalysisValidationError("task analysis reasoning_summary must be non-empty text")
     return TaskAnalysis(**document)
+
+
+def _unfence_json(output: str) -> str:
+    """Remove one outer Markdown JSON fence while rejecting surrounding prose."""
+    stripped = output.strip()
+    if not (stripped.startswith("```") and stripped.endswith("```")):
+        return stripped
+    body = stripped[3:-3].lstrip()
+    first_line, separator, remainder = body.partition("\n")
+    if first_line.strip().lower() == "json":
+        return remainder.strip()
+    if not separator and not first_line.strip():
+        return ""
+    if not first_line.strip():
+        return remainder.strip()
+    return stripped
 
 
 def _safe_analysis_error() -> str:

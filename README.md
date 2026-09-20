@@ -15,6 +15,7 @@ Agent 的顶层协调状态和每个 Step execution 都使用 LangGraph checkpoi
 - 通过 CLI 以一行 JSON 输出运行结果，便于脚本调用。
 - 运行过程中将 LLM thought/output、Plan–Execute 状态以及 MCP tool call/result 实时输出到 stderr；最终结果仍只写到 stdout。
 - `run` 先由 Task Router 描述性分析目标，再确定性地选择 direct、tool-agent、ReAct 或 Plan–execute。
+- MySQL 持久化 Conversation：每轮保留独立 run、显式 Execution mode 与有序公开历史。
 
 ### 工具调用批次
 
@@ -140,7 +141,7 @@ task_analyzer:
 ```
 
 `response_format` 只能是 `json_schema` 或 `json_object`。需要结构化结果的请求会使用所属组件的有效格式；`json_schema` 请求使用该调用的严格 schema，`json_object` 请求只要求返回 JSON object，Agent 仍会在本地严格校验结果。Executor 的工具选择请求不绑定结构化输出，以保留 MCP function call 能力；最终 completion receipt 使用 Executor 的有效格式。
-`direct`、`tool_agent` 和 `react` 使用各自 provider 的有效 `response_format`（未显式配置时继承共享模型配置，最终回退为 `json_schema`）。CLI 不提供 mode selector；Task Router 通过 Python factory 组合并选择模式。
+`direct`、`tool_agent` 和 `react` 使用各自 provider 的有效 `response_format`（未显式配置时继承共享模型配置，最终回退为 `json_schema`）。CLI 不提供 mode selector；单次 `run` 与每个 Conversation turn 都由 Task Router 通过 Python factory 组合并选择模式。
 `runtime_context` 使用 Structured-output mode，默认继承共享模型配置；它只负责生成与合并 Tool-round Observation，可单独指定 provider、模型和 `response_format`。`task_analyzer` 使用 Structured-output mode，并默认继承 Planner 的有效配置；它只描述任务特征，不能选择 Execution mode。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
 
 YAML 中的 `api_key` 是明文配置。请限制配置文件的文件权限，例如：
@@ -175,7 +176,7 @@ poetry run agent migrate
 poetry run agent run --goal '检查项目中的待办事项并整理摘要' --config agent.yaml --cwd /path/to/project
 ```
 
-`run` 的 JSON 结果中的 `status` 是所选 Execution mode 的 `completed` 或 `failed` 状态；`plan_execute` 的失败同样会作为失败的 Execution answer 返回。
+`run` 的 JSON 结果中的 `status` 是所选 Execution mode 的 `completed`、`failed` 或 `blocked` 状态。
 
 `--cwd` 指定 Agent 操作的项目目录。它会被强制写入每一个 Atom MCP 工具调用的 `cwd` 参数；未指定时使用启动 `agent` 命令时的当前目录。恢复 run 时应使用与原 run 相同的 `--cwd`，该目录属于持久化配置的一部分。
 
@@ -199,6 +200,48 @@ poetry run agent resume --run-id <uuidv4> --config agent.yaml --recovery abort
 ```
 
 当前 Atom MCP 工具没有声明幂等性，因此 `retry` 会被拒绝。`fail` 将该 Step 标记为失败并触发 replanning；`abort` 将 run 标记为 `blocked`。已完成或已阻塞的 run 再次 resume 时直接返回保存的终态结果，不会重新调用模型或工具。
+
+### Conversation
+
+Conversation 是以 `conv_id` 标识的持久化多轮交互。每个 turn 都有独立的 UUIDv4 `run_id`；Task Analyzer 会选择并记录既有的 `direct`、`tool_agent`、`react` 或 `plan_execute` mode。它不会改变既有单次 `run` / `resume` 的语义。
+
+新建 Conversation（省略 `--conv-id`）并运行首轮：
+
+```bash
+poetry run agent conversation run --input '整理当前项目的待办事项' --config agent.yaml --cwd /path/to/project
+```
+
+结果会返回本次 turn，而不是完整历史：
+
+```json
+{"command":"conversation","conv_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1,"run_id":"550e8400-e29b-41d4-a716-446655440001","execution_mode":"direct","status":"completed","answer":"…","error":null}
+```
+
+使用返回的 ID 追加下一轮；每轮都会由 Task Analyzer 重新选择 mode：
+
+```bash
+poetry run agent conversation run --conv-id <uuidv4> --input '根据上面的结果列出下一步' --config agent.yaml --cwd /path/to/project
+```
+
+读取完整、有序的公开历史：
+
+```bash
+poetry run agent conversation show --conv-id <uuidv4>
+```
+
+同一 Conversation 只允许一个 `pending` 或 `running` turn。并发追加会以退出码 2 返回 `conversation busy`，并包含活跃 turn 的 `sequence` 和 `run_id`；不会排队或并行执行。终态（`completed`、`failed`、`blocked`）后的 Conversation 可以继续追加。
+
+每次模型调用都会收到此前所有 turn 的公开结构化 history（序号、用户输入、mode、run ID、状态与 answer/error）以及独立的当前输入；Checkpoint、Plan、Step execution、原始 tool result 和凭据不会进入 history。当前版本不截断或压缩 history；provider 因上下文过大而拒绝请求时，该 turn 会记录为失败。
+
+仅 `plan_execute` turn 可以恢复。它会复用关联 Agent run 的 recovery 和原始有效 tool working directory：
+
+```bash
+poetry run agent conversation resume --conv-id <uuidv4> --config agent.yaml
+poetry run agent conversation resume --conv-id <uuidv4> --config agent.yaml --recovery fail
+poetry run agent conversation resume --conv-id <uuidv4> --config agent.yaml --recovery abort
+```
+
+中断的 ephemeral turn（`direct`、`tool_agent`、`react`）不可恢复；下一次 Conversation 操作会先将它安全标记为失败。独立使用 `agent resume` 完成关联 durable run 后，下一次 Conversation 操作会先对账该终态再决定是否追加。
 
 CLI 输出包含 `command`、`status`、`run_id` 等字段；发生错误时还包含 `error`。退出码如下：
 

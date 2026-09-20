@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from llm.response_format import ResponseFormat, require_response_format
 from llm.text_stream import TextStream
@@ -39,19 +39,21 @@ class Planner:
             },
         },
     }
-    _SCHEMA_INSTRUCTIONS = "Create a complete Plan from the provided Agent state."
     _JSON_OBJECT_INSTRUCTIONS = (
         "Return only strict JSON for the complete Plan. Do not use markdown or prose. "
         "The JSON must contain exactly revision, goal, and steps. Each step must "
         "contain exactly id, intent, and completion_criterion."
     )
-
+    _SCHEMA_INSTRUCTIONS = (
+        "Create a complete Plan from the provided Agent state. "
+        + _JSON_OBJECT_INSTRUCTIONS
+    )
     def __init__(self, text_stream: TextStream, trace: Any | None = None, *, response_format: ResponseFormat = "json_schema") -> None:
         self._text_stream = text_stream
         self._trace = trace
         self._response_format = require_response_format(response_format)
 
-    async def plan(self, state: AgentState) -> Plan:
+    async def plan(self, state: AgentState, *, conversation_input: Any = None) -> Plan:
         expected_revision = len(state.plan_history) + 1
         if self._trace is not None:
             self._trace.plan("started", expected_revision)
@@ -59,7 +61,9 @@ class Planner:
             raise PlanningValidationError(
                 "planning cannot exceed the three-revision goal budget"
             )
-        request = json.dumps(_state_payload(state), ensure_ascii=False, sort_keys=True)
+        request = json.dumps(
+            _state_payload(state, conversation_input=conversation_input), ensure_ascii=False, sort_keys=True
+        )
         text_format = self._TEXT_FORMAT if self._response_format == "json_schema" else {"type": "json_object"}
         instructions = (
             self._SCHEMA_INSTRUCTIONS
@@ -83,8 +87,8 @@ class Planner:
         return plan
 
 
-def _state_payload(state: AgentState) -> dict[str, Any]:
-    return {
+def _state_payload(state: AgentState, *, conversation_input: Any = None) -> dict[str, Any]:
+    payload = {
         "goal": state.goal,
         "memory_summary": state.memory_summary,
         "plan_history": [
@@ -113,6 +117,22 @@ def _state_payload(state: AgentState) -> dict[str, Any]:
             for execution in state.step_executions
         ],
     }
+    if conversation_input is not None:
+        history = (
+            conversation_input["history"]
+            if isinstance(conversation_input, Mapping)
+            else conversation_input.history
+        )
+        current_input = (
+            conversation_input["current_input"]
+            if isinstance(conversation_input, Mapping)
+            else conversation_input.current_input
+        )
+        payload["conversation_input"] = {
+            "history": list(history),
+            "current_input": current_input,
+        }
+    return payload
 
 
 def _parse_plan(output: str, goal: str, expected_revision: int) -> Plan:
@@ -139,8 +159,11 @@ def _parse_plan(output: str, goal: str, expected_revision: int) -> Plan:
         raise PlanningValidationError(
             f"plan revision must be the next sequential revision ({expected_revision})"
         )
-    if document["goal"] != goal:
-        raise PlanningValidationError("plan goal must match agent state goal")
+    # The state owns the goal.  Compatible providers may paraphrase this
+    # redundant response field even when their steps address the supplied
+    # goal, so validate its shape but never let it replace durable state.
+    if not isinstance(document["goal"], str) or not document["goal"].strip():
+        raise PlanningValidationError("plan goal must be a non-empty string")
     if not isinstance(document["steps"], list):
         raise PlanningValidationError("plan steps must be a JSON array")
 

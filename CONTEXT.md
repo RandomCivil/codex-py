@@ -96,6 +96,34 @@ _Avoid_: session, context window
 One identified invocation of the top-level Agent, addressed through the CLI by an application-generated UUIDv4 run ID and resumable from its stored Checkpoints. Only one active execution may own an Agent run under a renewable 60-second lease.
 _Avoid_: session, thread
 
+**Conversation**:
+The durable, user-facing sequence of Conversation turns for one continuing interaction, identified by a caller-supplied `conv_id`. A Conversation aggregates Agent runs but is not an Agent run.
+_Avoid_: session, run, thread
+
+**Conversation turn**:
+One strictly ordered user input and its resulting invocation of a selected existing Agent implementation within a Conversation. Every Conversation turn has its own Agent run.
+_Avoid_: Agent run, message, request
+
+**Active Conversation turn**:
+The sole nonterminal Conversation turn allowed in a Conversation. It prevents another turn from being appended until it becomes terminal or is explicitly recovered according to its selected Execution mode.
+_Avoid_: queued message, parallel turn
+
+**Conversation recovery**:
+The operation that resumes the Agent run of an Active Conversation turn and records its reconciled terminal result in the Conversation. It is distinct from standalone Agent-run recovery.
+_Avoid_: retrying a message, transcript continuation
+
+**Conversation history**:
+The complete structured, ordered record of a Conversation's turns, including their user inputs and results. It is the authoritative cross-turn record and is initially supplied without a context-budget limit.
+_Avoid_: Agent state, checkpoint, transcript window
+
+**Conversation-turn result**:
+The terminal outcome retained for a Conversation turn: `completed`, `failed`, or `blocked`, with its final answer or error. `pending` and `running` are nonterminal turn states only.
+_Avoid_: execution trace, checkpoint state
+
+**Conversation input**:
+The current user input paired with its Conversation history, supplied to the selected Execution mode for one Conversation turn. It preserves the user's input as distinct from prior turns and from an Agent run's goal.
+_Avoid_: concatenated goal, Agent state
+
 **Checkpoint**:
 One durable snapshot of a LangGraph execution within an Agent run, stored in MySQL for either the top-level Agent graph or a Step-execution graph. It contains unredacted state and is resumed only from its latest version.
 _Avoid_: savepoint, snapshot

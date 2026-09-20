@@ -4,6 +4,7 @@ import json
 from langchain_core.messages import AIMessage
 
 from agent import ExecutionAnswer, create_execution_mode
+from agent.conversation import ConversationInput
 from agent.runtime_context import RuntimeContext
 from agent.configuration import load_configuration
 
@@ -163,6 +164,28 @@ def test_tool_agent_executes_only_the_first_call_and_renders_its_result():
     assert runtime.closed is True
 
 
+def test_tool_agent_serializes_conversation_input_for_the_model():
+    model = ControlledToolModel(AIMessage(content="Done."))
+    runtime = ToolRuntime("unused")
+    conversation_input = ConversationInput("conv", ({"sequence": 1, "answer": "Earlier"},), "Continue")
+
+    answer = asyncio.run(create_execution_mode("tool_agent", model=model, tool_runtime=runtime).run(conversation_input))
+
+    assert answer == ExecutionAnswer("Done.", "completed")
+    assert model.calls == ['{"history":[{"sequence":1,"answer":"Earlier"}],"current_input":"Continue"}']
+
+
+def test_react_serializes_conversation_input_for_the_model():
+    model = ControlledToolModel(AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True})))
+    runtime = ToolRuntime("unused")
+    conversation_input = ConversationInput("conv", ({"sequence": 1, "answer": "Earlier"},), "Continue")
+
+    answer = asyncio.run(create_execution_mode("react", model=model, tool_runtime=runtime).run(conversation_input))
+
+    assert answer == ExecutionAnswer("Done.", "completed")
+    assert model.calls[0][1].content == '{"history":[{"sequence":1,"answer":"Earlier"}],"current_input":"Continue"}'
+
+
 def test_tool_agent_binds_the_effective_mcp_tool_set_in_canonical_name_order():
     class ServerTool:
         def __init__(self, name):
@@ -241,7 +264,7 @@ def test_plan_execute_maps_last_completed_step_handoff_to_common_answer():
     assert durable.calls[0][1].goal == "Ship it"
 
 
-def test_plan_execute_maps_blocked_run_to_failed_answer_without_synthesis():
+def test_plan_execute_preserves_blocked_run_without_synthesis():
     durable = DurableResult({"status": "blocked", "state": None})
 
     async def run():
@@ -249,9 +272,9 @@ def test_plan_execute_maps_blocked_run_to_failed_answer_without_synthesis():
 
     answer = asyncio.run(run())
 
-    assert answer.status == "failed"
+    assert answer.status == "blocked"
     assert answer.answer is None
-    assert answer.error == "plan-execute run did not complete"
+    assert answer.error == "plan-execute run blocked"
 
 
 def test_factory_selects_direct_mode_and_returns_one_completed_execution_answer():
@@ -598,6 +621,29 @@ def test_direct_mode_fails_when_the_model_returns_only_whitespace():
     assert answer.answer is None
     assert answer.error == "direct model returned an empty response"
     assert model.calls == [("Do the work", {"tools": None})]
+
+
+def test_direct_mode_instructs_json_object_providers_to_return_json():
+    model = ControlledTextModel(['{"response":"Done"}'])
+
+    async def run():
+        return await create_execution_mode(
+            "direct", model=model, response_format="json_object"
+        ).run("Do the work")
+
+    answer = asyncio.run(run())
+
+    assert answer == ExecutionAnswer("Done", "completed")
+    assert model.calls == [
+        (
+            "Do the work",
+            {
+                "tools": None,
+                "text_format": {"type": "json_object"},
+                "instructions": "Return exactly one valid JSON object with a response field.",
+            },
+        )
+    ]
 
 
 def test_direct_mode_fails_with_a_safe_error_when_model_invocation_raises():

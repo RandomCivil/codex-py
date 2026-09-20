@@ -1,6 +1,8 @@
 import json
 import uuid
 
+import pytest
+
 from agent.cli import EXIT_BUSY, EXIT_CONFIGURATION, main
 from agent.registry import ConfigurationMismatchError, RunBusyError
 
@@ -149,3 +151,150 @@ def test_resume_rejects_redundant_retry_recovery_selection(monkeypatch, capsys):
     assert main(["resume", "--run-id", str(uuid.uuid4()), "--recovery", "retry"]) == 5
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "invalid"
+
+
+def test_conversation_run_emits_current_turn_result(monkeypatch, capsys, tmp_path):
+    from agent.conversation import ConversationResult
+
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    monkeypatch.setattr(
+        "agent.cli.run_mysql_conversation",
+        lambda *args, **kwargs: ConversationResult("conv", 1, "run", "direct", "completed", "Hello"),
+    )
+
+    assert main(["conversation", "run", "--input", "Hello", "--config", _configuration_file(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "conversation",
+        "conv_id": "conv",
+        "sequence": 1,
+        "run_id": "run",
+        "execution_mode": "direct",
+        "status": "completed",
+        "answer": "Hello",
+        "error": None,
+    }
+
+
+def test_conversation_run_leaves_mode_selection_to_the_task_analyzer(monkeypatch, capsys, tmp_path):
+    from agent.conversation import ConversationResult
+
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def run(url, **kwargs):
+        calls.append((url, kwargs))
+        return ConversationResult("conv", 2, "run", "react", "completed", "Answer")
+
+    monkeypatch.setattr("agent.cli.run_mysql_conversation", run)
+
+    assert main(
+        [
+            "conversation",
+            "run",
+            "--input",
+            "Continue",
+            "--conv-id",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--cwd",
+            "/workspace/project",
+            "--config",
+            _configuration_file(tmp_path),
+        ]
+    ) == 0
+
+    assert calls[0][0] == "mysql://user:pass@localhost/db"
+    assert "execution_mode" not in calls[0][1]
+    assert calls[0][1]["conv_id"] == "550e8400-e29b-41d4-a716-446655440000"
+    assert calls[0][1]["cwd"] == "/workspace/project"
+    assert json.loads(capsys.readouterr().out)["execution_mode"] == "react"
+
+
+def test_conversation_run_forwards_log_level(monkeypatch, capsys, tmp_path):
+    from agent.conversation import ConversationResult
+
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def run(url, **kwargs):
+        calls.append((url, kwargs))
+        return ConversationResult("conv", 1, "run", "direct", "completed", "Answer")
+
+    monkeypatch.setattr("agent.cli.run_mysql_conversation", run)
+
+    assert main(
+        [
+            "conversation",
+            "run",
+            "--input",
+            "Hello",
+            "--log-level",
+            "error",
+            "--config",
+            _configuration_file(tmp_path),
+        ]
+    ) == 0
+
+    assert calls[0][1]["log_level"] == "error"
+
+
+def test_conversation_resume_emits_only_the_recovered_turn(monkeypatch, capsys, tmp_path):
+    from agent.conversation import ConversationResult
+
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def resume(url, **kwargs):
+        calls.append((url, kwargs))
+        return ConversationResult(
+            "550e8400-e29b-41d4-a716-446655440000",
+            3,
+            "550e8400-e29b-41d4-a716-446655440001",
+            "plan_execute",
+            "blocked",
+            error="recovery aborted",
+        )
+
+    monkeypatch.setattr("agent.cli.resume_mysql_conversation", resume)
+
+    assert main(
+        [
+            "conversation",
+            "resume",
+            "--conv-id",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--recovery",
+            "abort",
+            "--config",
+            _configuration_file(tmp_path),
+        ]
+    ) == 1
+
+    assert len(calls) == 1
+    assert calls[0][0] == "mysql://user:pass@localhost/db"
+    assert calls[0][1]["conv_id"] == "550e8400-e29b-41d4-a716-446655440000"
+    assert calls[0][1]["recovery"] == "abort"
+    assert calls[0][1]["configuration"] is not None
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "command": "conversation",
+        "conv_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 3,
+        "run_id": "550e8400-e29b-41d4-a716-446655440001",
+        "execution_mode": "plan_execute",
+        "status": "blocked",
+        "answer": None,
+        "error": "recovery aborted",
+    }
+
+
+def test_conversation_show_emits_complete_history(monkeypatch, capsys):
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    monkeypatch.setattr("agent.cli.show_mysql_conversation", lambda url, conv_id: [{"sequence": 1}])
+    conv_id = str(uuid.uuid4())
+
+    assert main(["conversation", "show", "--conv-id", conv_id]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "conversation",
+        "conv_id": conv_id,
+        "history": [{"sequence": 1}],
+    }

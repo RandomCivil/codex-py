@@ -258,6 +258,27 @@ def test_append_to_unknown_conversation_is_rejected_without_creating_one():
         asyncio.run(service.run(conv_id=str(uuid.uuid4()), user_input="Hello"))
 
 
+def test_create_allows_a_chat_generated_conversation_id():
+    store = InMemoryConversationStore()
+    runner = ControlledRunner()
+    runner.store = store
+    service = ConversationService(store, lambda mode, run_id: runner)
+    conv_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    result = asyncio.run(
+        service.run(
+            conv_id=conv_id,
+            user_input="Hello",
+            execution_mode="direct",
+            create=True,
+        )
+    )
+
+    assert result.conv_id == conv_id
+    assert result.sequence == 1
+    assert store.get(conv_id).turns[0].user_input == "Hello"
+
+
 def test_second_append_reports_the_active_turn_as_busy():
     started = asyncio.Event()
     release = asyncio.Event()

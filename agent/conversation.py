@@ -215,13 +215,17 @@ class ConversationService:
         user_input: str,
         execution_mode: ExecutionModeName | None = None,
         conv_id: str | None = None,
+        create: bool = False,
     ) -> ConversationResult:
         if not isinstance(user_input, str) or not user_input.strip():
             raise ValueError("conversation run requires nonempty user input")
         if execution_mode is not None and execution_mode not in {"direct", "tool_agent", "react", "plan_execute"}:
             raise ValueError("execution mode must be direct, tool_agent, react, or plan_execute")
-        if conv_id is None:
-            conv_id = str(uuid.uuid4())
+        if conv_id is None or create:
+            if conv_id is None:
+                conv_id = str(uuid.uuid4())
+            else:
+                _validate_uuid4(conv_id)
             history: tuple[dict[str, Any], ...] = ()
             sequence = 1
         else:
@@ -368,6 +372,7 @@ def run_mysql_conversation(
     cwd: str | None = None,
     log_level: str = "info",
     execution_mode: ExecutionModeName | None = None,
+    create: bool = False,
 ) -> ConversationResult:
     return asyncio.run(
         _run_mysql_conversation(
@@ -378,6 +383,7 @@ def run_mysql_conversation(
             cwd=cwd,
             log_level=log_level,
             execution_mode=execution_mode,
+            create=create,
         )
     )
 
@@ -444,6 +450,7 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
             user_input=kwargs["user_input"],
             conv_id=kwargs["conv_id"],
             execution_mode=kwargs.get("execution_mode"),
+            create=kwargs.get("create", False),
         )
 
 
@@ -474,7 +481,10 @@ async def _select_conversation_mode(
             await TaskAnalyzer(
                 analyzer_llm,
                 stream=getattr(analyzer_configuration, "stream", True),
-            ).run(conversation_input.current_input)
+            ).run(
+                conversation_input.current_input,
+                conversation_input=conversation_input,
+            )
         )
         trace.task_route(mode)
         return mode

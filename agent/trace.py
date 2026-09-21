@@ -231,9 +231,23 @@ class RunTrace:
         suffix = " reason=task_analysis_failed" if analysis_failed else ""
         self._line(f"[task route] mode={mode}{suffix}")
 
-    def execute(self, status: str, revision: int, step_id: str, detail: str | None = None) -> None:
+    def execute(
+        self,
+        status: str,
+        revision: int,
+        step_id: str,
+        detail: str | None = None,
+        *,
+        step_number: int | None = None,
+        step_total: int | None = None,
+    ) -> None:
         suffix = f" {detail}" if detail else ""
-        self._line(f"[execute] {status} revision={revision} step={step_id}{suffix}")
+        progress = (
+            f" plan_step={step_number}/{step_total}"
+            if step_number is not None and step_total is not None
+            else ""
+        )
+        self._line(f"[execute] {status} revision={revision} step={step_id}{progress}{suffix}")
 
     def recovery_context(self, files_read: list[str], files_modified: list[str], observations: list[str]) -> None:
         """Show every trustworthy Step-context value loaded for a resume."""

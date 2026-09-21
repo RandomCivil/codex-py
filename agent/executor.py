@@ -9,7 +9,6 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from llm.line_protocol import decode_step_completion
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
 from agent.runtime_context import RuntimeContextPolicy
 from agent.model_request import tool_request_shape, trace_llm_request
@@ -30,32 +29,9 @@ class Executor:
     _INSTRUCTIONS = (
         "Use the available MCP tools when they are needed to complete the selected Plan step. "
         "If a native tool call is emitted, the host executes it even when the response also has text. "
-        "If no tool use is needed, return exactly an empty NO_TOOL Line Protocol block. "
-        "The Executor will request the STEP_COMPLETION Line Protocol receipt separately."
+        "When the selected Plan step is complete, respond with its final handoff and do not request a tool. "
+        "A final response does not need a Line Protocol format."
     )
-    _COMPLETION_INSTRUCTIONS = """Return exactly one STEP_COMPLETION Line Protocol block, with no prose before or after it.
-Every field uses `NAME=JSON_LITERAL`, not `NAME: value`. COMPLETED and
-COMPLETION_CRITERION_MET must be the JSON boolean true. RESULT must be one non-empty JSON
-string literal. FILES_READ, FILES_MODIFIED, and OBSERVATIONS are optional and may each be
-repeated as JSON string literals. Do not call tools.
-
-Keep the receipt concise. RESULT must be one short sentence that states the material outcome
-and its strongest supporting evidence. Do not enumerate every discovered file, class, tool
-call, or intermediate finding in RESULT. Include optional context fields only when they provide
-durable information needed by a later Plan step, and keep each OBSERVATIONS value concise.
-
-Example:
-BEGIN STEP_COMPLETION
-COMPLETED=true
-COMPLETION_CRITERION_MET=true
-RESULT="Published"
-FILES_READ="README.md"
-FILES_MODIFIED="release.md"
-OBSERVATIONS="Publication confirmed"
-END STEP_COMPLETION
-
-Set COMPLETED and COMPLETION_CRITERION_MET to true only when the selected Plan-step completion
-criterion is actually met."""
 
     def __init__(
         self,
@@ -122,7 +98,6 @@ criterion is actually met."""
         self._session = None
         self._tools = None
         self._bound_model = None
-        self._completion_model = None
         self._graph = None
         self._active = False
 
@@ -141,7 +116,6 @@ criterion is actually met."""
             self._session = None
             self._tools = None
             self._bound_model = None
-            self._completion_model = None
             self._graph = None
             self._active = False
 
@@ -187,14 +161,13 @@ criterion is actually met."""
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
             return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"execution failed: {error}"))
 
-        return await self._check_step_completion(graph_result, revision, step_id, step)
+        return self._complete_step(graph_result, revision, step_id)
 
-    async def _check_step_completion(
+    def _complete_step(
         self,
         graph_result: dict[str, Any],
         revision: int,
         step_id: str,
-        step: PlanStep,
     ) -> ExecutionOutcome:
         try:
             tool_messages = [message for message in graph_result["messages"] if isinstance(message, ToolMessage)]
@@ -203,48 +176,24 @@ criterion is actually met."""
             operational_final = graph_result["messages"][-1]
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="tool round budget exhausted"))
-            completion_prompt = (
-                "Return exactly one STEP_COMPLETION Line Protocol block now. `RESULT` is the handoff and "
-                "evidence summary that subsequent Plan steps will receive. Derive it "
-                "only from the preceding messages: state the material outcome and the "
-                "supporting tool output, artifact path, resource identifier, or state "
-                "fact. Be concise; do not merely say it completed or reproduce the "
-                "message transcript. Set COMPLETED and COMPLETION_CRITERION_MET to true only if the "
-                "selected completion criterion was met: "
-                f"{step.completion_criterion}"
-            )
-            final = await self._completion_model.ainvoke(
-                await self._completion_messages(
-                    graph_result["messages"],
-                    completion_prompt,
-                    step.completion_criterion,
-                )
-            )
+            if not isinstance(operational_final, AIMessage) or not isinstance(operational_final.content, str):
+                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not return a final text response"))
+            handoff = operational_final.content
+            if not handoff.strip():
+                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not return a final text response"))
             if self._trace is not None:
-                self._trace.llm_response(final)
                 self._trace.llm_complete(
                     revision,
                     step_id,
                     {
-                        "content": getattr(final, "content", None),
-                        "tool_calls": getattr(final, "tool_calls", []),
-                        "finish_reason": _finish_reason(final),
+                        "content": operational_final.content,
+                        "tool_calls": operational_final.tool_calls,
+                        "finish_reason": _finish_reason(operational_final),
                     },
                 )
-            if getattr(final, "tool_calls", []):
-                return ExecutionOutcome(
-                    StepExecution(revision, step_id, "failed", error="model did not return a valid completion result")
-                )
-            try:
-                result = _completion_result(final, step.completion_criterion)
-            except (TypeError, ValueError) as error:
-                if self._trace is not None:
-                    self._trace.llm_completion_invalid(revision, step_id, error)
-                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not return a valid completion result"))
-            handoff, context_update = result
             return ExecutionOutcome(
                 StepExecution(revision, step_id, "completed", result=handoff),
-                context_update,
+                ContextUpdate(),
             )
         except Exception as error:
             if self._checkpointer is not None:
@@ -270,11 +219,8 @@ criterion is actually met."""
                 tools = [tool for tool in tools if tool.name in self._tool_allowlist]
             self._tools = canonical_mcp_tool_set(tools)
             # MCP hosts do not promise OpenAI's strict function-tool schema, so
-            # operational tool use remains non-strict. Completion is instead a
-            # separate structured response after MCP work ends; local parsing
-            # and invariant validation apply in both provider modes.
+            # operational tool use remains non-strict.
             self._bound_model = self._model.bind_tools(self._tools)
-            self._completion_model = self._model
             # Tool errors are part of the model/tool conversation: a bad argument or
             # an MCP error must be returned to the model so it can correct its next
             # call, rather than aborting this Step and causing top-level replanning.
@@ -311,10 +257,8 @@ criterion is actually met."""
             # prevents a valid native tool call from running.
             if calls and isinstance(message, AIMessage):
                 message = message.model_copy(update={"content": ""})
-            # Native tool calls are authoritative.  Some OpenAI-compatible
-            # providers return a prose operational summary instead of the
-            # requested NO_TOOL marker; when no native call exists, proceed to
-            # the separately validated STEP_COMPLETION receipt.
+            # Native tool calls are authoritative. When no native call exists,
+            # the model's text is the completed Plan-step handoff.
             if isinstance(message, AIMessage) and message.tool_calls:
                 self._rounds += 1
                 if self._trace is not None:
@@ -451,36 +395,6 @@ criterion is actually met."""
             [_tool_error(message) for message in results],
         )
 
-    async def _completion_messages(
-        self,
-        messages: list[BaseMessage],
-        prompt: str,
-        completion_criterion: str,
-    ) -> list[BaseMessage]:
-        result = [*messages]
-        if self._active_context_policy is not None:
-            self._active_context_policy.record_model_use()
-            # The final receipt sees the same Durable State and layered evidence
-            # as the last operational request; it never receives trace data.
-            context = await self._active_context_policy.maintain(self._active_durable_state)
-            result = [SystemMessage(content=self._COMPLETION_INSTRUCTIONS), context.as_messages()[0]]
-        else:
-            if result and isinstance(result[0], SystemMessage):
-                result = [SystemMessage(content=self._COMPLETION_INSTRUCTIONS), *result[1:]]
-            else:
-                result = [SystemMessage(content=self._COMPLETION_INSTRUCTIONS), *result]
-        result.append(HumanMessage(content=prompt))
-        trace_llm_request(
-            self._trace,
-            "executor",
-            result,
-            static_shape={
-                "request_kind": "completion_receipt",
-                "instructions": _completion_prompt_shape(prompt, completion_criterion),
-            },
-        )
-        return result
-
     def _require_active(self) -> None:
         if not self._active:
             raise RuntimeError("Executor must be used as an asynchronous context manager")
@@ -565,20 +479,6 @@ def _durable_context_payload(
     }
 
 
-def _completion_result(
-    message: AIMessage, completion_criterion: str
-) -> tuple[str, ContextUpdate]:
-    if not isinstance(message, AIMessage) or not isinstance(message.content, str):
-        raise TypeError("completion response must be an AIMessage with text content")
-    document = decode_step_completion(message.content)
-    context_update = ContextUpdate(
-        files_read=document["files_read"],
-        files_modified=document["files_modified"],
-        observations=document["observations"],
-    )
-    return document["result"].strip(), context_update
-
-
 def _finish_reason(message: AIMessage) -> Any:
     metadata = getattr(message, "response_metadata", None)
     if not isinstance(metadata, dict):
@@ -635,8 +535,3 @@ def _exit_code(content: Any) -> int | None:
                 except (TypeError, ValueError):
                     return None
     return None
-
-
-def _completion_prompt_shape(prompt: str, completion_criterion: str) -> str:
-    """Replace the per-step criterion before deriving a request-family ID."""
-    return prompt.replace(completion_criterion, "<completion_criterion>")

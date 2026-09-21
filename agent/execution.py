@@ -17,7 +17,7 @@ from agent.planner import PlanningValidationError
 from llm.llm import LLM
 from agent.runtime_context import RuntimeContextPolicy
 from agent.tool_binding import canonical_mcp_tool_set
-from llm.line_protocol import LineProtocolError, decode_answer, decode_goal_completion, decode_no_tool, normalize_no_tool
+from llm.line_protocol import LineProtocolError, decode_answer
 
 
 ExecutionStatus = Literal["completed", "failed", "blocked"]
@@ -35,10 +35,21 @@ def conversation_model_input(value: Any) -> Any:
     )
 
 
-_ANSWER_LINE_PROTOCOL_INSTRUCTIONS = (
-    "Return exactly one Line Protocol block: BEGIN ANSWER, one TEXT JSON string field, "
-    "then END ANSWER. Do not output prose or any other fields."
-)
+_ANSWER_LINE_PROTOCOL_INSTRUCTIONS = """Return exactly one ANSWER Line Protocol block, with no prose before or after it.
+The block has exactly one scalar field. Write it as `TEXT=<JSON string literal>`: the
+field name must be uppercase `TEXT`, followed by `=`, followed by a JSON-encoded string.
+Do not use a JSON object such as `{"text":"..."}`, and do not use `TEXT: ...`.
+
+Examples:
+BEGIN ANSWER
+TEXT="A concise answer"
+END ANSWER
+
+BEGIN ANSWER
+TEXT="第一行\\n第二行"
+END ANSWER
+
+Do not output any other fields or text."""
 
 _TOOL_AGENT_INSTRUCTIONS = (
     "Use a native function tool call when a tool is needed. If no tool call is needed, "
@@ -49,29 +60,10 @@ _TOOL_AGENT_INSTRUCTIONS = (
 _REACT_TOOL_LOOP_PROMPT = """You are an execution agent. Work iteratively: use an available tool when
 evidence or an external action is needed, inspect each result, and correct course when a
 tool fails. Do not claim the goal is complete until the available evidence supports it.
-When the goal is complete, stop requesting tools so the terminal response can be returned.
+When the goal is complete, respond with the final answer and do not request a tool. Native
+function tool calls take precedence over accompanying text; the host executes the calls and
+ignores that text. A final response does not need a Line Protocol format.
 """
-
-_REACT_TOOL_LOOP_PROMPT += """
-When native function tool calls are present, execute them even if the response also includes
-text; the host ignores that accompanying text. When no tool call is present, return exactly
-the two lines `BEGIN NO_TOOL` and `END NO_TOOL`, with nothing before, between, or after
-them. Do not include the final answer in that response: a separate terminal completion
-request follows it.
-"""
-
-_REACT_GOAL_COMPLETION_INSTRUCTIONS = """Return exactly one GOAL_COMPLETION Line Protocol block, with no prose before or after it.
-Every field uses `NAME=JSON_LITERAL`, not `NAME: value`. In particular, use `ANSWER=<JSON string literal>`. ANSWER must be one JSON string
-literal; encode any line breaks inside that string as `\\n`. Set GOAL_SATISFIED to the JSON
-boolean true.
-
-Example:
-BEGIN GOAL_COMPLETION
-ANSWER="A complete answer"
-GOAL_SATISFIED=true
-END GOAL_COMPLETION
-
-Do not call tools or output prose."""
 
 
 def _bind_tools(model: Any, tools: Any) -> Any:
@@ -325,7 +317,9 @@ class ReactMode:
                         # The policy-owned window is the sole historical source
                         # once it is active; old AI/Tool messages must not become
                         # an undocumented second memory channel.
-                        request_messages = [messages[0], messages[1], *context.as_messages()]
+                        request_messages = [
+                            messages[0], messages[1], *context.as_messages()
+                        ]
                     trace_llm_request(
                         self._trace,
                         "react",
@@ -341,38 +335,13 @@ class ReactMode:
                     calls = list(getattr(response, "tool_calls", []) or [])
                     content = _message_text(response) if getattr(response, "content", None) not in (None, "") else ""
                     if not calls:
-                        decode_no_tool(normalize_no_tool(content))
+                        return ExecutionAnswer(content, "completed")
                     # Once Runtime context is active, its instantaneous
                     # snapshot is the only historical source for subsequent
                     # requests.  Keep the legacy transcript only for the
                     # compatibility path that has no policy.
                     if policy is None:
                         messages.append(response)
-                    if not calls:
-                        completion_messages = [*messages]
-                        if policy is not None:
-                            policy.record_model_use()
-                            context = await policy.maintain({"goal": goal})
-                            completion_messages = [messages[0], messages[1], context.as_messages()[0]]
-                        final_request = [
-                            *completion_messages,
-                            HumanMessage(content=_REACT_GOAL_COMPLETION_INSTRUCTIONS),
-                        ]
-                        trace_llm_request(
-                            self._trace,
-                            "react",
-                            final_request,
-                            static_shape={
-                                "instructions": getattr(final_request[0], "content", ""),
-                                "terminal_instruction": getattr(final_request[-1], "content", ""),
-                                "request_kind": "goal_completion",
-                            },
-                        )
-                        response = await self._model.ainvoke(final_request)
-                        _trace_llm_response(self._trace, response)
-                        if getattr(response, "tool_calls", []):
-                            return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
-                        return _react_answer(response)
                     if round_number == self._max_rounds:
                         return ExecutionAnswer(None, "failed", error="react round budget exhausted")
                     results = await asyncio.gather(
@@ -418,11 +387,6 @@ class ReactMode:
                     error=True,
                 )
             return f"MCP tool failed: {error}", True, getattr(error, "result", {"error": str(error)})
-
-
-def _react_answer(response: Any) -> ExecutionAnswer:
-    answer = decode_goal_completion(_message_text(response))
-    return ExecutionAnswer(answer, "completed")
 
 
 def render_tool_result(value: Any) -> str:

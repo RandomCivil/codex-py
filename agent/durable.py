@@ -176,8 +176,11 @@ class DurableAgent:
             revision, step_id = _next_step(agent_state)
             if revision is None:
                 return {"status": "completed"}
+            step_number, step_total = _step_progress(agent_state, revision, step_id)
             if self._trace is not None:
-                self._trace.execute("started", revision, step_id)
+                self._trace.execute(
+                    "started", revision, step_id, step_number=step_number, step_total=step_total
+                )
             async with self._executor as executor:
                 outcome = await executor.execute(
                     agent_state,
@@ -193,7 +196,14 @@ class DurableAgent:
                 )
                 execution = outcome.execution
             if self._trace is not None:
-                self._trace.execute(execution.status, revision, step_id, execution.error or execution.result)
+                self._trace.execute(
+                    execution.status,
+                    revision,
+                    step_id,
+                    execution.error or execution.result,
+                    step_number=step_number,
+                    step_total=step_total,
+                )
             updates: GraphState = {"agent_state": agent_state.with_step_execution(execution)}
             if isinstance(outcome, ExecutionOutcome) and outcome.context_update is not None:
                 updates.update(_merge_context(state, outcome.context_update, revision, step_id))
@@ -638,6 +648,12 @@ def _next_step(state: AgentState) -> tuple[int | None, str | None]:
         if execution is None or execution.status != "completed":
             return plan.revision, step.id
     return None, None
+
+
+def _step_progress(state: AgentState, revision: int, step_id: str) -> tuple[int, int]:
+    """Return the selected Plan step's one-based position and Plan size."""
+    plan = next(item for item in state.plan_history if item.revision == revision)
+    return next(index for index, step in enumerate(plan.steps, start=1) if step.id == step_id), len(plan.steps)
 
 
 def _restore_recovery_state(

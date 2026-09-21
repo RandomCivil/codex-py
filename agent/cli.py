@@ -14,6 +14,7 @@ from agent.migration import MigrationConfigurationError, migrate_database
 from agent.registry import ConfigurationMismatchError, RunBusyError
 from agent.conversation import (
     ConversationBusyError,
+    ConversationError,
     ConversationNotFoundError,
     run_mysql_conversation,
     resume_mysql_conversation,
@@ -41,7 +42,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _ArgumentParser(prog="agent", add_help=False)
     parser.add_argument("command", choices=("migrate", "run", "resume", "conversation"))
-    parser.add_argument("conversation_action", nargs="?", choices=("run", "resume", "show"))
+    parser.add_argument("conversation_action", nargs="?", choices=("run", "resume", "show", "chat"))
     parser.add_argument("--goal")
     parser.add_argument("--run-id")
     parser.add_argument("--recovery", choices=("fail", "abort"))
@@ -51,11 +52,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--execution", choices=("direct", "tool_agent", "react", "plan_execute"))
     parser.add_argument("--conv-id")
     parser.add_argument("--input", "--user-input", dest="input")
+    parser.add_argument("--json", action="store_true", dest="json_output")
     try:
         args = parser.parse_args(argv)
     except InvalidInvocationError as exc:
         return _emit({"command": None, "status": "invalid", "error": str(exc)}, EXIT_INVALID_INVOCATION)
 
+    if args.json_output and (args.command != "conversation" or args.conversation_action != "chat"):
+        return _emit(
+            {"command": args.command, "status": "invalid", "error": "--json is only supported by conversation chat"},
+            EXIT_INVALID_INVOCATION,
+        )
     if args.command == "run" and (not args.goal or args.run_id or args.recovery or not args.config):
         return _emit({"command": "run", "status": "invalid", "error": "run requires --goal and --config and does not accept --run-id or --recovery"}, EXIT_INVALID_INVOCATION)
     if args.command == "resume" and (not args.run_id or args.goal or not args.config or args.execution):
@@ -75,6 +82,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit({"command": "conversation", "status": "invalid", "error": "conversation resume requires --conv-id and --config"}, EXIT_INVALID_INVOCATION)
         if args.conversation_action == "show" and (not args.conv_id or args.goal or args.run_id or args.recovery or args.config or args.input or args.cwd or args.log_level or args.execution):
             return _emit({"command": "conversation", "status": "invalid", "error": "conversation show requires --conv-id and does not accept run options"}, EXIT_INVALID_INVOCATION)
+        if args.conversation_action == "chat" and (not args.config or args.goal or args.run_id or args.input):
+            return _emit({"command": "conversation", "status": "invalid", "error": "conversation chat requires --config and does not accept --goal, --run-id, or --input"}, EXIT_INVALID_INVOCATION)
         if args.conversation_action is None:
             return _emit({"command": "conversation", "status": "invalid", "error": "conversation requires run or show"}, EXIT_INVALID_INVOCATION)
 
@@ -145,6 +154,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     configuration=configuration,
                 ).as_dict(),
             }
+        elif args.conversation_action == "chat":
+            return _run_chat(
+                os.environ["CODEX_MYSQL_URL"],
+                configuration=configuration,
+                conv_id=args.conv_id,
+                cwd=args.cwd,
+                log_level=args.log_level or "info",
+                execution_mode=args.execution,
+                recovery=args.recovery,
+                json_output=args.json_output,
+            )
         else:
             result = {
                 "command": "conversation",
@@ -187,6 +207,95 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _emit(result: dict[str, object], exit_code: int) -> int:
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return exit_code
+
+
+def _run_chat(
+    url: str,
+    *,
+    configuration: object,
+    conv_id: str | None,
+    cwd: str | None,
+    log_level: str,
+    execution_mode: str | None,
+    recovery: str | None,
+    json_output: bool,
+) -> int:
+    current_conv_id = conv_id
+    if current_conv_id is not None:
+        try:
+            recovered = resume_mysql_conversation(
+                url,
+                conv_id=current_conv_id,
+                recovery=recovery,
+                configuration=configuration,
+            )
+        except KeyboardInterrupt:
+            _emit_reconnect_guidance(current_conv_id)
+            return EXIT_COMPLETED
+        except ConversationError as exc:
+            if str(exc) not in {
+                "conversation has no active turn",
+                "only a plan_execute turn can be resumed",
+            }:
+                raise
+        else:
+            current_conv_id = recovered.conv_id
+            _emit_chat_result(recovered.as_dict(), json_output=json_output)
+    while True:
+        try:
+            user_input = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            _emit_reconnect_guidance(current_conv_id)
+            return EXIT_COMPLETED
+        if user_input in {"/exit", "/quit"}:
+            _emit_reconnect_guidance(current_conv_id)
+            return EXIT_COMPLETED
+        if not user_input.strip():
+            continue
+        creating = current_conv_id is None
+        if creating:
+            current_conv_id = str(uuid.uuid4())
+        try:
+            result = run_mysql_conversation(
+                url,
+                user_input=user_input,
+                conv_id=current_conv_id,
+                configuration=configuration,
+                cwd=cwd,
+                log_level=log_level,
+                create=creating,
+                **({"execution_mode": execution_mode} if execution_mode else {}),
+            )
+        except KeyboardInterrupt:
+            _emit_reconnect_guidance(current_conv_id)
+            return EXIT_COMPLETED
+        except Exception as exc:
+            _emit_chat_error(exc)
+            continue
+        current_conv_id = result.conv_id
+        _emit_chat_result(result.as_dict(), json_output=json_output)
+
+
+def _emit_chat_result(result: dict[str, object], *, json_output: bool) -> None:
+    if json_output:
+        _emit({"command": "conversation", **result}, EXIT_COMPLETED)
+        return
+    print(f"Conversation: {result['conv_id']}")
+    print(f"Turn {result['sequence']} ({result['execution_mode']}) — {result['status']}")
+    if result.get("answer") is not None:
+        print(result["answer"])
+    if result.get("error") is not None:
+        print(f"Error: {result['error']}")
+
+
+def _emit_reconnect_guidance(conv_id: str | None) -> None:
+    if conv_id is not None:
+        print(f"Reconnect with: agent conversation chat --conv-id {conv_id}")
+
+
+def _emit_chat_error(error: Exception) -> None:
+    """Keep interactive chat alive while making unexpected errors visible."""
+    print(f"Error: {error}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

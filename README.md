@@ -190,7 +190,7 @@ cwd:     /home/xzp/workspace/atom-mcp
 
 ## CLI
 
-所有命令都把最终结果以一行 JSON 写到 stdout，运行日志写到 stderr，因此可以安全地被脚本消费：
+除交互式 `conversation chat` 外，所有命令都把最终结果以一行 JSON 写到 stdout，运行日志写到 stderr，因此可以安全地被脚本消费：
 
 ```bash
 poetry run agent <command> [options]
@@ -281,6 +281,32 @@ poetry run agent conversation run --input '整理当前项目的待办事项' --
 ```bash
 poetry run agent conversation run --conv-id <uuidv4> --input '根据上面的结果列出下一步' --config agent.yaml --cwd /path/to/project
 ```
+
+#### 交互式 chat
+
+使用 `conversation chat` 可以在一个终端进程中连续提交输入，而不必手工复制每轮的 `conv_id`：
+
+```bash
+poetry run agent conversation chat --config agent.yaml --cwd /path/to/project
+```
+
+它以 `> ` 提示输入；空行会被忽略，完全等于 `/exit` 或 `/quit` 的一行会退出。省略 `--conv-id` 时，首个非空输入才会生成并创建 Conversation，因此直接退出不会留下空 Conversation。每个 turn 完成（包括 `failed` 或 `blocked`）后，chat 会先显示 Conversation ID、序号、Execution mode、状态以及 answer 或 error，再接受下一次输入。
+
+要继续已有 Conversation，传入它的 ID：
+
+```bash
+poetry run agent conversation chat --conv-id <uuidv4> --config agent.yaml
+```
+
+chat 会在显示提示符前自动尝试恢复 Active Conversation turn；可用已建立的 `--recovery fail` 或 `--recovery abort` 改变该恢复处置。显式 `--execution`、`--cwd` 和 `--log-level` 只作用于 chat 新提交的 turn，不会改变已持久化 Active turn 的 Execution mode。等待输入时收到 EOF 或 `Ctrl+C`，或在执行/恢复期间中断时，chat 会安全退出；已知 Conversation ID 时会打印可直接使用的 `agent conversation chat --conv-id ...` 重连命令。
+
+默认输出面向终端阅读。`--json` 可让每个 turn 的结果以既有公开 JSON 形状输出，用于交互调试：
+
+```bash
+poetry run agent conversation chat --config agent.yaml --json
+```
+
+提示符仍会写到 stdout，因此 `--json` 不是 pipe-safe 协议，也只支持 `conversation chat`；自动化请继续使用一次性的 `conversation run`、`resume` 和 `show` 命令。
 
 读取完整、有序的公开历史：
 

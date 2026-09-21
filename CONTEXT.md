@@ -5,12 +5,12 @@ This context coordinates language-model interactions for the Codex Python agent.
 ## Language
 
 **Line Protocol**:
-A strict UTF-8, line-oriented model-response representation in which a response is delimited by matching `BEGIN <TYPE>` and `END <TYPE>` lines. Scalar fields use `PATH=JSON_LITERAL`, dot-separated paths represent nested objects, repeated paths represent scalar arrays, and repeated nested blocks represent object arrays; it is the sole structured response contract for non-tool language-model responses and is validated locally before conversion to a component's domain contract.
+A strict UTF-8, line-oriented model-response representation in which a response is delimited by matching `BEGIN <TYPE>` and `END <TYPE>` lines. Scalar fields use `PATH=JSON_LITERAL`, dot-separated paths represent nested objects, repeated paths represent scalar arrays, and repeated nested blocks represent object arrays; components use it where they require a structured response contract and validate it locally before conversion to a component's domain contract.
 _Avoid_: JSON mode, JSON Schema, JSON object
 
 **No-tool response**:
-The empty `NO_TOOL` Line Protocol block emitted by a tool-capable model that declines native tool calls before its host makes a separate completion request.
-_Avoid_: plain-text no-tool reply, implicit completion
+A legacy empty `NO_TOOL` Line Protocol block that formerly indicated a tool-capable model declined native tool calls. ReAct and the Plan-step Executor now treat a no-tool response's content as their terminal result.
+_Avoid_: required no-tool marker, separate completion request
 
 **OpenAI-compatible provider**:
 A service exposing the OpenAI Responses API through a caller-supplied base URL, API key, and model name.
@@ -61,7 +61,7 @@ An Execution mode limited to one language-model request and at most one Tool exe
 _Avoid_: single-round ReAct, executor
 
 **ReAct mode**:
-An Ephemeral Execution mode that iterates language-model requests and Tool executions toward one answer, without a Planner or Plan. It ends only when its final structured response explicitly declares the goal satisfied.
+An Ephemeral Execution mode that iterates language-model requests and Tool executions toward one answer, without a Planner or Plan. It ends when a model response has no native tool calls; that response's content is the final answer.
 _Avoid_: Executor, plan execution
 
 **Plan–execute mode**:
@@ -103,6 +103,10 @@ _Avoid_: session, thread
 **Conversation**:
 The durable, user-facing sequence of Conversation turns for one continuing interaction, identified by a caller-supplied `conv_id`. A Conversation aggregates Agent runs but is not an Agent run.
 _Avoid_: session, run, thread
+
+**Interactive Conversation**:
+A terminal-mediated Conversation in which one completed turn's result is presented before the next user input is accepted; it either creates a new Conversation or reconnects to one by `conv_id`.
+_Avoid_: interactive session, chat session
 
 **Conversation turn**:
 One strictly ordered user input and its resulting invocation of a selected existing Agent implementation within a Conversation. Every Conversation turn has its own Agent run.
@@ -161,7 +165,7 @@ The component that derives a complete Plan from the goal and Agent state without
 _Avoid_: executor, tool caller
 
 **Executor**:
-The component that makes one bounded Tool execution attempt for a Plan step, selecting from tools exposed by its host without changing the Plan or requesting a new Plan.
+The component that makes one bounded Tool execution attempt for a Plan step, selecting from tools exposed by its host without changing the Plan or requesting a new Plan. When the model stops requesting tools, its nonempty content is the Plan-step handoff.
 _Avoid_: agent, planner, automatic tool loop
 
 **MCP tool set**:

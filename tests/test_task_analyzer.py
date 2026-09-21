@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -76,6 +77,30 @@ def test_task_analyzer_prompts_for_task_analysis_without_provider_formatting_opt
     assert text_stream.request["input"] == "Investigate the report"
     assert text_stream.request["tools"] is None
     assert "BEGIN TASK_ANALYSIS" in text_stream.request["instructions"]
+
+
+def test_task_analyzer_includes_prior_conversation_history_in_model_input():
+    text_stream = TextStream(valid_analysis())
+
+    asyncio.run(
+        TaskAnalyzer(text_stream).run(
+            "Continue the investigation",
+            conversation_input={
+                "history": [
+                    {
+                        "sequence": 1,
+                        "user_input": "Investigate the report",
+                        "answer": "The report needs follow-up.",
+                    }
+                ],
+                "current_input": "Continue the investigation",
+            },
+        )
+    )
+
+    request = json.loads(text_stream.request["input"])
+    assert request["current_input"] == "Continue the investigation"
+    assert request["conversation_history"][0]["answer"] == "The report needs follow-up."
 
 
 @pytest.mark.parametrize(

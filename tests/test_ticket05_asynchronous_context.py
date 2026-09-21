@@ -47,11 +47,7 @@ class _RoundModel:
                     }
                 ],
             )
-        if len(self.calls) == 6:
-            return AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL")
-        return AIMessage(
-            content='BEGIN GOAL_COMPLETION\nANSWER="The five tool rounds are complete."\nGOAL_SATISFIED=true\nEND GOAL_COMPLETION'
-        )
+        return AIMessage(content="The five tool rounds are complete.")
 
 
 class _FirstObservationBlocked:
@@ -124,15 +120,7 @@ class _ExecutorRoundModel:
                     }
                 ],
             )
-        if len(self.calls) == 6:
-            return AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL")
-        return AIMessage(
-            content=(
-                'BEGIN STEP_COMPLETION\nCOMPLETED=true\nCOMPLETION_CRITERION_MET=true\n'
-                'RESULT="The five tool rounds completed."\n'
-                'OBSERVATIONS="Five tool rounds completed."\nEND STEP_COMPLETION'
-            )
-        )
+        return AIMessage(content="The five tool rounds completed.")
 
 
 class _ExecutorClient:

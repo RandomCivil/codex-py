@@ -5,6 +5,16 @@ import re
 from agent.trace import RunTrace
 
 
+def test_execute_trace_includes_current_plan_step_progress():
+    output = StringIO()
+
+    RunTrace(output).execute("completed", 1, "explain", "Done", step_number=2, step_total=3)
+
+    assert output.getvalue().strip() == (
+        "[execute] completed revision=1 step=explain plan_step=2/3 Done"
+    )
+
+
 def test_model_request_usage_is_attributed_to_a_safe_deterministic_request_family():
     first_output = StringIO()
     first = RunTrace(first_output, level="error")

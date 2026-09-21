@@ -1,5 +1,6 @@
 """Structured task analysis and deterministic execution-mode routing."""
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
@@ -360,15 +361,16 @@ class TaskAnalyzer:
         self._text_stream = text_stream
         self._stream = stream
 
-    async def run(self, goal: str) -> TaskAnalysis:
+    async def run(self, goal: str, *, conversation_input: Any = None) -> TaskAnalysis:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
+        model_input = _analysis_input(goal, conversation_input)
         if self._stream:
             output = "".join(
                 [
                     chunk
                     async for chunk in self._text_stream.stream_text(
-                        goal,
+                        model_input,
                         instructions=_TASK_ANALYSIS_INSTRUCTIONS,
                         tools=None,
                     )
@@ -376,11 +378,32 @@ class TaskAnalyzer:
             )
         else:
             output = await self._text_stream.complete_text(
-                goal,
+                model_input,
                 instructions=_TASK_ANALYSIS_INSTRUCTIONS,
                 tools=None,
             )
         return _parse_analysis(output)
+
+
+def _analysis_input(goal: str, conversation_input: Any = None) -> str:
+    """Render the current request together with prior public conversation turns."""
+    if conversation_input is None:
+        return goal
+    history = (
+        conversation_input["history"]
+        if isinstance(conversation_input, Mapping)
+        else conversation_input.history
+    )
+    current_input = (
+        conversation_input["current_input"]
+        if isinstance(conversation_input, Mapping)
+        else conversation_input.current_input
+    )
+    return json.dumps(
+        {"conversation_history": list(history), "current_input": current_input},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def route(analysis: TaskAnalysis | Mapping[str, Any]) -> ExecutionModeName:

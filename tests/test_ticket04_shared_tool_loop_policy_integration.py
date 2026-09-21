@@ -49,10 +49,7 @@ class ReactModel:
                     content="",
                     tool_calls=[{"name": "write_file", "args": {"path": "note"}, "id": "write-1"}],
                 ),
-                AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL"),
-                AIMessage(
-                    content='BEGIN GOAL_COMPLETION\nANSWER="Done"\nGOAL_SATISFIED=true\nEND GOAL_COMPLETION'
-                ),
+                AIMessage(content="Done"),
             )
         )
 
@@ -102,13 +99,7 @@ class ExecutorModel:
                     content="",
                     tool_calls=[{"name": "write_file", "args": {"path": "note"}, "id": "write-1"}],
                 ),
-                AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL"),
-                AIMessage(
-                    content=(
-                        "BEGIN STEP_COMPLETION\nCOMPLETED=true\n"
-                        "COMPLETION_CRITERION_MET=true\nRESULT=\"Done\"\nEND STEP_COMPLETION"
-                    )
-                ),
+                AIMessage(content="Done"),
             )
         )
 

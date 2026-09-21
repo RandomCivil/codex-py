@@ -1,9 +1,11 @@
 import asyncio
+from io import StringIO
 
 from langchain_core.messages import AIMessage
 from langchain_core.tools import StructuredTool
 
 from agent.executor import Executor
+from agent.trace import RunTrace
 from memory.state import AgentState, Plan, PlanStep
 
 
@@ -143,6 +145,36 @@ def test_executor_completion_request_includes_the_full_step_receipt_syntax(monke
     assert "COMPLETED=true" in instructions
     assert "RESULT=\"Published\"" in instructions
     assert "END STEP_COMPLETION" in instructions
+    assert "RESULT must be one short sentence" in instructions
+    assert "Do not enumerate every discovered file" in instructions
+
+
+def test_executor_traces_finish_reason_and_specific_invalid_receipt_error(monkeypatch):
+    async def load_tools(session): return []
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    truncated = AIMessage(
+        content=(
+            'BEGIN STEP_COMPLETION\nCOMPLETED=true\n'
+            'COMPLETION_CRITERION_MET=true\nRESULT="Published"'
+        ),
+        response_metadata={"finish_reason": "length"},
+    )
+    model = Model(AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL"), truncated)
+    output = StringIO()
+
+    async def run():
+        async with Executor(model=model, trace=RunTrace(output)) as executor:
+            return await executor.execute(_state(), 1, "publish")
+
+    outcome = asyncio.run(run())
+
+    assert outcome.execution.status == "failed"
+    assert '"finish_reason": "length"' in output.getvalue()
+    assert (
+        "[llm complete invalid] revision=1 step=publish "
+        "error=incomplete protocol block"
+    ) in output.getvalue()
 
 
 def test_executor_executes_a_tool_call_with_accompanying_text(monkeypatch):

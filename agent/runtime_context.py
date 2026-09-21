@@ -24,10 +24,21 @@ RAW_ROUND_WINDOW = 3
 _OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
 BEGIN OBSERVATION ... END OBSERVATION.
 Create the Observation for the settled Tool round in the next message.
-Classify tool-confirmed output as confirmed_facts, every raw error as reported_errors,
-and interpretations as model_inferences. Set ROUND to the source round. Every evidence
-entry is one nested EVIDENCE block with CATEGORY, TEXT, and one or more repeated
-TOOL_CALL_ID fields. Use JSON literals after '=' and do not output prose."""
+Set ROUND to the source round. Every EVIDENCE block MUST contain CATEGORY, TEXT, and
+at least one TOOL_CALL_ID. Copy TOOL_CALL_ID exactly from the input tool-call ID;
+never omit it and never invent one. Classify tool-confirmed output as confirmed_facts,
+every raw error as reported_errors, and interpretations as model_inferences. Use JSON
+literals after '=' and do not output prose.
+
+Example:
+BEGIN OBSERVATION
+ROUND=4
+BEGIN EVIDENCE
+CATEGORY="confirmed_facts"
+TEXT="The requested files were found"
+TOOL_CALL_ID="call_123"
+END EVIDENCE
+END OBSERVATION"""
 
 _MERGE_OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
 BEGIN OBSERVATION ... END OBSERVATION.
@@ -415,7 +426,9 @@ def _parse_observation(response: Any, *, expected_round: int) -> Observation:
             parsed[category] += (Evidence(text, tuple(ids)),)
         return Observation(expected_round, **parsed, source_round_start=source_start, source_round_end=source_end)
     except (KeyError, TypeError, ValueError, LineProtocolError) as error:
-        raise _ObservationValidationError("Observation Line Protocol is invalid") from error
+        raise _ObservationValidationError(
+            f"Observation Line Protocol is invalid: {error}"
+        ) from error
 
 
 def _single_protocol_field(fields: Mapping[str, list[Any]], name: str) -> Any:

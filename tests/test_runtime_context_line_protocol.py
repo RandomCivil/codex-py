@@ -113,6 +113,28 @@ def test_malformed_observation_line_protocol_keeps_raw_fallback():
     assert policy.assemble({}).raw_tool_results[0].calls[0].result == "done"
 
 
+def test_observation_evidence_requires_tool_call_id():
+    model = ObservationLineProtocolModel(
+        "BEGIN OBSERVATION\nROUND=1\n"
+        "BEGIN EVIDENCE\nCATEGORY=\"confirmed_facts\"\nTEXT=\"fact\"\n"
+        "END EVIDENCE\nEND OBSERVATION"
+    )
+    policy = RuntimeContextPolicy(model)
+
+    async def run():
+        await policy.record_tool_round(
+            1, [{"id": "call-1", "name": "read", "args": {}}], ["done"]
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert policy.observation_outcomes[0].status == "invalid"
+    assert policy.observation_outcomes[0].error == (
+        "Observation Line Protocol is invalid: evidence"
+    )
+
+
 def test_observation_merge_decodes_source_range_and_preserves_tool_call_provenance(monkeypatch):
     monkeypatch.setattr(
         "agent.runtime_context._estimate_tokens",

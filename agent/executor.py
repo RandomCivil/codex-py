@@ -39,6 +39,11 @@ COMPLETION_CRITERION_MET must be the JSON boolean true. RESULT must be one non-e
 string literal. FILES_READ, FILES_MODIFIED, and OBSERVATIONS are optional and may each be
 repeated as JSON string literals. Do not call tools.
 
+Keep the receipt concise. RESULT must be one short sentence that states the material outcome
+and its strongest supporting evidence. Do not enumerate every discovered file, class, tool
+call, or intermediate finding in RESULT. Include optional context fields only when they provide
+durable information needed by a later Plan step, and keep each OBSERVATIONS value concise.
+
 Example:
 BEGIN STEP_COMPLETION
 COMPLETED=true
@@ -223,14 +228,18 @@ criterion is actually met."""
                     {
                         "content": getattr(final, "content", None),
                         "tool_calls": getattr(final, "tool_calls", []),
+                        "finish_reason": _finish_reason(final),
                     },
                 )
             if getattr(final, "tool_calls", []):
                 return ExecutionOutcome(
                     StepExecution(revision, step_id, "failed", error="model did not return a valid completion result")
                 )
-            result = _completion_result(final, step.completion_criterion)
-            if result is None:
+            try:
+                result = _completion_result(final, step.completion_criterion)
+            except (TypeError, ValueError) as error:
+                if self._trace is not None:
+                    self._trace.llm_completion_invalid(revision, step_id, error)
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not return a valid completion result"))
             handoff, context_update = result
             return ExecutionOutcome(
@@ -558,22 +567,23 @@ def _durable_context_payload(
 
 def _completion_result(
     message: AIMessage, completion_criterion: str
-) -> tuple[str, ContextUpdate] | None:
+) -> tuple[str, ContextUpdate]:
     if not isinstance(message, AIMessage) or not isinstance(message.content, str):
-        return None
-    try:
-        document = decode_step_completion(message.content)
-    except ValueError:
-        return None
-    try:
-        context_update = ContextUpdate(
-            files_read=document["files_read"],
-            files_modified=document["files_modified"],
-            observations=document["observations"],
-        )
-    except (TypeError, ValueError):
-        return None
+        raise TypeError("completion response must be an AIMessage with text content")
+    document = decode_step_completion(message.content)
+    context_update = ContextUpdate(
+        files_read=document["files_read"],
+        files_modified=document["files_modified"],
+        observations=document["observations"],
+    )
     return document["result"].strip(), context_update
+
+
+def _finish_reason(message: AIMessage) -> Any:
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    return metadata.get("finish_reason") or metadata.get("stop_reason")
 
 
 def _format_step_context(context: StepContext) -> str:

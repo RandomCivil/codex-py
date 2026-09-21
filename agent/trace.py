@@ -188,7 +188,10 @@ class RunTrace:
         """Print the exact request context submitted to a model at info level."""
         if self._level != "info":
             return
-        self._line(f"[llm context] data={_compact(context)}")
+        # Keep this as the context's native text representation.  The request
+        # context is a diagnostic transcript, not a data payload: converting it
+        # to sorted JSON obscures the order and formatting that the model saw.
+        self._line(f"[llm context] {context}")
 
     def runtime_context_observation(self, outcome: Any) -> None:
         """Report the transient outcome of an asynchronous Observation attempt."""
@@ -211,6 +214,13 @@ class RunTrace:
         self._line(
             f"[llm complete] revision={revision} step={step_id} "
             f"data={_compact(message)}"
+        )
+
+    def llm_completion_invalid(self, revision: int, step_id: str, error: Exception) -> None:
+        """Report why a terminal model receipt failed local validation."""
+        self._line(
+            f"[llm complete invalid] revision={revision} step={step_id} "
+            f"error={error}"
         )
 
     def plan(self, status: str, revision: int | None = None) -> None:

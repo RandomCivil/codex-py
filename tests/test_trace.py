@@ -285,7 +285,18 @@ def test_trace_prints_llm_context():
     trace.llm_context({"input": [{"role": "user", "content": "hello"}]})
 
     assert output.getvalue() == (
-        '[run-123] [llm context] data={"input": [{"content": "hello", "role": "user"}]}\n'
+        "[run-123] [llm context] {'input': [{'role': 'user', 'content': 'hello'}]}\n"
+    )
+
+
+def test_trace_prints_llm_context_without_structuring_multiline_text():
+    output = StringIO()
+    trace = RunTrace(output)
+
+    trace.llm_context("system prompt\nuser prompt\nassistant context")
+
+    assert output.getvalue() == (
+        "[llm context] system prompt\nuser prompt\nassistant context\n"
     )
 
 

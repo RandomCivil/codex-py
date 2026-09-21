@@ -27,7 +27,7 @@ from .configuration import ComponentProviderConfiguration
 from .executor import Executor
 from .migration import _connection_pool, _parse_url, ensure_schema_initialized
 from .planner import Planner
-from .execution import ExecutionAnswer, ToolRuntime, create_execution_mode
+from .execution import ExecutionAnswer, ToolRuntime, _plan_execute_failure_message, create_execution_mode
 from .task_analyzer import RoutedExecutionAnswer, TaskAnalyzer, TaskRouter
 from .registry import (
     ConfigurationMismatchError,
@@ -70,16 +70,22 @@ class DurableConversationRunner:
                 for parameter in inspect.signature(self._durable_agent.run).parameters.values()
             )
         )
-        return _durable_answer(
-            await self._durable_agent.run(
+        try:
+            result = await self._durable_agent.run(
                 self._run_id,
                 AgentState(conversation_input.current_input),
                 **({"conversation_input": conversation_input} if accepts_conversation_input else {}),
             )
-        )
+        except Exception as error:
+            return ExecutionAnswer(None, "failed", error=_plan_execute_failure_message(error))
+        return _durable_answer(result)
 
     async def resume(self, recovery: str | None = None) -> ExecutionAnswer:
-        return _durable_answer(await self._durable_agent.run(self._run_id, recovery=recovery))
+        try:
+            result = await self._durable_agent.run(self._run_id, recovery=recovery)
+        except Exception as error:
+            return ExecutionAnswer(None, "failed", error=_plan_execute_failure_message(error))
+        return _durable_answer(result)
 
 
 def _conversation_input_payload(value: Any) -> dict[str, Any] | None:
@@ -444,6 +450,7 @@ async def _run(
                         planner_configuration.model_name,
                         on_event=trace.llm_event,
                         on_request=lambda request: trace.llm_request("planner", request),
+                        on_response=lambda response: trace.llm_response(response, component="planner"),
                     )
                     planner = Planner(llm, trace=trace)
                     executor = Executor(
@@ -523,8 +530,19 @@ def run_agent(
     log_level: str = "info",
     *,
     configuration: ComponentProviderConfiguration | None = None,
+    execution_mode: str | None = None,
 ) -> dict[str, Any]:
-    return asyncio.run(_run(url, new_run_id(), goal, cwd=cwd, log_level=log_level, configuration=configuration))
+    return asyncio.run(
+        _run(
+            url,
+            new_run_id(),
+            goal,
+            cwd=cwd,
+            log_level=log_level,
+            configuration=configuration,
+            execution_mode=execution_mode,
+        )
+    )
 
 
 def resume_agent(

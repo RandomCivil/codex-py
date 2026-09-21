@@ -13,10 +13,12 @@ class LLM:
         *,
         on_event: Callable[[ResponseStreamEvent], None] | None = None,
         on_request: Callable[[Mapping[str, Any]], None] | None = None,
+        on_response: Callable[[Any], None] | None = None,
     ) -> None:
         self._model_name = model_name
         self._on_event = on_event
         self._on_request = on_request
+        self._on_response = on_response
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -71,3 +73,26 @@ class LLM:
         ):
             if event.type == "response.output_text.delta":
                 yield event.delta
+
+    async def complete_text(
+        self,
+        input: str | Sequence[dict[str, Any]],
+        *,
+        instructions: str | None = None,
+        tools: Iterable[dict[str, Any]] | None = None,
+    ) -> str:
+        """Return one complete non-streaming Responses API text result."""
+        request: dict[str, Any] = {
+            "model": self._model_name,
+            "input": input,
+        }
+        if instructions is not None:
+            request["instructions"] = instructions
+        if tools is not None:
+            request["tools"] = tools
+        if self._on_request is not None:
+            self._on_request(request)
+        response = await self._client.responses.create(**request)
+        if self._on_response is not None:
+            self._on_response(response)
+        return response.output_text

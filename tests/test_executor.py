@@ -53,6 +53,65 @@ def test_executor_uses_no_tool_then_validates_separate_line_protocol_receipt(mon
     assert outcome.context_update.files_read == ("README.md",)
     assert "NO_TOOL" in model.requests[0][0].content
     assert "STEP_COMPLETION" in model.requests[1][-1].content
+    assert "NO_TOOL" not in model.requests[1][0].content
+
+
+def test_executor_accepts_bare_no_tool_provider_response(monkeypatch):
+    async def load_tools(session): return []
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    model = Model(AIMessage(content="NO_TOOL"), _receipt())
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(_state(), 1, "publish")
+    outcome = asyncio.run(run())
+    assert outcome.execution.status == "completed"
+
+
+def test_executor_accepts_provider_answer_with_no_tool_suffix(monkeypatch):
+    async def load_tools(session): return []
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    model = Model(AIMessage(content="A provider-generated answer.\n\n_NO_TOOL_"), _receipt())
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(_state(), 1, "publish")
+    outcome = asyncio.run(run())
+    assert outcome.execution.status == "completed"
+
+
+def test_executor_accepts_provider_answer_with_fenced_no_tool_suffix(monkeypatch):
+    async def load_tools(session): return []
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    model = Model(
+        AIMessage(content="已完成项目结构勘察。\n\n```no_tool\n```"),
+        _receipt(),
+    )
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(_state(), 1, "publish")
+
+    assert asyncio.run(run()).execution.status == "completed"
+
+
+def test_executor_treats_plain_text_without_native_tool_calls_as_no_tool(monkeypatch):
+    async def load_tools(session): return []
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    model = Model(
+        AIMessage(content="已完成项目 Flutter 组件清单。下一步可继续检查组件实现。"),
+        _receipt(),
+    )
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(_state(), 1, "publish")
+
+    assert asyncio.run(run()).execution.status == "completed"
 
 
 def test_executor_rejects_step_completion_missing_its_required_receipt_proof(monkeypatch):
@@ -65,6 +124,25 @@ def test_executor_rejects_step_completion_missing_its_required_receipt_proof(mon
         async with Executor(model=model) as executor:
             return await executor.execute(_state(), 1, "publish")
     assert asyncio.run(run()).execution.status == "failed"
+
+
+def test_executor_completion_request_includes_the_full_step_receipt_syntax(monkeypatch):
+    async def load_tools(session): return []
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    model = Model(AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL"), _receipt())
+
+    async def run():
+        async with Executor(model=model) as executor:
+            return await executor.execute(_state(), 1, "publish")
+
+    assert asyncio.run(run()).execution.status == "completed"
+    instructions = model.requests[1][0].content
+    assert "NAME=JSON_LITERAL" in instructions
+    assert "BEGIN STEP_COMPLETION" in instructions
+    assert "COMPLETED=true" in instructions
+    assert "RESULT=\"Published\"" in instructions
+    assert "END STEP_COMPLETION" in instructions
 
 
 def test_executor_executes_a_tool_call_with_accompanying_text(monkeypatch):

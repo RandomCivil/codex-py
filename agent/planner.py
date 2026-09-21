@@ -2,7 +2,7 @@ import json
 from typing import Any, Mapping
 
 from llm.line_protocol import PLAN_INSTRUCTIONS, LineProtocolError, decode_plan
-from llm.text_stream import TextStream
+from llm.text_stream import TextCompletion
 from memory.state import AgentState, Plan, PlanStep
 
 
@@ -13,8 +13,8 @@ class PlanningValidationError(ValueError):
 class Planner:
     _PLAN_INSTRUCTIONS = PLAN_INSTRUCTIONS
 
-    def __init__(self, text_stream: TextStream, trace: Any | None = None) -> None:
-        self._text_stream = text_stream
+    def __init__(self, text_completion: TextCompletion, trace: Any | None = None) -> None:
+        self._text_completion = text_completion
         self._trace = trace
 
     async def plan(self, state: AgentState, *, conversation_input: Any = None) -> Plan:
@@ -28,15 +28,10 @@ class Planner:
         request = json.dumps(
             _state_payload(state, conversation_input=conversation_input), ensure_ascii=False, sort_keys=True
         )
-        output = "".join(
-            [
-                chunk
-                async for chunk in self._text_stream.stream_text(
-                    request,
-                    instructions=self._PLAN_INSTRUCTIONS,
-                    tools=None,
-                )
-            ]
+        output = await self._text_completion.complete_text(
+            request,
+            instructions=self._PLAN_INSTRUCTIONS,
+            tools=None,
         )
         try:
             plan = decode_plan(output, goal=state.goal, expected_revision=expected_revision)

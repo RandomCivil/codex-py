@@ -213,12 +213,12 @@ class ConversationService:
         self,
         *,
         user_input: str,
-        execution_mode: ExecutionModeName = "direct",
+        execution_mode: ExecutionModeName | None = None,
         conv_id: str | None = None,
     ) -> ConversationResult:
         if not isinstance(user_input, str) or not user_input.strip():
             raise ValueError("conversation run requires nonempty user input")
-        if execution_mode not in {"direct", "tool_agent", "react", "plan_execute"}:
+        if execution_mode is not None and execution_mode not in {"direct", "tool_agent", "react", "plan_execute"}:
             raise ValueError("execution mode must be direct, tool_agent, react, or plan_execute")
         if conv_id is None:
             conv_id = str(uuid.uuid4())
@@ -237,12 +237,14 @@ class ConversationService:
 
         run_id = str(uuid.uuid4())
         conversation_input = ConversationInput(conv_id, history, user_input)
-        if self._mode_selector is not None:
+        if execution_mode is None and self._mode_selector is not None:
             execution_mode = await _maybe_await(
                 _call_factory(self._mode_selector, conversation_input, run_id)
             )
             if execution_mode not in {"direct", "tool_agent", "react", "plan_execute"}:
                 raise TypeError("task analyzer returned an invalid execution mode")
+        if execution_mode is None:
+            execution_mode = "direct"
         turn = ConversationTurn(conv_id, sequence, run_id, execution_mode, user_input, "pending")
         await _maybe_await(self._store.append(turn))
         turn = ConversationTurn(conv_id, sequence, run_id, execution_mode, user_input, "running")
@@ -365,6 +367,7 @@ def run_mysql_conversation(
     configuration: Any,
     cwd: str | None = None,
     log_level: str = "info",
+    execution_mode: ExecutionModeName | None = None,
 ) -> ConversationResult:
     return asyncio.run(
         _run_mysql_conversation(
@@ -374,6 +377,7 @@ def run_mysql_conversation(
             configuration=configuration,
             cwd=cwd,
             log_level=log_level,
+            execution_mode=execution_mode,
         )
     )
 
@@ -439,6 +443,7 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
         return await service.run(
             user_input=kwargs["user_input"],
             conv_id=kwargs["conv_id"],
+            execution_mode=kwargs.get("execution_mode"),
         )
 
 

@@ -2,7 +2,8 @@ import asyncio
 
 from langchain_core.messages import AIMessage
 
-from agent.execution import DirectMode, ExecutionAnswer, ReactMode, ToolAgentMode
+from agent import PlanningValidationError
+from agent.execution import DirectMode, ExecutionAnswer, PlanExecuteMode, ReactMode, ToolAgentMode
 
 
 class TextModel:
@@ -25,6 +26,37 @@ class Runtime:
     async def __aenter__(self): return self
     async def __aexit__(self, *args): pass
     async def invoke(self, call): self.calls.append(call); return {"value": "done"}
+
+
+def test_plan_execute_reports_a_safe_actionable_provider_status():
+    class ProviderFailure(RuntimeError):
+        status_code = 402
+
+    class Durable:
+        async def run(self, *_args, **_kwargs):
+            raise ProviderFailure("provider payload that must not reach the caller")
+
+    answer = asyncio.run(PlanExecuteMode(Durable(), run_id="run-1").run("Inspect components"))
+
+    assert answer == ExecutionAnswer(
+        None,
+        "failed",
+        "plan-execute execution failed: provider returned HTTP 402 (Insufficient Balance)",
+    )
+
+
+def test_plan_execute_reports_the_safe_planning_validation_error():
+    class Durable:
+        async def run(self, *_args, **_kwargs):
+            raise PlanningValidationError("invalid line or text outside a block")
+
+    answer = asyncio.run(PlanExecuteMode(Durable(), run_id="run-1").run("Inspect components"))
+
+    assert answer == ExecutionAnswer(
+        None,
+        "failed",
+        "planning failed: invalid line or text outside a block",
+    )
 
 
 def test_direct_mode_decodes_answer_and_prompts_for_line_protocol():

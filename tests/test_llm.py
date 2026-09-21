@@ -51,6 +51,26 @@ def test_text_stream_yields_only_text_deltas_in_order(monkeypatch):
     assert asyncio.run(consume()) == ["Hello", " world"]
 
 
+def test_complete_text_uses_non_streaming_responses_api_and_reports_request(monkeypatch):
+    observed = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.responses = SimpleNamespace(
+                create=lambda **kwargs: observed.update(kwargs) or _response("Complete response")
+            )
+        async def close(self): pass
+
+    monkeypatch.setattr("llm.llm.AsyncOpenAI", Client)
+
+    assert asyncio.run(
+        LLM("https://provider.test", "secret", "model").complete_text(
+            "hello", instructions="Be concise"
+        )
+    ) == "Complete response"
+    assert observed == {"model": "model", "input": "hello", "instructions": "Be concise"}
+
+
 def test_event_stream_forwards_tools_without_text_format(monkeypatch):
     observed = {}
 
@@ -92,3 +112,7 @@ def test_event_stream_propagates_provider_error_without_retry(monkeypatch):
 
 async def _consume(llm, input, **kwargs):
     return [event async for event in llm.stream_events(input, **kwargs)]
+
+
+async def _response(output_text):
+    return SimpleNamespace(output_text=output_text)

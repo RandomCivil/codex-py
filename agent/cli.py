@@ -48,6 +48,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--cwd", help="working directory supplied to Atom MCP tool calls")
     parser.add_argument("--log-level", "--level", dest="log_level", choices=("info", "error"))
     parser.add_argument("--config")
+    parser.add_argument("--execution", choices=("direct", "tool_agent", "react", "plan_execute"))
     parser.add_argument("--conv-id")
     parser.add_argument("--input", "--user-input", dest="input")
     try:
@@ -57,7 +58,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run" and (not args.goal or args.run_id or args.recovery or not args.config):
         return _emit({"command": "run", "status": "invalid", "error": "run requires --goal and --config and does not accept --run-id or --recovery"}, EXIT_INVALID_INVOCATION)
-    if args.command == "resume" and (not args.run_id or args.goal or not args.config):
+    if args.command == "resume" and (not args.run_id or args.goal or not args.config or args.execution):
         return _emit({"command": "resume", "status": "invalid", "error": "resume requires --run-id and --config and does not accept --goal"}, EXIT_INVALID_INVOCATION)
     if args.command == "resume":
         try:
@@ -65,14 +66,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError
         except (ValueError, AttributeError):
             return _emit({"command": "resume", "status": "invalid", "error": "resume requires a UUIDv4 --run-id"}, EXIT_INVALID_INVOCATION)
-    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd or args.log_level or args.config):
-            return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, --cwd, --log-level, or --config"}, EXIT_INVALID_INVOCATION)
+    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd or args.log_level or args.config or args.execution):
+            return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, --cwd, --log-level, --config, or --execution"}, EXIT_INVALID_INVOCATION)
     if args.command == "conversation":
         if args.conversation_action == "run" and (not args.input or not args.config or args.goal or args.run_id or args.recovery):
             return _emit({"command": "conversation", "status": "invalid", "error": "conversation run requires --input and --config"}, EXIT_INVALID_INVOCATION)
-        if args.conversation_action == "resume" and (not args.conv_id or not args.config or args.goal or args.run_id or args.input or args.cwd or args.log_level):
+        if args.conversation_action == "resume" and (not args.conv_id or not args.config or args.goal or args.run_id or args.input or args.cwd or args.log_level or args.execution):
             return _emit({"command": "conversation", "status": "invalid", "error": "conversation resume requires --conv-id and --config"}, EXIT_INVALID_INVOCATION)
-        if args.conversation_action == "show" and (not args.conv_id or args.goal or args.run_id or args.recovery or args.config or args.input or args.cwd or args.log_level):
+        if args.conversation_action == "show" and (not args.conv_id or args.goal or args.run_id or args.recovery or args.config or args.input or args.cwd or args.log_level or args.execution):
             return _emit({"command": "conversation", "status": "invalid", "error": "conversation show requires --conv-id and does not accept run options"}, EXIT_INVALID_INVOCATION)
         if args.conversation_action is None:
             return _emit({"command": "conversation", "status": "invalid", "error": "conversation requires run or show"}, EXIT_INVALID_INVOCATION)
@@ -102,6 +103,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 options["cwd"] = args.cwd
             if args.log_level:
                 options["log_level"] = args.log_level
+            if args.execution:
+                options["execution_mode"] = args.execution
             run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, **options)
             result = {"command": args.command, **run}
             result.setdefault("run_id", str(uuid.uuid4()))
@@ -116,15 +119,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, **options)
             result = {"command": args.command, **resumed}
         elif args.conversation_action == "run":
+            conversation_options = {
+                "user_input": args.input,
+                "conv_id": args.conv_id,
+                "configuration": configuration,
+                "cwd": args.cwd,
+                "log_level": args.log_level or "info",
+            }
+            if args.execution:
+                conversation_options["execution_mode"] = args.execution
             result = {
                 "command": "conversation",
                 **run_mysql_conversation(
                     os.environ["CODEX_MYSQL_URL"],
-                    user_input=args.input,
-                    conv_id=args.conv_id,
-                    configuration=configuration,
-                    cwd=args.cwd,
-                    log_level=args.log_level or "info",
+                    **conversation_options,
                 ).as_dict(),
             }
         elif args.conversation_action == "resume":

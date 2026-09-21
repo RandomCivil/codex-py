@@ -10,6 +10,7 @@ from llm.line_protocol import (
     decode_no_tool,
     decode_plan,
     decode_step_completion,
+    normalize_no_tool,
     parse_line_protocol,
 )
 from memory.state import AgentState
@@ -105,17 +106,19 @@ def test_step_completion_allows_empty_declared_scalar_arrays():
 
 def test_no_tool_requires_an_empty_registered_block():
     assert decode_no_tool("BEGIN NO_TOOL\nEND NO_TOOL") is None
+    assert normalize_no_tool("NO_TOOL") == "BEGIN NO_TOOL\nEND NO_TOOL"
+    assert normalize_no_tool("answer\n\n_NO_TOOL_") == "BEGIN NO_TOOL\nEND NO_TOOL"
     with pytest.raises(LineProtocolError):
         decode_no_tool('BEGIN NO_TOOL\nTEXT="no"\nEND NO_TOOL')
 
 
 def test_planner_decodes_plan_protocol_without_provider_format():
-    class Stream:
-        async def stream_text(self, input, *, instructions=None, tools=None):
+    class Completion:
+        async def complete_text(self, input, *, instructions=None, tools=None):
             self.request = {"instructions": instructions}
-            yield 'BEGIN PLAN\nREVISION=1\nGOAL="Prepare release"\nBEGIN STEP\nID="one"\nINTENT="Do one"\nCOMPLETION_CRITERION="One is done"\nEND STEP\nEND PLAN\n'
+            return 'BEGIN PLAN\nREVISION=1\nGOAL="Prepare release"\nBEGIN STEP\nID="one"\nINTENT="Do one"\nCOMPLETION_CRITERION="One is done"\nEND STEP\nEND PLAN\n'
 
-    stream = Stream()
+    stream = Completion()
     plan = asyncio.run(Planner(stream).plan(AgentState("Prepare release")))
 
     assert plan.steps[0].id == "one"
@@ -123,9 +126,9 @@ def test_planner_decodes_plan_protocol_without_provider_format():
 
 
 def test_planner_rejects_malformed_protocol():
-    class Stream:
-        async def stream_text(self, input, *, instructions=None, tools=None):
-            yield "BEGIN PLAN\nREVISION=1\nEND PLAN\n"
+    class Completion:
+        async def complete_text(self, input, *, instructions=None, tools=None):
+            return "BEGIN PLAN\nREVISION=1\nEND PLAN\n"
 
     with pytest.raises(PlanningValidationError):
-        asyncio.run(Planner(Stream()).plan(AgentState("Prepare release")))
+        asyncio.run(Planner(Completion()).plan(AgentState("Prepare release")))

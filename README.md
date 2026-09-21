@@ -207,6 +207,12 @@ poetry run agent run --goal '检查项目中的待办事项并整理摘要' --co
 
 `run` 的 JSON 结果中的 `status` 是所选 Execution mode 的 `completed`、`failed` 或 `blocked` 状态。
 
+默认省略 `--execution` 时由 Task Analyzer 自动选择 mode；也可以显式指定 `direct`、`tool_agent`、`react` 或 `plan_execute`：
+
+```bash
+poetry run agent run --goal '检查项目中的待办事项并整理摘要' --execution react --config agent.yaml --cwd /path/to/project
+```
+
 一个不需要工具的目标可能返回 `direct`，简单工具任务可能返回 `tool_agent`，需要迭代观察时返回 `react`，长流程则返回 `plan_execute`。完整结果还可能包含 `execution`、`analysis` 和分析失败时的安全 `analysis_error`：
 
 ```json
@@ -253,6 +259,12 @@ Conversation 是以 `conv_id` 标识的持久化多轮交互。每个 turn 都�
 
 ```bash
 poetry run agent conversation run --input '整理当前项目的待办事项' --config agent.yaml --cwd /path/to/project
+```
+
+Conversation 也支持通过 `--execution` 显式指定 mode；省略时由 Task Analyzer 选择：
+
+```bash
+poetry run agent conversation run --input '整理当前项目的待办事项' --execution plan_execute --config agent.yaml
 ```
 
 结果会返回本次 turn，而不是完整历史：

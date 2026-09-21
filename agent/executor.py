@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from llm.line_protocol import decode_no_tool, decode_step_completion
+from llm.line_protocol import decode_step_completion
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
 from agent.runtime_context import RuntimeContextPolicy
 from agent.model_request import tool_request_shape, trace_llm_request
@@ -33,6 +33,24 @@ class Executor:
         "If no tool use is needed, return exactly an empty NO_TOOL Line Protocol block. "
         "The Executor will request the STEP_COMPLETION Line Protocol receipt separately."
     )
+    _COMPLETION_INSTRUCTIONS = """Return exactly one STEP_COMPLETION Line Protocol block, with no prose before or after it.
+Every field uses `NAME=JSON_LITERAL`, not `NAME: value`. COMPLETED and
+COMPLETION_CRITERION_MET must be the JSON boolean true. RESULT must be one non-empty JSON
+string literal. FILES_READ, FILES_MODIFIED, and OBSERVATIONS are optional and may each be
+repeated as JSON string literals. Do not call tools.
+
+Example:
+BEGIN STEP_COMPLETION
+COMPLETED=true
+COMPLETION_CRITERION_MET=true
+RESULT="Published"
+FILES_READ="README.md"
+FILES_MODIFIED="release.md"
+OBSERVATIONS="Publication confirmed"
+END STEP_COMPLETION
+
+Set COMPLETED and COMPLETION_CRITERION_MET to true only when the selected Plan-step completion
+criterion is actually met."""
 
     def __init__(
         self,
@@ -276,15 +294,16 @@ class Executor:
                 if message.content:
                     self._trace.llm_text("output", message.content)
             calls = list(getattr(message, "tool_calls", []) or [])
-            content = getattr(message, "content", "")
             # LangGraph's ToolNode requires an AI tool-call message without
             # content. Preserve the provider response in tracing above, then
             # normalize the graph-facing message so accompanying prose never
             # prevents a valid native tool call from running.
             if calls and isinstance(message, AIMessage):
                 message = message.model_copy(update={"content": ""})
-            if not calls:
-                decode_no_tool(content)
+            # Native tool calls are authoritative.  Some OpenAI-compatible
+            # providers return a prose operational summary instead of the
+            # requested NO_TOOL marker; when no native call exists, proceed to
+            # the separately validated STEP_COMPLETION receipt.
             if isinstance(message, AIMessage) and message.tool_calls:
                 self._rounds += 1
                 if self._trace is not None:
@@ -433,7 +452,12 @@ class Executor:
             # The final receipt sees the same Durable State and layered evidence
             # as the last operational request; it never receives trace data.
             context = await self._active_context_policy.maintain(self._active_durable_state)
-            result = [SystemMessage(content=self._INSTRUCTIONS), context.as_messages()[0]]
+            result = [SystemMessage(content=self._COMPLETION_INSTRUCTIONS), context.as_messages()[0]]
+        else:
+            if result and isinstance(result[0], SystemMessage):
+                result = [SystemMessage(content=self._COMPLETION_INSTRUCTIONS), *result[1:]]
+            else:
+                result = [SystemMessage(content=self._COMPLETION_INSTRUCTIONS), *result]
         result.append(HumanMessage(content=prompt))
         trace_llm_request(
             self._trace,

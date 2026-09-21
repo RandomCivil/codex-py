@@ -155,6 +155,27 @@ def test_durable_conversation_runner_uses_the_turn_run_for_run_and_recovery():
     assert durable.calls[0][2]["conversation_input"].current_input == "Ship it"
 
 
+def test_durable_conversation_runner_reports_a_safe_actionable_provider_status():
+    class ProviderFailure(RuntimeError):
+        status_code = 402
+
+    class FailingDurable:
+        async def run(self, *_args, **_kwargs):
+            raise ProviderFailure("provider payload that must not reach the caller")
+
+    answer = asyncio.run(
+        DurableConversationRunner(FailingDurable(), "550e8400-e29b-41d4-a716-446655440002").run(
+            type("Input", (), {"history": (), "current_input": "Ship it"})()
+        )
+    )
+
+    assert answer == ExecutionAnswer(
+        None,
+        "failed",
+        "plan-execute execution failed: provider returned HTTP 402 (Insufficient Balance)",
+    )
+
+
 def test_next_conversation_turn_reconciles_a_standalone_completed_agent_run():
     store = InMemoryConversationStore()
     conv_id = "550e8400-e29b-41d4-a716-446655440003"

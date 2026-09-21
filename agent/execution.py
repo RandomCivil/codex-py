@@ -13,10 +13,11 @@ from langchain_openai import ChatOpenAI
 
 from agent.configuration import ComponentProviderConfiguration
 from agent.model_request import tool_request_shape, trace_llm_context, trace_llm_request
+from agent.planner import PlanningValidationError
 from llm.llm import LLM
 from agent.runtime_context import RuntimeContextPolicy
 from agent.tool_binding import canonical_mcp_tool_set
-from llm.line_protocol import LineProtocolError, decode_answer, decode_goal_completion, decode_no_tool
+from llm.line_protocol import LineProtocolError, decode_answer, decode_goal_completion, decode_no_tool, normalize_no_tool
 
 
 ExecutionStatus = Literal["completed", "failed", "blocked"]
@@ -332,7 +333,7 @@ class ReactMode:
                     calls = list(getattr(response, "tool_calls", []) or [])
                     content = _message_text(response) if getattr(response, "content", None) not in (None, "") else ""
                     if not calls:
-                        decode_no_tool(content)
+                        decode_no_tool(normalize_no_tool(content))
                     # Once Runtime context is active, its instantaneous
                     # snapshot is the only historical source for subsequent
                     # requests.  Keep the legacy transcript only for the
@@ -511,8 +512,23 @@ class PlanExecuteMode:
             if status == "blocked":
                 return ExecutionAnswer(None, "blocked", error="plan-execute run blocked")
             return ExecutionAnswer(None, "failed", error="plan-execute run did not complete")
-        except Exception:
-            return ExecutionAnswer(None, "failed", error="plan-execute execution failed")
+        except Exception as error:
+            return ExecutionAnswer(
+                None,
+                "failed",
+                error=_plan_execute_failure_message(error),
+            )
+
+
+def _plan_execute_failure_message(error: Exception) -> str:
+    """Expose safe, actionable durable-run failures without provider payloads."""
+    if isinstance(error, PlanningValidationError):
+        return f"planning failed: {error}"
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        detail = " (Insufficient Balance)" if status_code == 402 else ""
+        return f"plan-execute execution failed: provider returned HTTP {status_code}{detail}"
+    return "plan-execute execution failed"
 
 
 class _UnavailableMode:

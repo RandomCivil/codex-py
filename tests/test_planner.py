@@ -18,19 +18,18 @@ def plan_document(*, revision=1, goal="Prepare release", step_id="inspect"):
     )
 
 
-class TextStream:
-    def __init__(self, *chunks):
-        self.chunks = chunks
+class TextCompletion:
+    def __init__(self, response):
+        self.response = response
         self.request = None
 
-    async def stream_text(self, input, *, instructions=None, tools=None):
+    async def complete_text(self, input, *, instructions=None, tools=None):
         self.request = {"input": input, "instructions": instructions, "tools": tools}
-        for chunk in self.chunks:
-            yield chunk
+        return self.response
 
 
 def test_planner_decodes_plan_and_prompts_without_provider_formatting():
-    stream = TextStream(plan_document())
+    stream = TextCompletion(plan_document())
     plan = asyncio.run(Planner(stream).plan(AgentState("Prepare release", memory_summary="Version 2.0")))
 
     assert plan.revision == 1
@@ -38,11 +37,16 @@ def test_planner_decodes_plan_and_prompts_without_provider_formatting():
     assert plan.steps[0].id == "inspect"
     assert stream.request["tools"] is None
     assert "BEGIN PLAN" in stream.request["instructions"]
+    assert "REVISION=1" in stream.request["instructions"]
+    assert "REVISION=2" in stream.request["instructions"]
+    assert "BEGIN STEP" in stream.request["instructions"]
+    assert "END STEP" in stream.request["instructions"]
+    assert "ID=\"write_release_notes\"" in stream.request["instructions"]
     assert '"memory_summary": "Version 2.0"' in stream.request["input"]
 
 
 def test_planner_keeps_conversation_history_separate_from_agent_goal():
-    stream = TextStream(plan_document(goal="Continue"))
+    stream = TextCompletion(plan_document(goal="Continue"))
     conversation_input = {"history": [{"sequence": 1, "answer": "Earlier"}], "current_input": "Continue"}
 
     asyncio.run(Planner(stream).plan(AgentState("Continue"), conversation_input=conversation_input))
@@ -62,11 +66,11 @@ def test_planner_keeps_conversation_history_separate_from_agent_goal():
 )
 def test_planner_rejects_invalid_protocol_or_plan_contract(document):
     with pytest.raises(PlanningValidationError):
-        asyncio.run(Planner(TextStream(document)).plan(AgentState("Prepare release")))
+        asyncio.run(Planner(TextCompletion(document)).plan(AgentState("Prepare release")))
 
 
 def test_planner_builds_next_revision_without_mutating_prior_plan():
     prior = Plan(1, "Prepare release", (PlanStep("one", "Inspect", "Done"),))
-    plan = asyncio.run(Planner(TextStream(plan_document(revision=2))).plan(AgentState("Prepare release", plan_history=(prior,))))
+    plan = asyncio.run(Planner(TextCompletion(plan_document(revision=2))).plan(AgentState("Prepare release", plan_history=(prior,))))
     assert plan.revision == 2
     assert prior.revision == 1

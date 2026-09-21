@@ -85,6 +85,72 @@ def test_run_forwards_log_level_to_agent(monkeypatch, capsys, tmp_path):
     assert calls == [("mysql://user:pass@localhost/db", "Prepare release", "error")]
 
 
+def test_run_forwards_explicit_execution_mode_to_agent(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def run(url, goal, execution_mode, **kwargs):
+        calls.append(execution_mode)
+        return {"status": "completed", "execution_mode": execution_mode}
+
+    monkeypatch.setattr("agent.cli.run_agent", run)
+
+    assert main(
+        [
+            "run",
+            "--goal",
+            "Prepare release",
+            "--execution",
+            "react",
+            "--config",
+            _configuration_file(tmp_path),
+        ]
+    ) == 0
+    assert calls == ["react"]
+    assert json.loads(capsys.readouterr().out)["execution_mode"] == "react"
+
+
+def test_run_without_execution_keeps_agent_mode_selection_implicit(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def run(url, goal, **kwargs):
+        calls.append(kwargs)
+        return {"status": "completed"}
+
+    monkeypatch.setattr("agent.cli.run_agent", run)
+
+    assert main(["run", "--goal", "Prepare release", "--config", _configuration_file(tmp_path)]) == 0
+    assert "execution_mode" not in calls[0]
+
+
+def test_conversation_run_forwards_explicit_execution_mode(monkeypatch, capsys, tmp_path):
+    from agent.conversation import ConversationResult
+
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    calls = []
+
+    def run(url, **kwargs):
+        calls.append(kwargs)
+        return ConversationResult("conv", 1, "run", "react", "completed", "Answer")
+
+    monkeypatch.setattr("agent.cli.run_mysql_conversation", run)
+
+    assert main(
+        [
+            "conversation",
+            "run",
+            "--input",
+            "Hello",
+            "--execution",
+            "react",
+            "--config",
+            _configuration_file(tmp_path),
+        ]
+    ) == 0
+    assert calls[0]["execution_mode"] == "react"
+
+
 def test_resume_requires_a_run_id(monkeypatch, capsys):
     monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
 

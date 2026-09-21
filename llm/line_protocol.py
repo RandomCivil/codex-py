@@ -161,6 +161,20 @@ def decode_no_tool(document: str) -> None:
     return None
 
 
+def normalize_no_tool(document: str) -> str:
+    """Normalize known provider no-tool spellings before strict validation."""
+    if not isinstance(document, str):
+        return document
+    stripped = document.strip()
+    if (
+        stripped == "NO_TOOL"
+        or stripped.endswith("\n_NO_TOOL_")
+        or re.search(r"(?:^|\n)```no_tool\s*\n```$", stripped, flags=re.IGNORECASE)
+    ):
+        return "BEGIN NO_TOOL\nEND NO_TOOL"
+    return document
+
+
 def decode_goal_completion(document: str) -> str:
     """Decode a ReAct terminal completion proof."""
     block = parse_line_protocol(document)
@@ -195,12 +209,41 @@ def decode_step_completion(document: str) -> dict[str, Any]:
     return {"result": result.strip(), **arrays}
 
 
-PLAN_INSTRUCTIONS = (
-    "Return exactly one Line Protocol block: BEGIN PLAN ... END PLAN. "
-    "Use REVISION and GOAL scalar fields, then one or more nested STEP blocks; "
-    "each STEP must contain exactly ID, INTENT, and COMPLETION_CRITERION. "
-    "Scalar values must be JSON literals (strings quoted and escaped). Do not output prose."
-)
+PLAN_INSTRUCTIONS = """Return exactly one Line Protocol block, with no prose before or after it.
+Every scalar line uses exactly `FIELD=JSON_LITERAL`; do not use spaces or `:` in place of `=`.
+REVISION must be the JSON integer for this revision, and GOAL must be a JSON string.
+Each step is delimited by `BEGIN STEP` and `END STEP` and contains exactly ID, INTENT,
+and COMPLETION_CRITERION as JSON strings.
+
+Examples:
+
+For a one-step goal:
+BEGIN PLAN
+REVISION=1
+GOAL="Inspect the project"
+BEGIN STEP
+ID="inspect_source"
+INTENT="Locate the relevant source files"
+COMPLETION_CRITERION="Relevant source files are identified"
+END STEP
+END PLAN
+
+For a goal with dependent steps:
+BEGIN PLAN
+REVISION=2
+GOAL="Prepare a release"
+BEGIN STEP
+ID="inspect_changes"
+INTENT="Review the changes included in the release"
+COMPLETION_CRITERION="Release changes and risks are listed"
+END STEP
+BEGIN STEP
+ID="write_release_notes"
+INTENT="Write release notes from the reviewed changes"
+COMPLETION_CRITERION="Release notes cover the listed changes and risks"
+END STEP
+END PLAN
+"""
 
 
 __all__ = [
@@ -212,6 +255,7 @@ __all__ = [
     "decode_answer",
     "decode_goal_completion",
     "decode_no_tool",
+    "normalize_no_tool",
     "parse_line_protocol",
     "decode_step_completion",
 ]

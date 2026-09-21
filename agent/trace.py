@@ -7,6 +7,7 @@ safe for callers that consume stdout as a machine-readable interface.
 import hashlib
 import json
 import sys
+import traceback
 from collections.abc import Mapping
 from typing import Any
 
@@ -223,6 +224,12 @@ class RunTrace:
             f"error={error}"
         )
 
+    def llm_validation_retry(self, component: str, error: Exception) -> None:
+        """Report a structured-output repair attempt without logging its content."""
+        self._line(
+            f"[llm validation retry] component={component} attempt=2 error={error}"
+        )
+
     def plan(self, status: str, revision: int | None = None) -> None:
         suffix = f" revision={revision}" if revision is not None else ""
         self._line(f"[plan] {status}{suffix}")
@@ -282,6 +289,31 @@ class RunTrace:
             self._line(f"[{label}] {name}")
             return
         self._line(f"[{label}] {name} result={_compact(result)}")
+
+    def execution_error(
+        self,
+        component: str,
+        error: BaseException,
+        *,
+        phase: str | None = None,
+        round_number: int | None = None,
+    ) -> None:
+        """Print the original exception and traceback for a failed execution.
+
+        Execution modes deliberately return safe, stable errors to callers.  The
+        trace is the diagnostic channel for the details that must not be folded
+        into that public contract.
+        """
+        label = component.strip() if isinstance(component, str) and component.strip() else "unknown"
+        context = f" component={label}"
+        if phase:
+            context += f" phase={phase}"
+        if round_number is not None:
+            context += f" round={round_number}"
+        self._line(f"[execution error]{context} error={type(error).__name__}: {error}")
+        for line in traceback.format_exception(type(error), error, error.__traceback__):
+            for detail in line.rstrip("\n").splitlines():
+                self._line(f"[execution traceback] {detail}")
 
     def _write(self, label: str, value: Any) -> None:
         text = str(value)

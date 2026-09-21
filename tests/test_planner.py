@@ -19,13 +19,18 @@ def plan_document(*, revision=1, goal="Prepare release", step_id="inspect"):
 
 
 class TextCompletion:
-    def __init__(self, response):
-        self.response = response
-        self.request = None
+    def __init__(self, *responses):
+        self.responses = iter(responses)
+        self.requests = []
 
     async def complete_text(self, input, *, instructions=None, tools=None):
-        self.request = {"input": input, "instructions": instructions, "tools": tools}
-        return self.response
+        request = {"input": input, "instructions": instructions, "tools": tools}
+        self.requests.append(request)
+        return next(self.responses)
+
+    @property
+    def request(self):
+        return self.requests[-1]
 
 
 def test_planner_decodes_plan_and_prompts_without_provider_formatting():
@@ -64,9 +69,21 @@ def test_planner_keeps_conversation_history_separate_from_agent_goal():
         plan_document().replace("END PLAN", "UNKNOWN=true\nEND PLAN"),
     ],
 )
-def test_planner_rejects_invalid_protocol_or_plan_contract(document):
+def test_planner_retries_invalid_protocol_with_validation_feedback(document):
+    stream = TextCompletion(document, plan_document())
+
+    plan = asyncio.run(Planner(stream).plan(AgentState("Prepare release")))
+
+    assert plan.revision == 1
+    assert len(stream.requests) == 2
+    repair = stream.requests[1]["instructions"]
+    assert "Validation error:" in repair
+    assert json.dumps(document) in repair
+
+
+def test_planner_still_rejects_a_second_invalid_response():
     with pytest.raises(PlanningValidationError):
-        asyncio.run(Planner(TextCompletion(document)).plan(AgentState("Prepare release")))
+        asyncio.run(Planner(TextCompletion("not protocol", "still not protocol")).plan(AgentState("Prepare release")))
 
 
 def test_planner_builds_next_revision_without_mutating_prior_plan():

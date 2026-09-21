@@ -480,6 +480,7 @@ async def _select_conversation_mode(
         mode = route(
             await TaskAnalyzer(
                 analyzer_llm,
+                trace=trace,
                 stream=getattr(analyzer_configuration, "stream", True),
             ).run(
                 conversation_input.current_input,

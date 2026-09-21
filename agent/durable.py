@@ -512,7 +512,11 @@ async def _run(
                             )
                             try:
                                 router = _task_router(
-                                    TaskAnalyzer(analyzer_llm, stream=analyzer_configuration.stream),
+                                    TaskAnalyzer(
+                                        analyzer_llm,
+                                        trace=trace,
+                                        stream=analyzer_configuration.stream,
+                                    ),
                                     run_id=run_id,
                                     configuration=configuration,
                                     durable_agent=durable,

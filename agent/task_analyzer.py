@@ -7,7 +7,8 @@ from typing import Any, Literal
 
 from agent.execution import ExecutionAnswer, ExecutionMode, ExecutionModeName
 from llm.line_protocol import CODEC_REGISTRY, LineProtocolError, parse_line_protocol
-from llm.text_stream import TextModel
+from llm.text_stream import TextModel, validated_text
+from agent.model_request import trace_llm_validation_retry
 
 
 TaskType = Literal[
@@ -357,32 +358,35 @@ _TASK_ANALYSIS_PROTOCOL_FIELDS = {
 class TaskAnalyzer:
     """Ask a model for descriptive task characteristics, never a mode choice."""
 
-    def __init__(self, text_stream: TextModel, *, stream: bool = True) -> None:
+    def __init__(self, text_stream: TextModel, *, trace: Any | None = None, stream: bool = True) -> None:
         self._text_stream = text_stream
+        self._trace = trace
         self._stream = stream
 
     async def run(self, goal: str, *, conversation_input: Any = None) -> TaskAnalysis:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
         model_input = _analysis_input(goal, conversation_input)
+        return await validated_text(
+            lambda instructions: self._request_analysis_text(model_input, instructions),
+            instructions=_TASK_ANALYSIS_INSTRUCTIONS,
+            validate=_parse_analysis,
+            on_retry=lambda error: trace_llm_validation_retry(self._trace, "task_analyzer", error),
+        )
+
+    async def _request_analysis_text(self, model_input: str, instructions: str) -> str:
         if self._stream:
-            output = "".join(
+            return "".join(
                 [
                     chunk
                     async for chunk in self._text_stream.stream_text(
-                        model_input,
-                        instructions=_TASK_ANALYSIS_INSTRUCTIONS,
-                        tools=None,
+                        model_input, instructions=instructions, tools=None
                     )
                 ]
             )
-        else:
-            output = await self._text_stream.complete_text(
-                model_input,
-                instructions=_TASK_ANALYSIS_INSTRUCTIONS,
-                tools=None,
-            )
-        return _parse_analysis(output)
+        return await self._text_stream.complete_text(
+            model_input, instructions=instructions, tools=None
+        )
 
 
 def _analysis_input(goal: str, conversation_input: Any = None) -> str:

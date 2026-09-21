@@ -29,6 +29,15 @@ def trace_llm_request(
     trace_llm_context(trace, context)
 
 
+def trace_llm_validation_retry(trace: Any | None, component: str, error: ValueError) -> None:
+    """Record a local-validation repair attempt when tracing is enabled."""
+    if trace is None:
+        return
+    callback = getattr(trace, "llm_validation_retry", None)
+    if callable(callback):
+        callback(component, error)
+
+
 def tool_request_shape(tools: Iterable[Any] | None) -> list[dict[str, Any]]:
     """Describe bound tools for a request-family digest without request content."""
     return [

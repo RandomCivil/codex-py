@@ -1,16 +1,18 @@
 import asyncio
+from io import StringIO
 
 from langchain_core.messages import AIMessage
 
 from agent import PlanningValidationError
 from agent.execution import DirectMode, ExecutionAnswer, PlanExecuteMode, ReactMode, ToolAgentMode
+from agent.trace import RunTrace
 
 
 class TextModel:
-    def __init__(self, response): self.response = response; self.requests = []
+    def __init__(self, *responses): self.responses = iter(responses); self.requests = []
     async def stream_text(self, input, **kwargs):
         self.requests.append((input, kwargs))
-        yield self.response
+        yield next(self.responses)
 
 
 class ToolModel:
@@ -72,7 +74,15 @@ def test_direct_mode_decodes_answer_and_prompts_for_line_protocol():
 
 
 def test_direct_mode_rejects_invalid_answer():
-    assert asyncio.run(DirectMode(TextModel("Ready")).run("Prepare")).status == "failed"
+    model = TextModel("Ready", 'BEGIN ANSWER\nTEXT="Ready"\nEND ANSWER')
+
+    assert asyncio.run(DirectMode(model).run("Prepare")) == ExecutionAnswer("Ready", "completed")
+    assert len(model.requests) == 2
+    assert "Validation error: invalid line or text outside a block" in model.requests[1][1]["instructions"]
+
+
+def test_direct_mode_rejects_a_second_invalid_answer():
+    assert asyncio.run(DirectMode(TextModel("Ready", "Still ready")).run("Prepare")).status == "failed"
 
 
 def test_tool_agent_prompts_for_answer_and_decodes_no_tool_response():
@@ -83,6 +93,21 @@ def test_tool_agent_prompts_for_answer_and_decodes_no_tool_response():
     assert "BEGIN ANSWER" in prompt
     assert "TEXT=<JSON string literal>" in prompt
     assert 'TEXT="A concise answer"' in prompt
+
+
+def test_tool_agent_retries_invalid_no_tool_response_with_validation_feedback():
+    model = ToolModel(
+        AIMessage(content="No tool needed"),
+        AIMessage(content='BEGIN ANSWER\nTEXT="No tool needed"\nEND ANSWER'),
+    )
+
+    answer = asyncio.run(ToolAgentMode(model, Runtime()).run("Answer"))
+
+    assert answer == ExecutionAnswer("No tool needed", "completed")
+    assert len(model.requests) == 2
+    prompt = model.requests[1][0].content
+    assert "Validation error: invalid line or text outside a block" in prompt
+    assert 'Previous response (JSON-encoded): "No tool needed"' in prompt
 
 
 def test_tool_agent_executes_a_tool_call_with_accompanying_text():
@@ -117,3 +142,18 @@ def test_react_executes_tool_calls_with_accompanying_text():
     assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
         {"name": "list_dir", "args": {}, "id": "1"}
     ]
+
+
+def test_react_logs_the_original_exception_before_returning_safe_error():
+    class FailingModel(ToolModel):
+        async def ainvoke(self, messages):
+            raise RuntimeError("provider exploded")
+
+    output = StringIO()
+    trace = RunTrace(output, level="error", run_id="run-123")
+
+    answer = asyncio.run(ReactMode(FailingModel(), Runtime(), trace=trace).run("Inspect"))
+
+    assert answer == ExecutionAnswer(None, "failed", error="react execution failed")
+    assert "[run-123] [execution error] component=react" in output.getvalue()
+    assert "RuntimeError: provider exploded" in output.getvalue()

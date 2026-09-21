@@ -222,6 +222,8 @@ def _run_chat(
 ) -> int:
     current_conv_id = conv_id
     if current_conv_id is not None:
+        history = show_mysql_conversation(url, current_conv_id)
+        _emit_chat_history(history, json_output=json_output)
         try:
             recovered = resume_mysql_conversation(
                 url,
@@ -286,6 +288,28 @@ def _emit_chat_result(result: dict[str, object], *, json_output: bool) -> None:
         print(result["answer"])
     if result.get("error") is not None:
         print(f"Error: {result['error']}")
+
+
+def _emit_chat_history(history: list[dict[str, object]], *, json_output: bool) -> None:
+    if not history:
+        return
+    if json_output:
+        print(
+            json.dumps(
+                {"command": "conversation", "history": history},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        return
+    print("Conversation history:")
+    for turn in history:
+        print(f"Turn {turn['sequence']} ({turn['execution_mode']}) — {turn['status']}")
+        print(f"User: {turn['user_input']}")
+        if turn.get("answer") is not None:
+            print(f"Answer: {turn['answer']}")
+        if turn.get("error") is not None:
+            print(f"Error: {turn['error']}")
 
 
 def _emit_reconnect_guidance(conv_id: str | None) -> None:

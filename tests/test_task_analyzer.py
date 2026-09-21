@@ -131,10 +131,29 @@ class CountingTextStream(TextStream):
             yield chunk
 
 
-def test_task_analyzer_does_not_retry_invalid_protocol_output():
-    text_stream = CountingTextStream("")
+class SequentialTextStream(TextStream):
+    def __init__(self, *responses: str) -> None:
+        super().__init__()
+        self.responses = iter(responses)
+        self.calls = 0
 
+    async def stream_text(self, input, *, instructions=None, tools=None):
+        self.calls += 1
+        self.request = {"input": input, "instructions": instructions, "tools": tools}
+        yield next(self.responses)
+
+
+def test_task_analyzer_retries_invalid_protocol_with_validation_feedback():
+    text_stream = SequentialTextStream("", valid_analysis())
+
+    analysis = asyncio.run(TaskAnalyzer(text_stream).run("Investigate the report"))
+
+    assert analysis.task_type == "research"
+    assert text_stream.calls == 2
+    assert "Validation error: protocol response is empty" in text_stream.request["instructions"]
+    assert 'Previous response (JSON-encoded): ""' in text_stream.request["instructions"]
+
+
+def test_task_analyzer_rejects_a_second_invalid_protocol_output():
     with pytest.raises(TaskAnalysisValidationError):
-        asyncio.run(TaskAnalyzer(text_stream).run("Investigate the report"))
-
-    assert text_stream.calls == 1
+        asyncio.run(TaskAnalyzer(SequentialTextStream("", "")).run("Investigate the report"))

@@ -12,9 +12,10 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 
 from agent.configuration import ComponentProviderConfiguration
-from agent.model_request import tool_request_shape, trace_llm_context, trace_llm_request
+from agent.model_request import tool_request_shape, trace_llm_context, trace_llm_request, trace_llm_validation_retry
 from agent.planner import PlanningValidationError
 from llm.llm import LLM
+from llm.text_stream import validated_text, validation_feedback_instructions
 from agent.runtime_context import RuntimeContextPolicy
 from agent.tool_binding import canonical_mcp_tool_set
 from llm.line_protocol import LineProtocolError, decode_answer
@@ -113,29 +114,29 @@ class DirectMode:
             }
             if not callable(getattr(self._model, "_on_request", None)):
                 trace_llm_context(self._trace, request)
-            if self._stream:
-                output = "".join(
-                    [
-                        chunk
-                        async for chunk in self._model.stream_text(
-                            goal,
-                            tools=None,
-                            **{key: value for key, value in request.items() if key not in {"input", "tools"}},
-                        )
-                    ]
-                )
-            else:
-                output = await self._model.complete_text(
-                    goal,
-                    tools=None,
-                    **{key: value for key, value in request.items() if key not in {"input", "tools"}},
-                )
+            answer = await validated_text(
+                lambda instructions: self._request_answer_text(goal, instructions),
+                instructions=_ANSWER_LINE_PROTOCOL_INSTRUCTIONS,
+                validate=decode_answer,
+                on_retry=lambda error: trace_llm_validation_retry(self._trace, "direct", error),
+            )
+        except LineProtocolError:
+            return ExecutionAnswer(None, "failed", error="direct model returned an invalid ANSWER response")
         except Exception:
             return ExecutionAnswer(None, "failed", error="direct model invocation failed")
-        try:
-            return ExecutionAnswer(decode_answer(output), "completed")
-        except ValueError:
-            return ExecutionAnswer(None, "failed", error="direct model returned an invalid ANSWER response")
+        return ExecutionAnswer(answer, "completed")
+
+    async def _request_answer_text(self, goal: Any, instructions: str) -> str:
+        if self._stream:
+            return "".join(
+                [
+                    chunk
+                    async for chunk in self._model.stream_text(
+                        goal, tools=None, instructions=instructions
+                    )
+                ]
+            )
+        return await self._model.complete_text(goal, tools=None, instructions=instructions)
 
 
 class ToolRuntime:
@@ -226,6 +227,8 @@ class ToolAgentMode:
 
     async def run(self, goal: Any) -> ExecutionAnswer:
         goal = conversation_model_input(goal)
+        round_number = 0
+        phase = "runtime setup"
         try:
             async with self._runtime as runtime:
                 tools = canonical_mcp_tool_set(runtime.tools)
@@ -245,7 +248,26 @@ class ToolAgentMode:
                 _trace_llm_response(self._trace, response)
                 calls = list(getattr(response, "tool_calls", []) or [])
                 if not calls:
-                    return ExecutionAnswer(decode_answer(_message_text(response)), "completed")
+                    try:
+                        return ExecutionAnswer(decode_answer(_message_text(response)), "completed")
+                    except LineProtocolError as error:
+                        trace_llm_validation_retry(self._trace, "tool_agent", error)
+                        response = await bound.ainvoke(
+                            [
+                                SystemMessage(
+                                    content=validation_feedback_instructions(
+                                        _TOOL_AGENT_INSTRUCTIONS,
+                                        error,
+                                        _message_text(response),
+                                    )
+                                ),
+                                HumanMessage(content=goal),
+                            ]
+                        )
+                        _trace_llm_response(self._trace, response)
+                        calls = list(getattr(response, "tool_calls", []) or [])
+                        if not calls:
+                            return ExecutionAnswer(decode_answer(_message_text(response)), "completed")
                 for ignored in calls[1:]:
                     if self._trace is not None:
                         _trace_ignored(self._trace, ignored)
@@ -312,6 +334,7 @@ class ReactMode:
                 for round_number in range(1, self._max_rounds + 1):
                     request_messages = messages
                     if policy is not None:
+                        phase = "runtime context maintenance"
                         policy.record_model_use()
                         context = await policy.maintain({"goal": goal})
                         # The policy-owned window is the sole historical source
@@ -330,8 +353,10 @@ class ReactMode:
                             "request_kind": "tool_round",
                         },
                     )
+                    phase = "model invocation"
                     response = await model.ainvoke(request_messages)
                     _trace_llm_response(self._trace, response)
+                    phase = "model response processing"
                     calls = list(getattr(response, "tool_calls", []) or [])
                     content = _message_text(response) if getattr(response, "content", None) not in (None, "") else ""
                     if not calls:
@@ -344,10 +369,12 @@ class ReactMode:
                         messages.append(response)
                     if round_number == self._max_rounds:
                         return ExecutionAnswer(None, "failed", error="react round budget exhausted")
+                    phase = "tool execution"
                     results = await asyncio.gather(
                         *(self._invoke_for_react(runtime, call) for call in calls)
                     )
                     if policy is not None:
+                        phase = "runtime context recording"
                         await policy.record_tool_round(
                             round_number,
                             calls,
@@ -365,12 +392,20 @@ class ReactMode:
                             for call, (content, is_error, _) in zip(calls, results)
                         )
         except LineProtocolError as error:
+            if self._trace is not None:
+                self._trace.execution_error(
+                    "react", error, phase=phase, round_number=round_number or None
+                )
             return ExecutionAnswer(
                 None,
                 "failed",
                 error=f"react model returned an invalid protocol response: {error}",
             )
-        except Exception:
+        except Exception as error:
+            if self._trace is not None:
+                self._trace.execution_error(
+                    "react", error, phase=phase, round_number=round_number or None
+                )
             return ExecutionAnswer(None, "failed", error="react execution failed")
 
         return ExecutionAnswer(None, "failed", error="react execution failed")

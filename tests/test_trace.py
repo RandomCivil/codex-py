@@ -15,6 +15,16 @@ def test_execute_trace_includes_current_plan_step_progress():
     )
 
 
+def test_validation_retry_trace_identifies_component_attempt_and_error():
+    output = StringIO()
+
+    RunTrace(output).llm_validation_retry("planner", ValueError("PLAN must contain a STEP"))
+
+    assert output.getvalue().strip() == (
+        "[llm validation retry] component=planner attempt=2 error=PLAN must contain a STEP"
+    )
+
+
 def test_model_request_usage_is_attributed_to_a_safe_deterministic_request_family():
     first_output = StringIO()
     first = RunTrace(first_output, level="error")
@@ -286,6 +296,21 @@ def test_trace_reports_task_routing_and_safe_analysis_fallback():
         "[run-123] [task route] mode=react",
         "[run-123] [task route] mode=plan_execute reason=task_analysis_failed",
     ]
+
+
+def test_trace_prints_detailed_execution_exception_with_context_and_traceback():
+    output = StringIO()
+    trace = RunTrace(output, level="error", run_id="run-123")
+
+    try:
+        raise RuntimeError("provider exploded")
+    except RuntimeError as error:
+        trace.execution_error("react", error, phase="model invocation", round_number=2)
+
+    logged = output.getvalue()
+    assert "[run-123] [execution error] component=react phase=model invocation round=2" in logged
+    assert "RuntimeError: provider exploded" in logged
+    assert "test_trace_prints_detailed_execution_exception_with_context_and_traceback" in logged
 
 
 def test_trace_prints_llm_context():

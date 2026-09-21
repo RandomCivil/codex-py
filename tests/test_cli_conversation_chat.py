@@ -17,6 +17,11 @@ def _configuration_file(tmp_path):
     return str(path)
 
 
+@pytest.fixture(autouse=True)
+def _empty_chat_history(monkeypatch):
+    monkeypatch.setattr("agent.cli.show_mysql_conversation", lambda *args: [])
+
+
 def test_chat_creates_a_conversation_only_after_first_nonempty_input(
     monkeypatch, capsys, tmp_path
 ):
@@ -238,6 +243,58 @@ def test_chat_recovers_reconnected_conversation_before_first_prompt(
     assert events[2][0] == "run"
     assert events[2][2]["conv_id"] == "conv"
     assert events[2][2]["execution_mode"] == "direct"
+
+
+def test_chat_lists_existing_history_before_first_prompt(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("CODEX_MYSQL_URL", "mysql://user:pass@localhost/db")
+    history = [
+        {
+            "sequence": 1,
+            "user_input": "先检查项目",
+            "execution_mode": "react",
+            "run_id": "run-1",
+            "status": "completed",
+            "answer": "项目已检查",
+            "error": None,
+        },
+        {
+            "sequence": 2,
+            "user_input": "继续分析",
+            "execution_mode": "direct",
+            "run_id": "run-2",
+            "status": "failed",
+            "answer": None,
+            "error": "provider unavailable",
+        },
+    ]
+    monkeypatch.setattr("agent.cli.show_mysql_conversation", lambda *args: history)
+    monkeypatch.setattr(
+        "agent.cli.resume_mysql_conversation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ConversationError("conversation has no active turn")
+        ),
+    )
+    observed = []
+
+    def get_input(prompt):
+        observed.append(capsys.readouterr().out)
+        return "/exit"
+
+    monkeypatch.setattr("builtins.input", get_input)
+
+    assert main(
+        ["conversation", "chat", "--conv-id", "conv", "--config", _configuration_file(tmp_path)]
+    ) == 0
+
+    assert observed == [
+        "Conversation history:\n"
+        "Turn 1 (react) — completed\n"
+        "User: 先检查项目\n"
+        "Answer: 项目已检查\n"
+        "Turn 2 (direct) — failed\n"
+        "User: 继续分析\n"
+        "Error: provider unavailable\n"
+    ]
 
 
 def test_chat_keeps_existing_ephemeral_recovery_handling(monkeypatch, capsys, tmp_path):

@@ -32,6 +32,7 @@ from .runtime_context import (
     RawToolResult,
     RuntimeContext,
     RuntimeContextPolicy,
+    classify_exec_command,
 )
 from .conversation import (
     Conversation,
@@ -46,4 +47,4 @@ from .conversation import (
     resume_mysql_conversation,
 )
 
-__all__ = ["Agent", "AgentResult", "Executor", "Planner", "PlanningValidationError", "TaskAnalysis", "TaskAnalysisValidationError", "TaskAnalyzer", "TaskRouter", "RoutedExecutionAnswer", "route", "PersistenceError", "RecoveryDecisionError", "ConfigurationError", "ComponentProviderConfiguration", "ProviderConfiguration", "load_configuration", "apply_recovery_decision", "mark_stale_execution_interrupted", "ContextUpdate", "ExecutionOutcome", "StepContext", "ExecutionAnswer", "ExecutionMode", "DirectMode", "ToolRuntime", "ToolAgentMode", "ReactMode", "PlanExecuteMode", "render_tool_result", "create_execution_mode", "DEFAULT_CONTEXT_BUDGET", "ContextMaintenanceError", "Evidence", "Observation", "ObservationOutcome", "RawToolCall", "RawToolResult", "RuntimeContext", "RuntimeContextPolicy", "Conversation", "ConversationTurn", "ConversationInput", "ConversationResult", "ConversationService", "ConversationBusyError", "ConversationNotFoundError", "InMemoryConversationStore", "MySQLConversationStore", "resume_mysql_conversation"]
+__all__ = ["Agent", "AgentResult", "Executor", "Planner", "PlanningValidationError", "TaskAnalysis", "TaskAnalysisValidationError", "TaskAnalyzer", "TaskRouter", "RoutedExecutionAnswer", "route", "PersistenceError", "RecoveryDecisionError", "ConfigurationError", "ComponentProviderConfiguration", "ProviderConfiguration", "load_configuration", "apply_recovery_decision", "mark_stale_execution_interrupted", "ContextUpdate", "ExecutionOutcome", "StepContext", "ExecutionAnswer", "ExecutionMode", "DirectMode", "ToolRuntime", "ToolAgentMode", "ReactMode", "PlanExecuteMode", "render_tool_result", "create_execution_mode", "DEFAULT_CONTEXT_BUDGET", "ContextMaintenanceError", "Evidence", "Observation", "ObservationOutcome", "RawToolCall", "RawToolResult", "RuntimeContext", "RuntimeContextPolicy", "classify_exec_command", "Conversation", "ConversationTurn", "ConversationInput", "ConversationResult", "ConversationService", "ConversationBusyError", "ConversationNotFoundError", "InMemoryConversationStore", "MySQLConversationStore", "resume_mysql_conversation"]

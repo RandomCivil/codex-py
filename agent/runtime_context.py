@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
 
@@ -19,6 +20,8 @@ from llm.line_protocol import LineProtocolError, parse_line_protocol
 
 DEFAULT_CONTEXT_BUDGET = 128_000
 RAW_ROUND_WINDOW = 3
+
+EvidenceLifecycle = Literal["recent_raw", "permanent_raw", "observation"]
 
 
 _OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
@@ -107,6 +110,7 @@ class ObservationOutcome:
     round: int
     status: Literal["pending", "succeeded", "provider_error", "invalid", "cancelled"]
     error: str | None = None
+    tool_call_id: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +120,7 @@ class RawToolCall:
     arguments: Mapping[str, Any]
     result: Any = None
     error: str | None = None
+    lifecycle: EvidenceLifecycle = "observation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,8 +161,10 @@ class RuntimeContextPolicy:
         self._trace = trace
         self._raw: list[RawToolResult] = []
         self._observations: list[Observation] = []
-        self._observation_outcomes: dict[int, ObservationOutcome] = {}
+        self._observation_outcomes: dict[tuple[int, str], ObservationOutcome] = {}
         self._observation_tasks: set[asyncio.Task[Any]] = set()
+        self._call_order: dict[tuple[int, str], int] = {}
+        self._next_call_order = 0
         self._model_uses = 0
         self._tool_rounds = 0
 
@@ -171,8 +178,8 @@ class RuntimeContextPolicy:
 
     @property
     def observation_outcomes(self) -> tuple[ObservationOutcome, ...]:
-        """Return transient diagnostics in settled Tool-round order."""
-        return tuple(self._observation_outcomes[item.round] for item in self._raw)
+        """Return transient diagnostics in Observation-start order."""
+        return tuple(self._observation_outcomes.values())
 
     def fresh_for_invocation(self) -> RuntimeContextPolicy:
         """Create an equivalent policy with no transient Tool-round history."""
@@ -215,46 +222,51 @@ class RuntimeContextPolicy:
                     dict(call.get("args") or {}),
                     result=result,
                     error=error or _result_error(result),
+                    lifecycle=_native_evidence_lifecycle(
+                        str(call.get("name") or "unknown"), call.get("args") or {}
+                    ),
                 )
                 for call, result, error in zip(calls, results, errors)
             ),
         )
         self._raw.append(raw)
         self._tool_rounds += 1
+        for call in raw.calls:
+            self._call_order[(raw.round, call.tool_call_id)] = self._next_call_order
+            self._next_call_order += 1
         self._expire_observations()
-        self._set_observation_outcome(raw.round, "pending")
-        task = asyncio.create_task(self._observe(raw))
-        self._observation_tasks.add(task)
-        task.add_done_callback(self._observation_finished)
-        await asyncio.sleep(0)
+        for call in (call for call in raw.calls if call.lifecycle == "observation"):
+            observation_raw = RawToolResult(raw.round, (call,))
+            self._set_observation_outcome(raw.round, call.tool_call_id, "pending")
+            task = asyncio.create_task(self._observe(observation_raw))
+            self._observation_tasks.add(task)
+            task.add_done_callback(self._observation_finished)
+            await asyncio.sleep(0)
         return raw
 
     def assemble(self, durable_state: Any) -> RuntimeContext:
         """Assemble Durable State, older Observations, and recent Raw results."""
         recent_rounds = {item.round for item in self._raw[-self.raw_rounds :]}
-        observations = tuple(
-            item
+        observations = tuple(self._observations)
+        observed_call_ids = {
+            call_id
             for item in self._observations
-            if not all(
-                round_number in recent_rounds
-                for round_number in range(
-                    item.source_round_start or item.round,
-                    (item.source_round_end or item.round) + 1,
-                )
-            )
-        )
-        observed_rounds = {
-            round_number
-            for item in self._observations
-            for round_number in range(
-                item.source_round_start or item.round,
-                (item.source_round_end or item.round) + 1,
-            )
+            for call_id in item.source_tool_call_ids
         }
         raw_results = tuple(
-            item
+            RawToolResult(
+                item.round,
+                tuple(
+                    call
+                    for call in item.calls
+                    if _is_visible_call(call, item.round, recent_rounds, observed_call_ids)
+                ),
+            )
             for item in self._raw
-            if item.round in recent_rounds or item.round not in observed_rounds
+            if any(
+                _is_visible_call(call, item.round, recent_rounds, observed_call_ids)
+                for call in item.calls
+            )
         )
         return RuntimeContext(durable_state, observations, raw_results)
 
@@ -283,33 +295,49 @@ class RuntimeContextPolicy:
         return None
 
     async def _observe(self, raw: RawToolResult) -> None:
+        call_id = raw.calls[0].tool_call_id
         try:
             observation = await self._request_observation(raw)
         except asyncio.CancelledError:
-            self._set_observation_outcome(raw.round, "cancelled", "Observation task was cancelled")
+            self._set_observation_outcome(
+                raw.round, call_id, "cancelled", "Observation task was cancelled"
+            )
         except _ObservationProviderError as error:
-            self._set_observation_outcome(raw.round, "provider_error", str(error))
+            self._set_observation_outcome(raw.round, call_id, "provider_error", str(error))
         except _ObservationValidationError as error:
-            self._set_observation_outcome(raw.round, "invalid", str(error))
+            self._set_observation_outcome(raw.round, call_id, "invalid", str(error))
         except ContextMaintenanceError as error:
-            self._set_observation_outcome(raw.round, "invalid", str(error))
+            self._set_observation_outcome(raw.round, call_id, "invalid", str(error))
             return
         else:
             self._observations.append(observation)
-            self._observations.sort(key=_observation_start_round)
-            self._set_observation_outcome(raw.round, "succeeded")
+            self._observations.sort(key=self._observation_order)
+            self._set_observation_outcome(raw.round, call_id, "succeeded")
+
+    def _observation_order(self, observation: Observation) -> tuple[int, int]:
+        source_round = observation.source_round_start or observation.round
+        source_order = min(
+            (
+                self._call_order.get((source_round, call_id), self._next_call_order)
+                for call_id in observation.source_tool_call_ids
+            ),
+            default=self._next_call_order,
+        )
+        return source_order, source_round
 
     def _set_observation_outcome(
         self,
         round: int,
+        tool_call_id: str,
         status: Literal["pending", "succeeded", "provider_error", "invalid", "cancelled"],
         error: str | None = None,
     ) -> None:
-        self._observation_outcomes[round] = ObservationOutcome(round, status, error)
+        outcome = ObservationOutcome(round, status, error, tool_call_id)
+        self._observation_outcomes[(round, tool_call_id)] = outcome
         if self._trace is not None:
             callback = getattr(self._trace, "runtime_context_observation", None)
             if callback is not None:
-                callback(self._observation_outcomes[round])
+                callback(outcome)
 
     def _observation_finished(self, task: asyncio.Task[Any]) -> None:
         self._observation_tasks.discard(task)
@@ -322,7 +350,11 @@ class RuntimeContextPolicy:
             ],
             request_kind="observation",
         )
-        return _parse_observation(response, expected_round=raw.round)
+        return _parse_observation(
+            response,
+            expected_round=raw.round,
+            expected_tool_call_id=raw.calls[0].tool_call_id,
+        )
 
     async def _merge_observations(self, first: Observation, second: Observation) -> Observation:
         response = await self._structured_invoke(
@@ -391,7 +423,12 @@ class RuntimeContextPolicy:
             raise _ObservationProviderError(str(error) or "Runtime context model request failed") from error
 
 
-def _parse_observation(response: Any, *, expected_round: int) -> Observation:
+def _parse_observation(
+    response: Any,
+    *,
+    expected_round: int,
+    expected_tool_call_id: str | None = None,
+) -> Observation:
     content = getattr(response, "content", response)
     if not isinstance(content, str):
         raise _ObservationValidationError("Observation protocol response must be text")
@@ -424,7 +461,21 @@ def _parse_observation(response: Any, *, expected_round: int) -> Observation:
             if not isinstance(text, str) or not text.strip() or not ids or any(not isinstance(item, str) for item in ids):
                 raise ValueError("evidence")
             parsed[category] += (Evidence(text, tuple(ids)),)
-        return Observation(expected_round, **parsed, source_round_start=source_start, source_round_end=source_end)
+        observation = Observation(
+            expected_round,
+            **parsed,
+            source_round_start=source_start,
+            source_round_end=source_end,
+        )
+        if expected_tool_call_id is not None:
+            source_ids = set(observation.source_tool_call_ids)
+            if source_ids != {expected_tool_call_id}:
+                raise ValueError("source tool-call attribution")
+            if source_start is not None and (
+                source_start != expected_round or source_end != expected_round
+            ):
+                raise ValueError("source round attribution")
+        return observation
     except (KeyError, TypeError, ValueError, LineProtocolError) as error:
         raise _ObservationValidationError(
             f"Observation Line Protocol is invalid: {error}"
@@ -451,6 +502,69 @@ def _result_error(result: Any) -> str | None:
     if isinstance(result, Mapping) and (result.get("error") or result.get("isError") is True):
         return str(result.get("error") or result)
     return None
+
+
+def _is_visible_call(
+    call: RawToolCall,
+    round: int,
+    recent_rounds: set[int],
+    observed_call_ids: set[str],
+) -> bool:
+    return (
+        (call.lifecycle == "recent_raw" and round in recent_rounds)
+        or call.lifecycle == "permanent_raw"
+        or (call.lifecycle == "observation" and call.tool_call_id not in observed_call_ids)
+    )
+
+
+def classify_exec_command(command: Any) -> EvidenceLifecycle:
+    """Classify a shell command without executing or expanding it.
+
+    Only one top-level command from the explicitly allow-listed command sets is
+    considered readable.  Any shell syntax that could make the command's
+    effects uncertain receives the write-class Observation lifecycle.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return "observation"
+    if _contains_uncertain_shell_syntax(command):
+        return "observation"
+    try:
+        words = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return "observation"
+    if not words:
+        return "observation"
+    if words[0] in {"ls", "find", "fd"}:
+        return "recent_raw"
+    if words[0] in {"rg", "grep", "cat", "sed", "head", "tail"}:
+        return "permanent_raw"
+    return "observation"
+
+
+def _contains_uncertain_shell_syntax(command: str) -> bool:
+    quote: str | None = None
+    for character in command:
+        if quote is not None:
+            if quote == '"' and character in {"$", "`", "\\"}:
+                return True
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "|&;()<>`$#\\\n\r":
+            return True
+    return quote is not None
+
+
+def _native_evidence_lifecycle(name: str, arguments: Mapping[str, Any] | None = None) -> EvidenceLifecycle:
+    if name in {"list_dir", "glob"}:
+        return "recent_raw"
+    if name in {"grep", "read_file"}:
+        return "permanent_raw"
+    if name in {"exec", "atom.exec"}:
+        return classify_exec_command((arguments or {}).get("command"))
+    return "observation"
 
 
 def _evidence_payload(item: Evidence) -> dict[str, Any]:

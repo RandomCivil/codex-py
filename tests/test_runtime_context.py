@@ -227,15 +227,15 @@ def test_pending_old_observation_remains_raw_until_a_later_snapshot():
         await model.started.wait()
 
         pending = policy.assemble({"goal": "inspect"})
-        assert [item.round for item in pending.raw_tool_results] == [1, 2, 3, 4]
-        assert pending.observations == ()
+        assert [item.round for item in pending.raw_tool_results] == [1]
+        assert [item.round for item in pending.observations] == [2, 3, 4]
 
         model.release.set()
         await asyncio.sleep(0.01)
 
         ready = policy.assemble({"goal": "inspect"})
-        assert [item.round for item in ready.raw_tool_results] == [2, 3, 4]
-        assert [item.round for item in ready.observations] == [1]
+        assert ready.raw_tool_results == ()
+        assert [item.round for item in ready.observations] == [1, 2, 3, 4]
         assert ready.observations[0].source_tool_call_ids == ("call-1",)
 
     asyncio.run(run())
@@ -263,7 +263,7 @@ def test_policy_logs_observation_model_response():
     asyncio.run(
         policy.record_tool_round(
             1,
-            [{"id": "call-1", "name": "read_file", "args": {}}],
+            [{"id": "call-1", "name": "unknown_read", "args": {}}],
             ["ok"],
         )
     )
@@ -302,11 +302,19 @@ class MergeObservationModel(SequencedObservationModel):
             second_round = observations[1]["round"]
             return AIMessage(
                 content=observation_protocol(
-                    {
-                        "round": second_round,
-                        "confirmed_facts": [
-                            {"text": "facts 1-2", "tool_call_ids": ["call-1", "call-2"]}
-                        ],
+                {
+                    "round": second_round,
+                    "confirmed_facts": [
+                        {
+                            "text": "merged facts",
+                            "tool_call_ids": [
+                                call_id
+                                for observation in observations
+                                for fact in observation["confirmed_facts"]
+                                for call_id in fact["tool_call_ids"]
+                            ],
+                        }
+                    ],
                         "reported_errors": [],
                         "model_inferences": [],
                     }
@@ -354,10 +362,9 @@ def test_policy_records_complete_round_and_validated_observation():
 
     context = policy.assemble(durable_state={"goal": "inspect"})
     assert context.raw_tool_results[0].round == 1
-    assert [item.tool_call_id for item in context.raw_tool_results[0].calls] == ["call-1", "call-2"]
-    assert context.raw_tool_results[0].calls[0].arguments == {"path": "pyproject.toml"}
-    assert context.raw_tool_results[0].calls[1].result == {"error": "missing"}
-    assert context.observations == ()
+    assert [item.tool_call_id for item in context.raw_tool_results[0].calls] == ["call-2"]
+    assert context.raw_tool_results[0].calls[0].result == {"error": "missing"}
+    assert context.observations[0].source_tool_call_ids == ("call-1",)
     assert policy.observations[0].round == 1
     assert policy.observations[0].confirmed_facts[0].tool_call_ids == ("call-1",)
     assert model.bind_options["tools"] == []
@@ -477,8 +484,8 @@ def test_policy_moves_only_the_fourth_oldest_round_to_observation_context():
     asyncio.run(run())
     context = policy.assemble(durable_state={"goal": "inspect"})
 
-    assert [item.round for item in context.raw_tool_results] == [2, 3, 4]
-    assert [item.round for item in context.observations] == [1]
+    assert context.raw_tool_results == ()
+    assert [item.round for item in context.observations] == [1, 2, 3, 4]
     assert context.observations[0].confirmed_facts[0].text == "fact-1"
 
 
@@ -543,9 +550,15 @@ def test_policy_merges_oldest_expired_observations_and_preserves_source_range(mo
     context = asyncio.run(run())
 
     assert context.observations[0].source_round_start == 1
-    assert context.observations[0].source_round_end == 2
-    assert context.observations[0].source_tool_call_ids == ("call-1", "call-2")
-    assert [item.round for item in context.raw_tool_results] == [3, 4, 5]
+    assert context.observations[0].source_round_end == 5
+    assert context.observations[0].source_tool_call_ids == (
+        "call-1",
+        "call-2",
+        "call-3",
+        "call-4",
+        "call-5",
+    )
+    assert context.raw_tool_results == ()
     merge_contract, merge_evidence = next(
         call for call in model.calls if len(call) == 2 and "Merge the Observations" in call[0].content
     )
@@ -615,8 +628,14 @@ def test_policy_merges_observations_in_round_order_after_out_of_order_completion
 
     assert [item["round"] for item in model.merge_payloads[0]] == [1, 2]
     assert context.observations[0].source_round_start == 1
-    assert context.observations[0].source_round_end == 2
-    assert context.observations[0].source_tool_call_ids == ("call-1", "call-2")
+    assert context.observations[0].source_round_end == 5
+    assert context.observations[0].source_tool_call_ids == (
+        "call-1",
+        "call-2",
+        "call-3",
+        "call-4",
+        "call-5",
+    )
 
 
 def test_observation_merge_request_puts_fixed_contract_before_observations(monkeypatch):
@@ -635,7 +654,9 @@ def test_observation_merge_request_puts_fixed_contract_before_observations(monke
 
     asyncio.run(run())
 
-    contract, evidence = model.calls[-1]
+    contract, evidence = next(
+        call for call in model.calls if len(call) == 2 and "Merge the Observations" in call[0].content
+    )
 
     assert "Merge the Observations" in contract.content
     assert "call-1" not in contract.content
@@ -664,7 +685,9 @@ def test_observation_merge_request_omits_provider_response_format(monkeypatch):
 
     asyncio.run(run())
 
-    contract, evidence = model.calls[-1]
+    contract, evidence = next(
+        call for call in model.calls if len(call) == 2 and "Merge the Observations" in call[0].content
+    )
 
     assert "BEGIN OBSERVATION" in contract.content
     assert "call-1" not in contract.content
@@ -672,9 +695,9 @@ def test_observation_merge_request_omits_provider_response_format(monkeypatch):
     assert model.bind_options == {"tools": []}
 
 
-def test_policy_fails_instead_of_merging_an_observation_with_a_recent_raw_round(monkeypatch):
+def test_policy_can_merge_validated_observations_from_recent_rounds(monkeypatch):
     monkeypatch.setattr("agent.runtime_context._estimate_tokens", lambda context: 2)
-    policy = RuntimeContextPolicy(SequencedObservationModel(), budget=1)
+    policy = RuntimeContextPolicy(MergeObservationModel(), budget=1)
 
     async def run():
         for round_number in range(1, 5):

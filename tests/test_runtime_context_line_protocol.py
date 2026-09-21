@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from langchain_core.messages import AIMessage
 
@@ -27,20 +28,25 @@ class MergeLineProtocolModel(ObservationLineProtocolModel):
 
     async def ainvoke(self, messages):
         self.calls.append(messages)
-        payload = messages[1].content
-        if '"source_round_start"' in payload:
+        payload = json.loads(messages[1].content)
+        if isinstance(payload, list):
+            source_ids = [
+                call_id
+                for observation in payload
+                for evidence in observation["confirmed_facts"]
+                for call_id in evidence["tool_call_ids"]
+            ]
             return AIMessage(
                 content="\n".join(
                     [
                         "BEGIN OBSERVATION",
-                        "ROUND=2",
-                        "SOURCE_ROUND_START=1",
-                        "SOURCE_ROUND_END=2",
+                        f"ROUND={payload[-1]['round']}",
+                        f"SOURCE_ROUND_START={payload[0]['source_round_start']}",
+                        f"SOURCE_ROUND_END={payload[-1]['source_round_end']}",
                         "BEGIN EVIDENCE",
                         'CATEGORY="confirmed_facts"',
-                        'TEXT="facts 1-2"',
-                        'TOOL_CALL_ID="call-1"',
-                        'TOOL_CALL_ID="call-2"',
+                        'TEXT="merged facts"',
+                        *[f'TOOL_CALL_ID="{call_id}"' for call_id in source_ids],
                         "END EVIDENCE",
                         "END OBSERVATION",
                     ]
@@ -156,8 +162,14 @@ def test_observation_merge_decodes_source_range_and_preserves_tool_call_provenan
 
     merged = context.observations[0]
     assert merged.source_round_start == 1
-    assert merged.source_round_end == 2
-    assert merged.source_tool_call_ids == ("call-1", "call-2")
+    assert merged.source_round_end == 5
+    assert merged.source_tool_call_ids == (
+        "call-1",
+        "call-2",
+        "call-3",
+        "call-4",
+        "call-5",
+    )
     assert "BEGIN OBSERVATION" in next(
         call[0].content for call in model.calls if "Merge the Observations" in call[0].content
     )

@@ -44,7 +44,7 @@ def configuration_snapshot(
 ) -> dict[str, Any]:
     """Return effective non-secret component and execution configuration."""
     if planner is None:
-        planner = {"base_url": base_url or "", "model_name": model or "", "response_format": "json_schema"}
+        planner = {"base_url": base_url or "", "model_name": model or ""}
     if executor is None:
         executor = planner
     if task_analyzer is None:
@@ -64,7 +64,6 @@ def _provider_snapshot(provider: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "base_url": provider["base_url"],
         "model_name": provider["model_name"],
-        "response_format": provider["response_format"],
     }
 
 

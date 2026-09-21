@@ -1,814 +1,131 @@
 import asyncio
-import json
 
 from langchain_core.messages import AIMessage
 
-from agent import ExecutionAnswer, create_execution_mode
-from agent.conversation import ConversationInput
-from agent.runtime_context import RuntimeContext, RuntimeContextPolicy
-from agent.configuration import load_configuration
+from agent.execution import DirectMode, ExecutionAnswer, ReactMode, ToolAgentMode
 
 
-class ControlledTextModel:
-    def __init__(self, chunks):
-        self.chunks = chunks
-        self.calls = []
-
+class TextModel:
+    def __init__(self, response): self.response = response; self.requests = []
     async def stream_text(self, input, **kwargs):
-        self.calls.append((input, kwargs))
-        for chunk in self.chunks:
-            yield chunk
+        self.requests.append((input, kwargs))
+        yield self.response
 
 
-class FailingTextModel:
-    def __init__(self, error):
-        self.error = error
-        self.calls = 0
-
-    async def stream_text(self, input, **kwargs):
-        self.calls += 1
-        raise self.error
-        yield  # keep this an async generator
-
-
-class ControlledToolModel:
-    def __init__(self, response):
-        self.response = response
-        self.calls = []
-
-    def bind_tools(self, tools):
-        self.tools = tools
-        return self
-
-    async def ainvoke(self, input):
-        self.calls.append(input)
-        return self.response
-
-
-class StructuredToolModel(ControlledToolModel):
-    def __init__(self, response):
-        super().__init__(response)
-        self.response_format_bindings = []
-
-    def bind(self, **kwargs):
-        self.response_format_bindings.append(kwargs)
-        return self
-
-
-class TerminalStructuredModel:
-    def __init__(self):
-        self.operational_calls = []
-        self.completion_calls = []
-        self.operational_response_formats = []
-        self.response_format_bindings = []
-        self._operational_responses = iter(
-            [
-                AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "call-1"}]),
-                AIMessage(content="The tool result is sufficient."),
-            ]
-        )
-
-    def bind_tools(self, tools, *, response_format=None):
-        self.tools = tools
-        self.operational_response_formats.append(response_format)
-        return self
-
-    async def ainvoke(self, input):
-        self.operational_calls.append(list(input))
-        return next(self._operational_responses)
-
-    def bind(self, **kwargs):
-        self.response_format_bindings.append(kwargs)
-        return TerminalCompletionModel(self)
-
-
-class TerminalCompletionModel:
-    def __init__(self, parent):
-        self.parent = parent
-
-    async def ainvoke(self, input):
-        self.parent.completion_calls.append(list(input))
-        return AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
-
-
-class SequencedToolModel:
-    def __init__(self, responses):
-        self.responses = iter(responses)
-        self.calls = []
-
-    def bind_tools(self, tools):
-        self.tools = tools
-        return self
-
-    async def ainvoke(self, input):
-        self.calls.append(list(input))
+class ToolModel:
+    def __init__(self, *responses): self.responses = iter(responses); self.requests = []; self.tools = None
+    def bind_tools(self, tools): self.tools = tools; return self
+    async def ainvoke(self, messages):
+        self.requests.append(messages)
         return next(self.responses)
 
 
-class ToolRuntime:
-    def __init__(self, result):
-        self.result = result
-        self.calls = []
-        self.closed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        self.closed = True
-
-    @property
-    def tools(self):
-        return ["first", "second"]
-
-    async def invoke(self, call):
-        self.calls.append(call)
-        return self.result
-
-
-class CorrectingToolRuntime(ToolRuntime):
-    async def invoke(self, call):
-        self.calls.append(call)
-        if len(self.calls) == 1:
-            raise ValueError("invalid arguments")
-        return self.result
-
-
-class BatchToolRuntime(ToolRuntime):
-    async def invoke(self, call):
-        self.calls.append(call)
-        await asyncio.sleep(0.02 if call["id"] == "slow" else 0)
-        return {"id": call["id"]}
-
-
-def test_tool_agent_executes_only_the_first_call_and_renders_its_result():
-    model = ControlledToolModel(
-        AIMessage(
-            content="",
-            tool_calls=[
-                {"name": "first", "args": {"value": 1}, "id": "call-1"},
-                {"name": "second", "args": {"value": 2}, "id": "call-2"},
-            ],
-        )
-    )
-    runtime = ToolRuntime({"value": "done", "items": [2, 1]})
-
-    async def run():
-        return await create_execution_mode("tool_agent", model=model, tool_runtime=runtime).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer(json.dumps({"items": [2, 1], "value": "done"}, sort_keys=True), "completed")
-    assert len(model.calls) == 1
-    assert runtime.calls == [model.response.tool_calls[0]]
-    assert runtime.closed is True
-
-
-def test_tool_agent_serializes_conversation_input_for_the_model():
-    model = ControlledToolModel(AIMessage(content="Done."))
-    runtime = ToolRuntime("unused")
-    conversation_input = ConversationInput("conv", ({"sequence": 1, "answer": "Earlier"},), "Continue")
-
-    answer = asyncio.run(create_execution_mode("tool_agent", model=model, tool_runtime=runtime).run(conversation_input))
-
-    assert answer == ExecutionAnswer("Done.", "completed")
-    assert model.calls == ['{"history":[{"sequence":1,"answer":"Earlier"}],"current_input":"Continue"}']
-
-
-def test_react_serializes_conversation_input_for_the_model():
-    model = ControlledToolModel(AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True})))
-    runtime = ToolRuntime("unused")
-    conversation_input = ConversationInput("conv", ({"sequence": 1, "answer": "Earlier"},), "Continue")
-
-    answer = asyncio.run(create_execution_mode("react", model=model, tool_runtime=runtime).run(conversation_input))
-
-    assert answer == ExecutionAnswer("Done.", "completed")
-    assert model.calls[0][1].content == '{"history":[{"sequence":1,"answer":"Earlier"}],"current_input":"Continue"}'
-
-
-def test_tool_agent_binds_the_effective_mcp_tool_set_in_canonical_name_order():
-    class ServerTool:
-        def __init__(self, name):
-            self.name = name
-
-    class EnumeratingRuntime(ToolRuntime):
-        @property
-        def tools(self):
-            return [ServerTool("zebra"), ServerTool("alpha")]
-
-    model = ControlledToolModel(
-        AIMessage(content="", tool_calls=[{"name": "alpha", "args": {}, "id": "call-1"}])
-    )
-    runtime = EnumeratingRuntime("accepted")
-
-    async def run():
-        return await create_execution_mode("tool_agent", model=model, tool_runtime=runtime).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("accepted", "completed")
-    assert [tool.name for tool in model.tools] == ["alpha", "zebra"]
-    assert runtime.calls == [model.response.tool_calls[0]]
-
-
-def test_tool_agent_returns_model_text_without_opening_tool_runtime_when_no_tool_is_selected():
-    model = ControlledToolModel(AIMessage(content="Nothing else is needed."))
-    runtime = ToolRuntime("unused")
-
-    async def run():
-        return await create_execution_mode("tool_agent", model=model, tool_runtime=runtime).run("Answer")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Nothing else is needed.", "completed")
-    assert runtime.closed is True
-
-
-class DurableResult:
-    def __init__(self, result):
-        self.result = result
-        self.calls = []
-
-    async def run(self, run_id, state):
-        self.calls.append((run_id, state))
-        return self.result
-
-
-def test_plan_execute_maps_last_completed_step_handoff_to_common_answer():
-    durable = DurableResult(
-        {
-            "status": "completed",
-            "state": {
-                "goal": "Ship it",
-                "plan_history": [
-                    {
-                        "revision": 1,
-                        "goal": "Ship it",
-                        "steps": [{"id": "publish", "intent": "Publish", "completion_criterion": "Published"}],
-                    }
-                ],
-                "step_executions": [
-                    {"revision": 1, "step_id": "publish", "status": "completed", "result": "Published.", "error": None}
-                ],
-                "memory_summary": None,
-            },
-        }
-    )
-
-    async def run():
-        return await create_execution_mode("plan_execute", durable_agent=durable).run("Ship it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Published.", "completed")
-    assert durable.calls[0][1].goal == "Ship it"
-
-
-def test_plan_execute_preserves_blocked_run_without_synthesis():
-    durable = DurableResult({"status": "blocked", "state": None})
-
-    async def run():
-        return await create_execution_mode("plan_execute", durable_agent=durable).run("Ship it")
-
-    answer = asyncio.run(run())
-
-    assert answer.status == "blocked"
-    assert answer.answer is None
-    assert answer.error == "plan-execute run blocked"
-
-
-def test_factory_selects_direct_mode_and_returns_one_completed_execution_answer():
-    model = ControlledTextModel(["The ", "answer is ready."])
-
-    async def run():
-        runner = create_execution_mode("direct", model=model)
-        return await runner.run("Prepare the release notes")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("The answer is ready.", "completed")
-    assert model.calls == [("Prepare the release notes", {"tools": None})]
-
-
-def test_react_completes_only_from_a_structured_goal_satisfied_response():
-    model = ControlledToolModel(
-        AIMessage(
-            content=json.dumps({"answer": "The release is ready.", "goal_satisfied": True}),
-        )
-    )
-    runtime = ToolRuntime("unused")
-
-    async def run():
-        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Prepare the release")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("The release is ready.", "completed")
-    assert len(model.calls) == 1
-    assert runtime.closed is True
-
-
-def test_react_binds_the_effective_mcp_tool_set_in_canonical_name_order():
-    class ServerTool:
-        def __init__(self, name):
-            self.name = name
-
-    class EnumeratingRuntime(ToolRuntime):
-        @property
-        def tools(self):
-            return [ServerTool("zebra"), ServerTool("alpha")]
-
-    model = SequencedToolModel(
-        [
-            AIMessage(content="", tool_calls=[{"name": "alpha", "args": {}, "id": "call-1"}]),
-            AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True})),
-        ]
-    )
-    runtime = EnumeratingRuntime("accepted")
-
-    async def run():
-        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Done.", "completed")
-    assert [tool.name for tool in model.tools] == ["alpha", "zebra"]
-    assert [call["name"] for call in runtime.calls] == ["alpha"]
-
-
-def test_react_prepends_a_few_shot_prompt_to_the_goal():
-    model = ControlledToolModel(
-        AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
-    )
-    runtime = ToolRuntime("unused")
-
-    async def run():
-        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Done.", "completed")
-    prompt, goal = model.calls[0][:2]
-    assert prompt.type == "system"
-    assert "Examples:" in prompt.content
-    assert "call the available file-reading tool" in prompt.content
-    assert goal.content == "Do it"
-
-
-def test_react_uses_configured_structured_output_mode_for_its_final_response(tmp_path):
-    path = tmp_path / "agent.yaml"
-    path.write_text(
-        """
-model:
-  base_url: https://shared.example/v1
-  api_key: shared-secret
-  model_name: shared-model
-  response_format: json_object
-"""
-    )
-    configuration = load_configuration(path)
-    model = StructuredToolModel(
-        AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
-    )
-    runtime = ToolRuntime("unused")
-
-    async def run():
-        return await create_execution_mode(
-            "react", model=model, tool_runtime=runtime, configuration=configuration
-        ).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Done.", "completed")
-    assert model.response_format_bindings == [{"response_format": {"type": "json_object"}}]
-
-
-def test_react_applies_structured_output_only_to_the_terminal_completion_request(tmp_path):
-    path = tmp_path / "agent.yaml"
-    path.write_text(
-        """
-model:
-  base_url: https://shared.example/v1
-  api_key: shared-secret
-  model_name: shared-model
-  response_format: json_schema
-"""
-    )
-    model = TerminalStructuredModel()
-    runtime = ToolRuntime("observed")
-
-    async def run():
-        return await create_execution_mode(
-            "react",
-            model=model,
-            tool_runtime=runtime,
-            configuration=load_configuration(path),
-        ).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Done.", "completed")
-    assert len(model.operational_calls) == 2
-    assert len(model.completion_calls) == 1
-    assert model.operational_response_formats == [None]
-    response_format = model.response_format_bindings[0]["response_format"]
-    assert response_format["type"] == "json_schema"
-    assert response_format["json_schema"]["name"] == "react_goal_completion"
-
-
-def test_react_returns_tool_errors_to_the_model_for_a_corrective_round():
-    model = SequencedToolModel(
-        [
-            AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "bad-call"}]),
-            AIMessage(
-                content="",
-                tool_calls=[{"name": "first", "args": {"fixed": True}, "id": "good-call"}],
-            ),
-            AIMessage(content=json.dumps({"answer": "Corrected.", "goal_satisfied": True})),
-        ]
-    )
-    runtime = CorrectingToolRuntime("accepted")
-
-    async def run():
-        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Fix it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Corrected.", "completed")
-    assert [call["id"] for call in runtime.calls] == ["bad-call", "good-call"]
-    assert len(model.calls) == 3
-
-
-def test_react_executes_tool_batches_concurrently_and_returns_results_in_request_order():
-    model = SequencedToolModel(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {"name": "first", "args": {}, "id": "slow"},
-                    {"name": "second", "args": {}, "id": "fast"},
-                ],
-            ),
-            AIMessage(content=json.dumps({"answer": "Both observed.", "goal_satisfied": True})),
-        ]
-    )
-    runtime = BatchToolRuntime("unused")
-
-    async def run():
-        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Observe both")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Both observed.", "completed")
-    tool_messages = model.calls[1][-2:]
-    assert [message.tool_call_id for message in tool_messages] == ["slow", "fast"]
-    assert [message.content for message in tool_messages] == [
-        '{"id": "slow"}',
-        '{"id": "fast"}',
+class Runtime:
+    def __init__(self): self.tools = []; self.calls = []
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): pass
+    async def invoke(self, call): self.calls.append(call); return {"value": "done"}
+
+
+def test_direct_mode_decodes_answer_and_prompts_for_line_protocol():
+    model = TextModel('BEGIN ANSWER\nTEXT="Ready"\nEND ANSWER')
+    answer = asyncio.run(DirectMode(model).run("Prepare"))
+    assert answer == ExecutionAnswer("Ready", "completed")
+    assert "BEGIN ANSWER" in model.requests[0][1]["instructions"]
+    assert "text_format" not in model.requests[0][1]
+
+
+def test_direct_mode_rejects_invalid_answer():
+    assert asyncio.run(DirectMode(TextModel("Ready")).run("Prepare")).status == "failed"
+
+
+def test_tool_agent_prompts_for_answer_and_decodes_no_tool_response():
+    model = ToolModel(AIMessage(content='BEGIN ANSWER\nTEXT="No tool needed"\nEND ANSWER'))
+    answer = asyncio.run(ToolAgentMode(model, Runtime()).run("Answer"))
+    assert answer == ExecutionAnswer("No tool needed", "completed")
+    assert "BEGIN ANSWER" in model.requests[0][0].content
+
+
+def test_tool_agent_executes_a_tool_call_with_accompanying_text():
+    model = ToolModel(AIMessage(content='BEGIN ANSWER\nTEXT="bad"\nEND ANSWER', tool_calls=[{"name": "x", "args": {}, "id": "1"}]))
+    runtime = Runtime()
+    answer = asyncio.run(ToolAgentMode(model, runtime).run("Answer"))
+    assert answer == ExecutionAnswer('{"value": "done"}', "completed")
+    assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
+        {"name": "x", "args": {}, "id": "1"}
     ]
 
 
-def test_react_rejects_a_final_response_without_goal_satisfaction_proof():
-    model = ControlledToolModel(
-        AIMessage(content=json.dumps({"answer": "Probably done.", "goal_satisfied": False}))
+def test_react_requires_no_tool_before_separate_goal_completion():
+    model = ToolModel(
+        AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL"),
+        AIMessage(content='BEGIN GOAL_COMPLETION\nANSWER="Done"\nGOAL_SATISFIED=true\nEND GOAL_COMPLETION'),
     )
-    runtime = ToolRuntime("unused")
-
-    async def run():
-        return await create_execution_mode("react", model=model, tool_runtime=runtime).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer.status == "failed"
-    assert answer.answer is None
-    assert answer.error == "react response did not prove goal completion"
-
-
-def test_react_fails_when_the_configured_round_budget_is_exhausted():
-    model = SequencedToolModel(
-        [
-            AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "call-1"}]),
-            AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "call-2"}]),
-        ]
-    )
-    runtime = ToolRuntime("observed")
-
-    async def run():
-        return await create_execution_mode(
-            "react", model=model, tool_runtime=runtime, max_rounds=2
-        ).run("Keep going")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer(None, "failed", error="react round budget exhausted")
-    assert len(model.calls) == 2
-    assert len(runtime.calls) == 1
-
-
-def test_react_rejects_a_non_positive_round_budget():
-    model = ControlledToolModel(AIMessage(content="{}"))
-
-    try:
-        create_execution_mode("react", model=model, tool_runtime=ToolRuntime("unused"), max_rounds=0)
-    except ValueError as error:
-        assert str(error) == "max_rounds must be a positive integer"
-    else:
-        raise AssertionError("non-positive React budget should be rejected")
-
-
-def test_react_sends_the_layered_context_to_operational_and_final_requests():
-    class CapturingPolicy:
-        def __init__(self):
-            self.requests = []
-            self.rounds = []
-
-        def record_model_use(self):
-            pass
-
-        async def maintain(self, durable_state):
-            self.requests.append(durable_state)
-            return RuntimeContext(durable_state, (), ())
-
-        async def record_tool_round(self, round, calls, results, errors):
-            self.rounds.append((round, calls, results, errors))
-
-    model = TerminalStructuredModel()
-    policy = CapturingPolicy()
-    runtime = ToolRuntime("observed")
-
-    async def run():
-        return await create_execution_mode(
-            "react", model=model, tool_runtime=runtime,
-            context_policy=policy,
-            response_format="json_schema",
-        ).run("Do it")
-
-    answer = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Done.", "completed")
-    assert len(policy.requests) == 3
-    assert policy.rounds[0][0] == 1
-    assert model.completion_calls[0][-2].content.startswith("## Runtime context")
-
-
-def test_react_advances_from_settled_tools_without_waiting_for_observation():
-    class BlockingContextModel:
-        def __init__(self):
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        def bind(self, **kwargs):
-            return self
-
-        async def ainvoke(self, messages):
-            self.started.set()
-            await self.release.wait()
-            return AIMessage(content=json.dumps({
-                "round": 1,
-                "confirmed_facts": [],
-                "reported_errors": [],
-                "model_inferences": [],
-            }))
-
-    class TwoRoundModel:
-        def __init__(self):
-            self.calls = []
-
-        def bind_tools(self, tools):
-            return self
-
-        async def ainvoke(self, messages):
-            self.calls.append(list(messages))
-            if len(self.calls) == 1:
-                return AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "call-1"}])
-            return AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
-
-    async def run():
-        context_model = BlockingContextModel()
-        model = TwoRoundModel()
-        policy = RuntimeContextPolicy(context_model)
-        answer = await create_execution_mode(
-            "react", model=model, tool_runtime=ToolRuntime("observed"),
-            context_policy=policy,
-        ).run("Do it")
-        assert context_model.started.is_set()
-        assert len(model.calls) == 2
-        assert "call-1" in model.calls[1][-1].content
-        context_model.release.set()
-        return answer
-
-    assert asyncio.run(run()) == ExecutionAnswer("Done.", "completed")
-
-
-def test_react_keeps_observation_failures_nonfatal_and_retains_raw_context():
-    class FailingContextModel:
-        def bind(self, **kwargs):
-            return self
-
-        async def ainvoke(self, messages):
-            raise RuntimeError("context provider unavailable")
-
-    class TwoRoundModel:
-        def __init__(self):
-            self.calls = []
-
-        def bind_tools(self, tools):
-            return self
-
-        async def ainvoke(self, messages):
-            self.calls.append(list(messages))
-            if len(self.calls) == 1:
-                return AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "call-1"}])
-            return AIMessage(content=json.dumps({"answer": "Recovered.", "goal_satisfied": True}))
-
-    async def run():
-        policy = RuntimeContextPolicy(FailingContextModel())
-        model = TwoRoundModel()
-        answer = await create_execution_mode(
-            "react", model=model, tool_runtime=ToolRuntime("observed"),
-            context_policy=policy,
-        ).run("Recover")
-        await asyncio.sleep(0)
-        return answer, policy, model
-
-    answer, policy, model = asyncio.run(run())
-
-    assert answer == ExecutionAnswer("Recovered.", "completed")
-    assert "call-1" in model.calls[1][-1].content
-
-
-def test_react_does_not_reuse_runtime_context_between_invocations():
-    class ImmediateContextModel:
-        def bind(self, **kwargs):
-            return self
-
-        async def ainvoke(self, messages):
-            return AIMessage(content=json.dumps({
-                "round": 1,
-                "confirmed_facts": [],
-                "reported_errors": [],
-                "model_inferences": [],
-            }))
-
-    class ReusableModel:
-        def __init__(self):
-            self.calls = []
-            self.invocation = 0
-
-        def bind_tools(self, tools):
-            return self
-
-        async def ainvoke(self, messages):
-            self.calls.append(list(messages))
-            if len(self.calls) in {1, 3}:
-                self.invocation += 1
-                return AIMessage(
-                    content="",
-                    tool_calls=[{
-                        "name": "first",
-                        "args": {},
-                        "id": f"call-{self.invocation}",
-                    }],
-                )
-            return AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
-
-    async def run():
-        model = ReusableModel()
-        mode = create_execution_mode(
-            "react", model=model, tool_runtime=ToolRuntime("observed"),
-            context_policy=RuntimeContextPolicy(ImmediateContextModel()),
-        )
-        first = await mode.run("First")
-        second = await mode.run("Second")
-        return first, second, model
-
-    first, second, model = asyncio.run(run())
-
-    assert first == ExecutionAnswer("Done.", "completed")
-    assert second == ExecutionAnswer("Done.", "completed")
-    assert "call-1" not in model.calls[3][-1].content
-    assert "call-2" in model.calls[3][-1].content
-
-
-def test_react_strict_schema_uses_tool_guidance_without_repeating_terminal_shape():
-    model = TerminalStructuredModel()
-    runtime = ToolRuntime("observed")
-
-    async def run():
-        return await create_execution_mode(
-            "react", model=model, tool_runtime=runtime,
-            response_format="json_schema",
-        ).run("Do it")
-
-    assert asyncio.run(run()) == ExecutionAnswer("Done.", "completed")
-    assert "use an available tool" in model.operational_calls[0][0].content
-    assert "exactly one JSON object" not in model.operational_calls[0][0].content
-    assert "Return the final goal-completion response now." in model.completion_calls[0][-1].content
-    assert "configured structured contract" not in model.completion_calls[0][-1].content
-
-
-def test_react_uses_the_runtime_context_component_model_when_configured(tmp_path, monkeypatch):
-    path = tmp_path / "agent.yaml"
-    path.write_text(
-        """
-model:
-  base_url: https://shared.example/v1
-  api_key: shared-key
-  model_name: shared-model
-  response_format: json_schema
-runtime_context:
-  base_url: https://context.example/v1
-  api_key: context-key
-  model_name: context-model
-  response_format: json_object
-"""
-    )
-    created = []
-
-    class ContextModel:
-        def __init__(self, **kwargs):
-            created.append(kwargs)
-
-    monkeypatch.setattr("agent.execution.ChatOpenAI", ContextModel)
-    mode = create_execution_mode(
-        "react",
-        model=ControlledToolModel(AIMessage(content="{}")),
-        tool_runtime=ToolRuntime("unused"),
-        configuration=load_configuration(path),
-    )
-
-    assert created == [
-        {
-            "base_url": "https://context.example/v1",
-            "api_key": "context-key",
-            "model": "context-model",
-            "max_retries": 0,
-        }
-    ]
-    assert mode._context_response_format == "json_object"
-
-
-def test_direct_mode_fails_when_the_model_returns_only_whitespace():
-    model = ControlledTextModel(["  \n"])
-
-    async def run():
-        return await create_execution_mode("direct", model=model).run("Do the work")
-
-    answer = asyncio.run(run())
-
-    assert answer.status == "failed"
-    assert answer.answer is None
-    assert answer.error == "direct model returned an empty response"
-    assert model.calls == [("Do the work", {"tools": None})]
-
-
-def test_direct_mode_instructs_json_object_providers_to_return_json():
-    model = ControlledTextModel(['{"response":"Done"}'])
-
-    async def run():
-        return await create_execution_mode(
-            "direct", model=model, response_format="json_object"
-        ).run("Do the work")
-
-    answer = asyncio.run(run())
-
+    answer = asyncio.run(ReactMode(model, Runtime()).run("Complete"))
     assert answer == ExecutionAnswer("Done", "completed")
-    assert model.calls == [
-        (
-            "Do the work",
-            {
-                "tools": None,
-                "text_format": {"type": "json_object"},
-                "instructions": "Return exactly one valid JSON object with a response field.",
-            },
-        )
+    assert "NO_TOOL" in model.requests[0][0].content
+    assert "Do not include the final answer" in model.requests[0][0].content
+    assert "GOAL_COMPLETION" in model.requests[1][-1].content
+
+
+def test_react_terminal_prompt_requires_a_json_encoded_answer_and_reports_protocol_errors():
+    model = ToolModel(
+        AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL"),
+        AIMessage(
+            content=(
+                "BEGIN GOAL_COMPLETION\n"
+                "ANSWER: A Markdown answer on raw lines\n\n"
+                "- rather than a JSON string\n"
+                "GOAL_SATISFIED=true\n"
+                "END GOAL_COMPLETION"
+            )
+        ),
+    )
+
+    answer = asyncio.run(ReactMode(model, Runtime()).run("Complete"))
+
+    assert answer == ExecutionAnswer(
+        None,
+        "failed",
+        error=(
+            "react model returned an invalid protocol response: "
+            "invalid line or text outside a block"
+        ),
+    )
+    terminal_instruction = model.requests[1][-1].content
+    assert "ANSWER=<JSON string literal>" in terminal_instruction
+    assert 'ANSWER="A complete answer"' in terminal_instruction
+
+
+def test_react_rejects_prose_instead_of_no_tool():
+    model = ToolModel(AIMessage(content="Done"))
+    assert asyncio.run(ReactMode(model, Runtime()).run("Complete")).status == "failed"
+
+
+def test_react_reports_the_protocol_failure_for_a_nonempty_no_tool_response():
+    model = ToolModel(AIMessage(content="BEGIN NO_TOOL\n\nComponent summary"))
+
+    answer = asyncio.run(ReactMode(model, Runtime()).run("Count components"))
+
+    assert answer == ExecutionAnswer(
+        None,
+        "failed",
+        error=(
+            "react model returned an invalid protocol response: "
+            "blank lines and comments are not permitted"
+        ),
+    )
+
+
+def test_react_executes_tool_calls_with_accompanying_text():
+    model = ToolModel(
+        AIMessage(content="I'll inspect the source tree.", tool_calls=[{"name": "list_dir", "args": {}, "id": "1"}]),
+        AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL"),
+        AIMessage(content='BEGIN GOAL_COMPLETION\nANSWER="Done"\nGOAL_SATISFIED=true\nEND GOAL_COMPLETION'),
+    )
+    runtime = Runtime()
+    answer = asyncio.run(ReactMode(model, runtime).run("Inspect"))
+    assert answer == ExecutionAnswer("Done", "completed")
+    assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
+        {"name": "list_dir", "args": {}, "id": "1"}
     ]
-
-
-def test_direct_mode_fails_with_a_safe_error_when_model_invocation_raises():
-    model = FailingTextModel(RuntimeError("provider secret: do-not-leak"))
-
-    async def run():
-        return await create_execution_mode("direct", model=model).run("Do the work")
-
-    answer = asyncio.run(run())
-
-    assert answer.status == "failed"
-    assert answer.answer is None
-    assert answer.error == "direct model invocation failed"
-    assert "do-not-leak" not in answer.error
-    assert model.calls == 1
-
-
-def test_factory_has_one_common_runner_contract_for_each_explicit_mode():
-    for mode in ("direct", "tool_agent", "react", "plan_execute"):
-        runner = create_execution_mode(mode, model=ControlledTextModel(["unused"])) if mode == "direct" else create_execution_mode(mode)
-
-        assert hasattr(runner, "run")
-
-    try:
-        create_execution_mode("router")
-    except ValueError as error:
-        assert str(error) == "mode must be direct, tool_agent, react, or plan_execute"
-    else:
-        raise AssertionError("unknown mode should be rejected")

@@ -14,7 +14,6 @@ def _configuration_file(tmp_path):
         "  base_url: https://provider.test/v1\n"
         "  api_key: key\n"
         "  model_name: model\n"
-        "  response_format: json_schema\n"
     )
     return str(path)
 

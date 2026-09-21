@@ -4,20 +4,24 @@ This context coordinates language-model interactions for the Codex Python agent.
 
 ## Language
 
+**Line Protocol**:
+A strict UTF-8, line-oriented model-response representation in which a response is delimited by matching `BEGIN <TYPE>` and `END <TYPE>` lines. Scalar fields use `PATH=JSON_LITERAL`, dot-separated paths represent nested objects, repeated paths represent scalar arrays, and repeated nested blocks represent object arrays; it is the sole structured response contract for non-tool language-model responses and is validated locally before conversion to a component's domain contract.
+_Avoid_: JSON mode, JSON Schema, JSON object
+
+**No-tool response**:
+The empty `NO_TOOL` Line Protocol block emitted by a tool-capable model that declines native tool calls before its host makes a separate completion request.
+_Avoid_: plain-text no-tool reply, implicit completion
+
 **OpenAI-compatible provider**:
 A service exposing the OpenAI Responses API through a caller-supplied base URL, API key, and model name.
 _Avoid_: OpenAI provider, model provider
 
-**Structured-output mode**:
-The OpenAI-compatible provider request mode used for a component's final structured response: `json_schema`, which asks the provider to enforce a supplied schema, or `json_object`, which asks it only to return a JSON object and relies on local validation for the component's contract.
-_Avoid_: JSON mode, response type
-
 **Component provider configuration**:
-The effective OpenAI-compatible provider credentials, endpoint, model name, and, where structured output is required, Structured-output mode used by a named language-model component. Components may inherit shared values, then apply component-specific overrides.
+The effective OpenAI-compatible provider credentials, endpoint, and model name used by a named language-model component. Components may inherit shared values, then apply component-specific overrides.
 _Avoid_: global model configuration, executor tool configuration
 
 **Runtime-context component**:
-The named language-model component that generates and compacts Observations for tool-capable execution modes. It may use a separately configured OpenAI-compatible provider and Structured-output mode, while ReAct and the Plan-step Executor retain ownership of their tool loops.
+The named language-model component that generates and compacts Observations for tool-capable execution modes. It may use a separately configured OpenAI-compatible provider, while ReAct and the Plan-step Executor retain ownership of their tool loops.
 _Avoid_: tool-loop model, observation provider
 
 **Text stream**:

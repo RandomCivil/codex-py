@@ -78,18 +78,18 @@ def test_resume_rejects_configuration_drift_before_runner_is_called():
 
 def test_effective_component_snapshot_excludes_keys_and_allows_key_rotation():
     first = configuration_snapshot(
-        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema", "api_key": "one"},
-        executor={"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object", "api_key": "two"},
+        planner={"base_url": "https://planner.test", "model_name": "planner", "api_key": "one"},
+        executor={"base_url": "https://executor.test", "model_name": "executor", "api_key": "two"},
         mcp={"command": "atom"},
     )
     rotated = configuration_snapshot(
-        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema", "api_key": "rotated"},
-        executor={"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object", "api_key": "rotated"},
+        planner={"base_url": "https://planner.test", "model_name": "planner", "api_key": "rotated"},
+        executor={"base_url": "https://executor.test", "model_name": "executor", "api_key": "rotated"},
         mcp={"command": "atom"},
     )
 
-    assert first["planner"] == {"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"}
-    assert first["executor"] == {"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object"}
+    assert first["planner"] == {"base_url": "https://planner.test", "model_name": "planner"}
+    assert first["executor"] == {"base_url": "https://executor.test", "model_name": "executor"}
     assert first["task_analyzer"] == first["planner"]
     assert "api_key" not in str(first)
     assert configuration_fingerprint(first) == configuration_fingerprint(rotated)
@@ -97,21 +97,19 @@ def test_effective_component_snapshot_excludes_keys_and_allows_key_rotation():
 
 def test_runtime_context_snapshot_excludes_credentials_and_tracks_effective_configuration():
     original = configuration_snapshot(
-        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
+        planner={"base_url": "https://planner.test", "model_name": "planner"},
         runtime_context={
             "base_url": "https://context.test",
             "model_name": "context-model",
-            "response_format": "json_object",
             "api_key": "secret",
         },
         mcp={},
     )
     changed = configuration_snapshot(
-        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
+        planner={"base_url": "https://planner.test", "model_name": "planner"},
         runtime_context={
             "base_url": "https://context.test",
             "model_name": "changed-context-model",
-            "response_format": "json_object",
             "api_key": "rotated-secret",
         },
         mcp={},
@@ -120,7 +118,6 @@ def test_runtime_context_snapshot_excludes_credentials_and_tracks_effective_conf
     assert original["runtime_context"] == {
         "base_url": "https://context.test",
         "model_name": "context-model",
-        "response_format": "json_object",
     }
     assert "api_key" not in str(original)
     assert configuration_fingerprint(original) != configuration_fingerprint(changed)
@@ -131,18 +128,17 @@ def test_runtime_context_snapshot_excludes_credentials_and_tracks_effective_conf
     [
         {"base_url": "https://changed.test"},
         {"model_name": "changed-model"},
-        {"response_format": "json_schema"},
     ],
 )
 def test_effective_component_drift_changes_resume_fingerprint(change):
     original = configuration_snapshot(
-        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
-        executor={"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object"},
+        planner={"base_url": "https://planner.test", "model_name": "planner"},
+        executor={"base_url": "https://executor.test", "model_name": "executor"},
         mcp={},
     )
-    changed_executor = {"base_url": "https://executor.test", "model_name": "executor", "response_format": "json_object", **change}
+    changed_executor = {"base_url": "https://executor.test", "model_name": "executor", **change}
     changed = configuration_snapshot(
-        planner={"base_url": "https://planner.test", "model_name": "planner", "response_format": "json_schema"},
+        planner={"base_url": "https://planner.test", "model_name": "planner"},
         executor=changed_executor,
         mcp={},
     )

@@ -44,7 +44,6 @@ def test_run_forwards_resolved_component_configurations(tmp_path, monkeypatch, c
         "  base_url: https://shared.example/v1\n"
         "  api_key: shared-key\n"
         "  model_name: shared-model\n"
-        "  response_format: json_schema\n"
         "planner:\n"
         "  model_name: planner-model\n"
     )
@@ -79,7 +78,6 @@ def test_resume_forwards_the_resolved_component_configurations(tmp_path, monkeyp
         "  base_url: https://shared.example/v1\n"
         "  api_key: shared-key\n"
         "  model_name: shared-model\n"
-        "  response_format: json_object\n"
         "executor:\n"
         "  base_url: https://executor.example/v1\n"
     )
@@ -94,7 +92,7 @@ def test_resume_forwards_the_resolved_component_configurations(tmp_path, monkeyp
     assert main(["resume", "--run-id", "550e8400-e29b-41d4-a716-446655440000", "--config", str(path)]) == 0
     configuration = observed["configuration"]
     assert configuration.planner.model_name == "shared-model"
-    assert configuration.planner.response_format == "json_object"
+    assert not hasattr(configuration.planner, "response_format")
     assert configuration.executor.base_url == "https://executor.example/v1"
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
 
@@ -105,8 +103,8 @@ def test_operator_documentation_describes_the_yaml_configuration_workflow():
     assert "agent.yaml" in documentation
     assert "planner:" in documentation
     assert "executor:" in documentation
-    assert "json_schema" in documentation
-    assert "json_object" in documentation
+    assert "Line Protocol" in documentation
+    assert "response_format" in documentation
     assert "文件权限" in documentation
     assert "OPENAI_BASE_URL" not in documentation
     assert "OPENAI_API_KEY" not in documentation

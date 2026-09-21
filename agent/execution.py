@@ -14,9 +14,9 @@ from langchain_openai import ChatOpenAI
 from agent.configuration import ComponentProviderConfiguration
 from agent.model_request import tool_request_shape, trace_llm_context, trace_llm_request
 from llm.llm import LLM
-from llm.response_format import ResponseFormat, chat_response_format, responses_text_format, require_response_format
 from agent.runtime_context import RuntimeContextPolicy
 from agent.tool_binding import canonical_mcp_tool_set
+from llm.line_protocol import LineProtocolError, decode_answer, decode_goal_completion, decode_no_tool
 
 
 ExecutionStatus = Literal["completed", "failed", "blocked"]
@@ -34,31 +34,15 @@ def conversation_model_input(value: Any) -> Any:
     )
 
 
-_REACT_RESPONSE_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "react_goal_completion",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["answer", "goal_satisfied"],
-            "properties": {
-                "answer": {"type": "string", "minLength": 1},
-                "goal_satisfied": {"const": True},
-            },
-        },
-    },
-}
+_ANSWER_LINE_PROTOCOL_INSTRUCTIONS = (
+    "Return exactly one Line Protocol block: BEGIN ANSWER, one TEXT JSON string field, "
+    "then END ANSWER. Do not output prose or any other fields."
+)
 
-_GENERAL_RESPONSE_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["response"],
-    "properties": {"response": {"type": "string"}},
-}
-
-_DIRECT_JSON_OBJECT_INSTRUCTIONS = "Return exactly one valid JSON object with a response field."
+_TOOL_AGENT_INSTRUCTIONS = (
+    "Use a native function tool call when a tool is needed. If no tool call is needed, "
+    + _ANSWER_LINE_PROTOCOL_INSTRUCTIONS
+)
 
 
 _REACT_TOOL_LOOP_PROMPT = """You are an execution agent. Work iteratively: use an available tool when
@@ -67,65 +51,33 @@ tool fails. Do not claim the goal is complete until the available evidence suppo
 When the goal is complete, stop requesting tools so the terminal response can be returned.
 """
 
-_REACT_JSON_OBJECT_PROMPT = _REACT_TOOL_LOOP_PROMPT + """
-The terminal response must be exactly one JSON object containing a concise evidence-based
-`answer` and `goal_satisfied: true`.
+_REACT_TOOL_LOOP_PROMPT += """
+When native function tool calls are present, execute them even if the response also includes
+text; the host ignores that accompanying text. When no tool call is present, return exactly
+the two lines `BEGIN NO_TOOL` and `END NO_TOOL`, with nothing before, between, or after
+them. Do not include the final answer in that response: a separate terminal completion
+request follows it.
+"""
 
-Examples:
+_REACT_GOAL_COMPLETION_INSTRUCTIONS = """Return exactly one GOAL_COMPLETION Line Protocol block, with no prose before or after it.
+Every field uses `NAME=JSON_LITERAL`, not `NAME: value`. In particular, use `ANSWER=<JSON string literal>`. ANSWER must be one JSON string
+literal; encode any line breaks inside that string as `\\n`. Set GOAL_SATISFIED to the JSON
+boolean true.
 
-User goal: "Find the version in the project configuration."
-Assistant: I need project evidence, so I call the available file-reading tool.
-Tool result: The configuration reports version 1.4.0.
-Assistant: {"answer":"The project version is 1.4.0, as recorded in the configuration.","goal_satisfied":true}
+Example:
+BEGIN GOAL_COMPLETION
+ANSWER="A complete answer"
+GOAL_SATISFIED=true
+END GOAL_COMPLETION
 
-User goal: "Summarize the text supplied in this conversation."
-Assistant: {"answer":"Here is the requested summary based on the supplied text.","goal_satisfied":true}
-
-Use the tools and facts for the current goal, never the example values above."""
-
-
-def _general_chat_response_format(response_format: ResponseFormat) -> dict[str, Any]:
-    return chat_response_format(response_format, name="model_response", schema=_GENERAL_RESPONSE_SCHEMA)
-
-
-def _direct_text_format(response_format: ResponseFormat) -> dict[str, Any]:
-    return responses_text_format(
-        response_format,
-        name="direct_response",
-        schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["response"],
-            "properties": {"response": {"type": "string"}},
-        },
-    )
+Do not call tools or output prose."""
 
 
-def _bind_tools_with_response_format(model: Any, tools: Any, response_format: ResponseFormat | None) -> Any:
-    """Bind tools and the configured output format at the same model seam."""
-    if response_format is None:
-        return model.bind_tools(tools)
-    try:
-        return model.bind_tools(
-            tools,
-            response_format=_general_chat_response_format(response_format),
-        )
-    except TypeError as error:
-        # Small injected test/double models may expose the older two-argument
-        # seam; real ChatOpenAI accepts response_format as a keyword.
-        if "response_format" not in str(error) and "unexpected keyword" not in str(error):
-            raise
-        return model.bind_tools(tools)
+def _bind_tools(model: Any, tools: Any) -> Any:
+    """Bind native tools; final non-tool answers use the local ANSWER codec."""
+    return model.bind_tools(tools)
 
 
-def _bind_response_format(model: Any, response_format: dict[str, Any]) -> Any:
-    """Apply a terminal response format while retaining lightweight doubles."""
-    try:
-        return model.bind(response_format=response_format)
-    except (AttributeError, TypeError) as error:
-        if isinstance(error, TypeError) and "response_format" not in str(error):
-            raise
-        return model
 @dataclass(frozen=True, slots=True)
 class ExecutionAnswer:
     """The terminal result shared by whole-task Execution modes."""
@@ -153,12 +105,9 @@ class ExecutionMode(Protocol):
 class DirectMode:
     """Obtain one tool-free answer from a language model."""
 
-    def __init__(self, model: Any, *, response_format: ResponseFormat | None = None, trace: Any | None = None) -> None:
+    def __init__(self, model: Any, *, trace: Any | None = None) -> None:
         self._model = model
         self._trace = trace
-        self._response_format = (
-            require_response_format(response_format) if response_format is not None else None
-        )
 
     async def run(self, goal: Any) -> ExecutionAnswer:
         goal = conversation_model_input(goal)
@@ -166,16 +115,7 @@ class DirectMode:
             request = {
                 "input": goal,
                 "tools": None,
-                **(
-                    {"instructions": _DIRECT_JSON_OBJECT_INSTRUCTIONS}
-                    if self._response_format == "json_object"
-                    else {}
-                ),
-                **(
-                    {"text_format": _direct_text_format(self._response_format)}
-                    if self._response_format is not None
-                    else {}
-                ),
+                "instructions": _ANSWER_LINE_PROTOCOL_INSTRUCTIONS,
             }
             if not callable(getattr(self._model, "_on_request", None)):
                 trace_llm_context(self._trace, request)
@@ -191,15 +131,10 @@ class DirectMode:
             )
         except Exception:
             return ExecutionAnswer(None, "failed", error="direct model invocation failed")
-        if not output.strip():
-            return ExecutionAnswer(None, "failed", error="direct model returned an empty response")
         try:
-            document = json.loads(output)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            document = None
-        if isinstance(document, dict) and isinstance(document.get("response"), str):
-            output = document["response"]
-        return ExecutionAnswer(output, "completed")
+            return ExecutionAnswer(decode_answer(output), "completed")
+        except ValueError:
+            return ExecutionAnswer(None, "failed", error="direct model returned an invalid ANSWER response")
 
 
 class ToolRuntime:
@@ -283,39 +218,33 @@ class _ToolExecutionError(RuntimeError):
 class ToolAgentMode:
     """Make one model request and, at most, one host tool invocation."""
 
-    def __init__(self, model: Any, tool_runtime: Any, trace: Any | None = None, *, response_format: ResponseFormat | None = None) -> None:
+    def __init__(self, model: Any, tool_runtime: Any, trace: Any | None = None) -> None:
         self._model = model
         self._runtime = tool_runtime
         self._trace = trace
-        self._response_format = (
-            require_response_format(response_format) if response_format is not None else None
-        )
 
     async def run(self, goal: Any) -> ExecutionAnswer:
         goal = conversation_model_input(goal)
         try:
             async with self._runtime as runtime:
                 tools = canonical_mcp_tool_set(runtime.tools)
-                bound = _bind_tools_with_response_format(
-                    self._model, tools, self._response_format
-                )
+                bound = _bind_tools(self._model, tools)
                 trace_llm_request(
                     self._trace,
                     "tool_agent",
-                    goal,
+                    [SystemMessage(content=_TOOL_AGENT_INSTRUCTIONS), HumanMessage(content=goal)],
                     static_shape={
                         "tools": tool_request_shape(tools),
-                        "response_format": self._response_format,
+                        "instructions": _TOOL_AGENT_INSTRUCTIONS,
                     },
                 )
-                response = await bound.ainvoke(goal)
+                response = await bound.ainvoke(
+                    [SystemMessage(content=_TOOL_AGENT_INSTRUCTIONS), HumanMessage(content=goal)]
+                )
                 _trace_llm_response(self._trace, response)
                 calls = list(getattr(response, "tool_calls", []) or [])
                 if not calls:
-                    text = _message_text(response)
-                    if not text.strip():
-                        return ExecutionAnswer(None, "failed", error="tool-agent model returned an empty response")
-                    return ExecutionAnswer(text, "completed")
+                    return ExecutionAnswer(decode_answer(_message_text(response)), "completed")
                 for ignored in calls[1:]:
                     if self._trace is not None:
                         _trace_ignored(self._trace, ignored)
@@ -335,11 +264,9 @@ class ReactMode:
         trace: Any | None = None,
         *,
         max_rounds: int = 50,
-        response_format: ResponseFormat | None = None,
         context_policy: RuntimeContextPolicy | None = None,
         context_budget: int = 128_000,
         context_model: Any | None = None,
-        context_response_format: ResponseFormat | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
@@ -347,13 +274,9 @@ class ReactMode:
         self._runtime = tool_runtime
         self._trace = trace
         self._max_rounds = max_rounds
-        self._response_format = (
-            require_response_format(response_format) if response_format is not None else None
-        )
         self._context_policy = context_policy
         self._context_budget = context_budget
         self._context_model = context_model
-        self._context_response_format = context_response_format
 
     def _policy_for_invocation(self) -> RuntimeContextPolicy | Any | None:
         """Return an invocation-local Runtime-context policy."""
@@ -366,10 +289,6 @@ class ReactMode:
         goal = conversation_model_input(goal)
         try:
             async with self._runtime as runtime:
-                # Tool-use rounds must remain unconstrained: some
-                # OpenAI-compatible providers reject a response format when
-                # it is combined with tool definitions.  The structured
-                # completion contract is applied only after tool use stops.
                 tools = canonical_mcp_tool_set(runtime.tools)
                 model = self._model.bind_tools(tools)
                 # Injected doubles can predate the no-tool Observation seam.  The
@@ -381,16 +300,11 @@ class ReactMode:
                 if policy is None and (self._context_model is not None or isinstance(self._model, ChatOpenAI)):
                     policy = RuntimeContextPolicy(
                         policy_model, budget=self._context_budget,
-                        response_format=self._context_response_format or self._response_format or "json_schema",
                         trace=self._trace,
                     )
                 messages: list[Any] = [
                     SystemMessage(
-                        content=(
-                            _REACT_TOOL_LOOP_PROMPT
-                            if self._response_format == "json_schema"
-                            else _REACT_JSON_OBJECT_PROMPT
-                        )
+                        content=_REACT_TOOL_LOOP_PROMPT
                     ),
                     HumanMessage(content=goal),
                 ]
@@ -416,6 +330,9 @@ class ReactMode:
                     response = await model.ainvoke(request_messages)
                     _trace_llm_response(self._trace, response)
                     calls = list(getattr(response, "tool_calls", []) or [])
+                    content = _message_text(response) if getattr(response, "content", None) not in (None, "") else ""
+                    if not calls:
+                        decode_no_tool(content)
                     # Once Runtime context is active, its instantaneous
                     # snapshot is the only historical source for subsequent
                     # requests.  Keep the legacy transcript only for the
@@ -423,51 +340,29 @@ class ReactMode:
                     if policy is None:
                         messages.append(response)
                     if not calls:
-                        if self._response_format is not None:
-                            completion_model = _bind_response_format(
-                                self._model,
-                                _react_response_format(self._response_format),
-                            )
-                            completion_messages = [*messages]
-                            if policy is not None:
-                                policy.record_model_use()
-                                context = await policy.maintain({"goal": goal})
-                                completion_messages = [messages[0], messages[1], context.as_messages()[0]]
-                            final_request = [
-                                *completion_messages,
-                                HumanMessage(
-                                    content=(
-                                        "Return the final goal-completion response now."
-                                        if self._response_format == "json_schema"
-                                        else (
-                                            "Return the final goal-completion response now. "
-                                            "It must be one JSON object with exactly an evidence-based "
-                                            "answer and goal_satisfied: true."
-                                        )
-                                    )
-                                ),
-                            ]
-                            trace_llm_request(
-                                self._trace,
-                                "react",
-                                final_request,
-                                static_shape={
-                                    "instructions": getattr(final_request[0], "content", ""),
-                                    "terminal_instruction": getattr(final_request[-1], "content", ""),
-                                    "request_kind": "goal_completion",
-                                    "response_format": _react_response_format(self._response_format),
-                                },
-                            )
-                            response = await completion_model.ainvoke(
-                                final_request
-                            )
-                            _trace_llm_response(self._trace, response)
-                            if getattr(response, "tool_calls", []):
-                                return ExecutionAnswer(
-                                    None,
-                                    "failed",
-                                    error="react response did not prove goal completion",
-                                )
+                        completion_messages = [*messages]
+                        if policy is not None:
+                            policy.record_model_use()
+                            context = await policy.maintain({"goal": goal})
+                            completion_messages = [messages[0], messages[1], context.as_messages()[0]]
+                        final_request = [
+                            *completion_messages,
+                            HumanMessage(content=_REACT_GOAL_COMPLETION_INSTRUCTIONS),
+                        ]
+                        trace_llm_request(
+                            self._trace,
+                            "react",
+                            final_request,
+                            static_shape={
+                                "instructions": getattr(final_request[0], "content", ""),
+                                "terminal_instruction": getattr(final_request[-1], "content", ""),
+                                "request_kind": "goal_completion",
+                            },
+                        )
+                        response = await self._model.ainvoke(final_request)
+                        _trace_llm_response(self._trace, response)
+                        if getattr(response, "tool_calls", []):
+                            return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
                         return _react_answer(response)
                     if round_number == self._max_rounds:
                         return ExecutionAnswer(None, "failed", error="react round budget exhausted")
@@ -491,6 +386,12 @@ class ReactMode:
                             )
                             for call, (content, is_error, _) in zip(calls, results)
                         )
+        except LineProtocolError as error:
+            return ExecutionAnswer(
+                None,
+                "failed",
+                error=f"react model returned an invalid protocol response: {error}",
+            )
         except Exception:
             return ExecutionAnswer(None, "failed", error="react execution failed")
 
@@ -511,30 +412,8 @@ class ReactMode:
 
 
 def _react_answer(response: Any) -> ExecutionAnswer:
-    try:
-        content = getattr(response, "content", response)
-        if isinstance(content, str):
-            document = json.loads(content)
-        elif isinstance(content, Mapping):
-            document = content
-        else:
-            return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
-    if document.get("goal_satisfied") is not True:
-        return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
-    answer = document.get("answer")
-    if not isinstance(answer, str) or not answer.strip():
-        return ExecutionAnswer(None, "failed", error="react response did not prove goal completion")
+    answer = decode_goal_completion(_message_text(response))
     return ExecutionAnswer(answer, "completed")
-
-
-def _react_response_format(response_format: ResponseFormat) -> dict[str, Any]:
-    if response_format == "json_schema":
-        return _REACT_RESPONSE_SCHEMA
-    if response_format == "json_object":
-        return {"type": "json_object"}
-    raise ValueError("response_format must be json_schema or json_object")
 
 
 def render_tool_result(value: Any) -> str:
@@ -655,7 +534,6 @@ def create_execution_mode(
     base_url: str | None = None,
     api_key: str | None = None,
     model_name: str | None = None,
-    response_format: ResponseFormat | None = None,
     tool_runtime: Any | None = None,
     trace: Any | None = None,
     durable_agent: Any | None = None,
@@ -677,20 +555,12 @@ def create_execution_mode(
             return _UnavailableMode(mode)
         return PlanExecuteMode(durable_agent, run_id=run_id)
     provider = getattr(configuration, mode, None) if configuration is not None else None
-    selected_response_format = (
-        (provider.response_format or "json_schema")
-        if provider is not None
-        else response_format
-    )
-    if selected_response_format is not None:
-        selected_response_format = require_response_format(selected_response_format)
     if provider is not None and model is None:
         if mode == "direct":
             model = LLM(
                 provider.base_url,
                 provider.api_key,
                 provider.model_name,
-                response_format=provider.response_format or "json_schema",
                 on_event=getattr(trace, "llm_event", None),
                 on_request=(
                     (lambda request: trace.llm_request("direct", request))
@@ -712,7 +582,6 @@ def create_execution_mode(
             model,
             tool_runtime or ToolRuntime(trace=trace),
             trace=trace,
-            response_format=selected_response_format,
         )
     if mode == "react":
         if model is None:
@@ -734,10 +603,6 @@ def create_execution_mode(
             context_budget=context_budget,
             context_policy=context_policy,
             context_model=context_model,
-            context_response_format=(
-                context_configuration.response_format if context_configuration is not None else None
-            ),
-            response_format=selected_response_format,
         )
     if model is None:
         if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
@@ -746,7 +611,6 @@ def create_execution_mode(
             base_url,
             api_key,
             model_name,
-            response_format=selected_response_format,
             on_event=getattr(trace, "llm_event", None),
             on_request=(
                 (lambda request: trace.llm_request("direct", request))
@@ -754,4 +618,4 @@ def create_execution_mode(
                 else None
             ),
         )
-    return DirectMode(model, response_format=selected_response_format, trace=trace)
+    return DirectMode(model, trace=trace)

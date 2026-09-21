@@ -1,6 +1,6 @@
 """Shared protocol for models that stream structured text responses."""
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 
@@ -11,5 +11,4 @@ class TextStream(Protocol):
         *,
         instructions: str | None = None,
         tools: Any = None,
-        text_format: Mapping[str, Any],
     ) -> AsyncIterator[str]: ...

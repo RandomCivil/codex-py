@@ -47,8 +47,10 @@ class _RoundModel:
                     }
                 ],
             )
+        if len(self.calls) == 6:
+            return AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL")
         return AIMessage(
-            content='{"answer": "The five tool rounds are complete.", "goal_satisfied": true}'
+            content='BEGIN GOAL_COMPLETION\nANSWER="The five tool rounds are complete."\nGOAL_SATISFIED=true\nEND GOAL_COMPLETION'
         )
 
 
@@ -66,13 +68,7 @@ class _FirstObservationBlocked:
         if self.calls == 1:
             self.started.set()
             await self.release.wait()
-        return AIMessage(
-            content=(
-                '{"round": %d, "confirmed_facts": [], '
-                '"reported_errors": [], "model_inferences": []}'
-            )
-            % self.calls
-        )
+        return AIMessage(content="BEGIN OBSERVATION\nROUND=%d\nEND OBSERVATION" % self.calls)
 
 
 def test_react_round_five_uses_raw_fallback_for_pending_round_one():
@@ -129,17 +125,12 @@ class _ExecutorRoundModel:
                 ],
             )
         if len(self.calls) == 6:
-            return AIMessage(content="All five tool rounds are sufficient.")
+            return AIMessage(content="BEGIN NO_TOOL\nEND NO_TOOL")
         return AIMessage(
-            content=json.dumps(
-                {
-                    "completed": True,
-                    "result": "The five tool rounds completed.",
-                    "completion_criterion_met": True,
-                    "files_read": [],
-                    "files_modified": [],
-                    "observations": ["Five tool rounds completed."],
-                }
+            content=(
+                'BEGIN STEP_COMPLETION\nCOMPLETED=true\nCOMPLETION_CRITERION_MET=true\n'
+                'RESULT="The five tool rounds completed."\n'
+                'OBSERVATIONS="Five tool rounds completed."\nEND STEP_COMPLETION'
             )
         )
 

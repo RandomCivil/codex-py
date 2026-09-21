@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Literal
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -8,51 +8,12 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
-from pydantic import BaseModel, ConfigDict, Field
 
-from llm.response_format import ResponseFormat, require_response_format
+from llm.line_protocol import decode_no_tool, decode_step_completion
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
 from agent.runtime_context import RuntimeContextPolicy
 from agent.model_request import tool_request_shape, trace_llm_request
 from agent.tool_binding import canonical_mcp_tool_set
-
-
-class _StepCompletion(BaseModel):
-    """The JSON Schema handoff receipt for a completed Plan step."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    completed: Literal[True]
-    completion_criterion_met: Literal[True]
-    result: str = Field(
-        min_length=1,
-        description=(
-            "A concise handoff and evidence summary for the next Plan step. "
-            "State the material outcome and the supporting tool output, artifact, "
-            "identifier, or state fact; do not reproduce the message transcript."
-        )
-    )
-    files_read: list[str]
-    files_modified: list[str]
-    observations: list[str]
-
-
-_COMPLETION_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "step_completion",
-        "strict": True,
-        "schema": _StepCompletion.model_json_schema(),
-    },
-}
-
-
-def _completion_response_format(response_format: ResponseFormat) -> dict[str, Any]:
-    if response_format == "json_schema":
-        return _COMPLETION_RESPONSE_FORMAT
-    if response_format == "json_object":
-        return {"type": "json_object"}
-    raise ValueError("response_format must be json_schema or json_object")
 
 
 class ExecutorGraphState(MessagesState, total=False):
@@ -68,8 +29,9 @@ class Executor:
 
     _INSTRUCTIONS = (
         "Use the available MCP tools when they are needed to complete the selected Plan step. "
-        "If no tool use is needed, stop requesting MCP tools. The Executor "
-        "will collect the required structured completion receipt separately."
+        "If a native tool call is emitted, the host executes it even when the response also has text. "
+        "If no tool use is needed, return exactly an empty NO_TOOL Line Protocol block. "
+        "The Executor will request the STEP_COMPLETION Line Protocol receipt separately."
     )
 
     def __init__(
@@ -79,7 +41,6 @@ class Executor:
         base_url: str | None = None,
         api_key: str | None = None,
         model_name: str | None = None,
-        response_format: ResponseFormat = "json_schema",
         command: str = "poetry",
         args: tuple[str, ...] = ("run", "atom-mcp"),
         cwd: str = "/home/xzp/workspace/atom-mcp",
@@ -95,11 +56,9 @@ class Executor:
         context_policy: RuntimeContextPolicy | None = None,
         context_budget: int = 128_000,
         context_model: Any | None = None,
-        context_response_format: ResponseFormat | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
-        self._response_format = require_response_format(response_format)
         if model is None:
             if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
                 raise ValueError("Executor requires explicit base_url, api_key, and model_name when no model is injected")
@@ -132,7 +91,6 @@ class Executor:
         self._context_policy = context_policy
         self._context_budget = context_budget
         self._context_model = context_model
-        self._context_response_format = context_response_format
         self._active_context_policy: RuntimeContextPolicy | None = None
         self._active_durable_state: Any = None
         self._client = None
@@ -194,7 +152,6 @@ class Executor:
                 self._active_context_policy = RuntimeContextPolicy(
                     policy_model,
                     budget=self._context_budget,
-                    response_format=self._context_response_format or self._response_format,
                     trace=self._trace,
                 )
             graph_result = await self._execute_with_tools(
@@ -222,29 +179,15 @@ class Executor:
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="tool round budget exhausted"))
             completion_prompt = (
-                "Return the completion receipt now. `result` is the handoff and "
+                "Return exactly one STEP_COMPLETION Line Protocol block now. `RESULT` is the handoff and "
                 "evidence summary that subsequent Plan steps will receive. Derive it "
                 "only from the preceding messages: state the material outcome and the "
                 "supporting tool output, artifact path, resource identifier, or state "
                 "fact. Be concise; do not merely say it completed or reproduce the "
-                "message transcript. Set completed and completion_criterion_met to true only if the "
+                "message transcript. Set COMPLETED and COMPLETION_CRITERION_MET to true only if the "
                 "selected completion criterion was met: "
                 f"{step.completion_criterion}"
             )
-            if self._response_format == "json_object":
-                completion_prompt += (
-                    " Return one top-level JSON object directly with exactly these fields: completed, "
-                    "completion_criterion_met, result, files_read, files_modified, and observations. "
-                    'Do not wrap the receipt in `{"type":"json_object","result":...}`; `json_object` '
-                    "is only the response format, not a field in your response. Do not include any other "
-                    "fields, including step_id, revision, status, intent, artifact, outcome, or type."
-                    " Follow this example exactly in shape (use facts from the preceding "
-                    "messages, not these example values): "
-                    '{"completed":true,"completion_criterion_met":true,"result":"The '
-                    'selected outcome is complete; supporting evidence is recorded.",'
-                    '"files_read":["docs/example.md"],"files_modified":["src/example.py"],'
-                    '"observations":["The completion criterion is satisfied."]}'
-                )
             final = await self._completion_model.ainvoke(
                 await self._completion_messages(
                     graph_result["messages"],
@@ -261,6 +204,10 @@ class Executor:
                         "content": getattr(final, "content", None),
                         "tool_calls": getattr(final, "tool_calls", []),
                     },
+                )
+            if getattr(final, "tool_calls", []):
+                return ExecutionOutcome(
+                    StepExecution(revision, step_id, "failed", error="model did not return a valid completion result")
                 )
             result = _completion_result(final, step.completion_criterion)
             if result is None:
@@ -298,7 +245,7 @@ class Executor:
             # separate structured response after MCP work ends; local parsing
             # and invariant validation apply in both provider modes.
             self._bound_model = self._model.bind_tools(self._tools)
-            self._completion_model = self._model.bind(response_format=_completion_response_format(self._response_format))
+            self._completion_model = self._model
             # Tool errors are part of the model/tool conversation: a bad argument or
             # an MCP error must be returned to the model so it can correct its next
             # call, rather than aborting this Step and causing top-level replanning.
@@ -328,6 +275,16 @@ class Executor:
                 self._trace.llm_response(message)
                 if message.content:
                     self._trace.llm_text("output", message.content)
+            calls = list(getattr(message, "tool_calls", []) or [])
+            content = getattr(message, "content", "")
+            # LangGraph's ToolNode requires an AI tool-call message without
+            # content. Preserve the provider response in tracing above, then
+            # normalize the graph-facing message so accompanying prose never
+            # prevents a valid native tool call from running.
+            if calls and isinstance(message, AIMessage):
+                message = message.model_copy(update={"content": ""})
+            if not calls:
+                decode_no_tool(content)
             if isinstance(message, AIMessage) and message.tool_calls:
                 self._rounds += 1
                 if self._trace is not None:
@@ -485,7 +442,6 @@ class Executor:
             static_shape={
                 "request_kind": "completion_receipt",
                 "instructions": _completion_prompt_shape(prompt, completion_criterion),
-                "response_format": _completion_response_format(self._response_format),
             },
         )
         return result
@@ -580,28 +536,8 @@ def _completion_result(
     if not isinstance(message, AIMessage) or not isinstance(message.content, str):
         return None
     try:
-        document = json.loads(message.content)
-    except json.JSONDecodeError:
-        return None
-    required = {
-        "completed",
-        "completion_criterion_met",
-        "result",
-        "files_read",
-        "files_modified",
-        "observations",
-    }
-    if not isinstance(document, dict) or set(document) != required:
-        return None
-    if (
-        document["completed"] is not True
-        or document["completion_criterion_met"] is not True
-        or not isinstance(document["result"], str)
-        or not document["result"].strip()
-        or not isinstance(document["files_read"], list)
-        or not isinstance(document["files_modified"], list)
-        or not isinstance(document["observations"], list)
-    ):
+        document = decode_step_completion(message.content)
+    except ValueError:
         return None
     try:
         context_update = ContextUpdate(

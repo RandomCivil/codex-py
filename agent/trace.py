@@ -315,7 +315,7 @@ def _cache_relevant_shape(request: Any) -> dict[str, Any]:
         return {}
     return {
         key: _as_serializable(request[key])
-        for key in ("model", "instructions", "tools", "text", "response_format")
+        for key in ("model", "instructions", "tools", "text")
         if key in request
     }
 

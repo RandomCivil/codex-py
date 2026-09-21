@@ -459,7 +459,6 @@ async def _select_conversation_mode(
         analyzer_configuration.base_url,
         analyzer_configuration.api_key,
         analyzer_configuration.model_name,
-        response_format=analyzer_configuration.response_format,
         on_event=trace.llm_event,
         on_request=lambda request: trace.llm_request("task_analyzer", request),
     )
@@ -467,7 +466,6 @@ async def _select_conversation_mode(
         mode = route(
             await TaskAnalyzer(
                 analyzer_llm,
-                response_format=analyzer_configuration.response_format,
             ).run(conversation_input.current_input)
         )
         trace.task_route(mode)

@@ -138,13 +138,11 @@ model:
   base_url: https://your-provider.example/v1
   api_key: your-api-key
   model_name: gpt-4o-mini
-  response_format: json_schema
 
 planner:
   model_name: planner-model
 
 executor:
-  response_format: json_object
 
 # Whole-task execution mode overrides are optional and inherit from model.
 direct:
@@ -154,22 +152,20 @@ tool_agent:
   base_url: https://tools-provider.example/v1
 
 react:
-  response_format: json_schema
 
 # Optional; when omitted, Observation calls use the owning ReAct/Executor model.
 # When present, it inherits model and generates and compacts tool-round Observations.
 runtime_context:
   model_name: context-summary-model
-  response_format: json_object
 
 # Optional; inherits the effective planner configuration.
 task_analyzer:
   model_name: task-analysis-model
 ```
 
-`response_format` 只能是 `json_schema` 或 `json_object`。需要结构化结果的请求会使用所属组件的有效格式；`json_schema` 请求使用该调用的严格 schema，`json_object` 请求只要求返回 JSON object，Agent 仍会在本地严格校验结果。Executor 的工具选择请求不绑定结构化输出，以保留 MCP function call 能力；最终 completion receipt 使用 Executor 的有效格式。
-`direct`、`tool_agent` 和 `react` 使用各自 provider 的有效 `response_format`（未显式配置时继承共享模型配置，最终回退为 `json_schema`）。CLI 不提供 mode selector；单次 `run` 与每个 Conversation turn 都由 Task Router 通过 Python factory 组合并选择模式。
-`runtime_context` 使用 Structured-output mode，默认继承共享模型配置；它只负责生成与合并 Tool-round Observation，可单独指定 provider、模型和 `response_format`。`task_analyzer` 使用 Structured-output mode，并默认继承 Planner 的有效配置；它只描述任务特征，不能选择 Execution mode。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
+所有非工具模型响应都使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
+
+旧配置中的 `response_format` 已移除；包含该字段的 YAML 会在任何模型或工具工作前报出迁移错误。
 
 YAML 中的 `api_key` 是明文配置。请限制配置文件的文件权限，例如：
 

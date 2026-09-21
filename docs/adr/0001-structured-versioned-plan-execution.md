@@ -1,6 +1,6 @@
 # Structured, versioned Plan–Execute execution
 
-The Agent coordinates a Planner and Executor through immutable, machine-validatable Plan revisions. The Planner derives a whole-goal, strictly serial Plan from the goal and Agent state, emitting strict JSON that is validated into Plan and PlanStep values; the Executor chooses tools at runtime to pursue each step's intent but never modifies the Plan. Failed execution is recorded and returned to the Agent, which may request a new Plan revision up to a three-revision goal budget before returning a blocked result. This preserves explicit tool authority while making planning and execution history auditable.
+The Agent coordinates a Planner and Executor through immutable, machine-validatable Plan revisions. The Planner derives a whole-goal, strictly serial Plan from the goal and Agent state, emitting a locally validated `PLAN` Line Protocol block that becomes Plan and PlanStep values; the Executor chooses tools at runtime to pursue each step's intent but never modifies the Plan. Failed execution is recorded and returned to the Agent, which may request a new Plan revision up to a three-revision goal budget before returning a blocked result. This preserves explicit tool authority while making planning and execution history auditable.
 
 ## Considered Options
 

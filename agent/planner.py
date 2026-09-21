@@ -1,7 +1,7 @@
 import json
 from typing import Any, Mapping
 
-from llm.response_format import ResponseFormat, require_response_format
+from llm.line_protocol import PLAN_INSTRUCTIONS, LineProtocolError, decode_plan
 from llm.text_stream import TextStream
 from memory.state import AgentState, Plan, PlanStep
 
@@ -11,47 +11,11 @@ class PlanningValidationError(ValueError):
 
 
 class Planner:
-    _TEXT_FORMAT = {
-        "type": "json_schema",
-        "name": "agent_plan",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["revision", "goal", "steps"],
-            "properties": {
-                "revision": {"type": "integer"},
-                "goal": {"type": "string", "minLength": 1},
-                "steps": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["id", "intent", "completion_criterion"],
-                        "properties": {
-                            "id": {"type": "string", "minLength": 1, "pattern": "\\S"},
-                            "intent": {"type": "string", "minLength": 1, "pattern": "\\S"},
-                            "completion_criterion": {"type": "string", "minLength": 1, "pattern": "\\S"},
-                        },
-                    },
-                },
-            },
-        },
-    }
-    _JSON_OBJECT_INSTRUCTIONS = (
-        "Return only strict JSON for the complete Plan. Do not use markdown or prose. "
-        "The JSON must contain exactly revision, goal, and steps. Each step must "
-        "contain exactly id, intent, and completion_criterion."
-    )
-    _SCHEMA_INSTRUCTIONS = (
-        "Create a complete Plan from the provided Agent state. "
-        + _JSON_OBJECT_INSTRUCTIONS
-    )
-    def __init__(self, text_stream: TextStream, trace: Any | None = None, *, response_format: ResponseFormat = "json_schema") -> None:
+    _PLAN_INSTRUCTIONS = PLAN_INSTRUCTIONS
+
+    def __init__(self, text_stream: TextStream, trace: Any | None = None) -> None:
         self._text_stream = text_stream
         self._trace = trace
-        self._response_format = require_response_format(response_format)
 
     async def plan(self, state: AgentState, *, conversation_input: Any = None) -> Plan:
         expected_revision = len(state.plan_history) + 1
@@ -64,24 +28,20 @@ class Planner:
         request = json.dumps(
             _state_payload(state, conversation_input=conversation_input), ensure_ascii=False, sort_keys=True
         )
-        text_format = self._TEXT_FORMAT if self._response_format == "json_schema" else {"type": "json_object"}
-        instructions = (
-            self._SCHEMA_INSTRUCTIONS
-            if self._response_format == "json_schema"
-            else self._JSON_OBJECT_INSTRUCTIONS
-        )
         output = "".join(
             [
                 chunk
                 async for chunk in self._text_stream.stream_text(
                     request,
-                    instructions=instructions,
+                    instructions=self._PLAN_INSTRUCTIONS,
                     tools=None,
-                    text_format=text_format,
                 )
             ]
         )
-        plan = _parse_plan(output, state.goal, expected_revision)
+        try:
+            plan = decode_plan(output, goal=state.goal, expected_revision=expected_revision)
+        except LineProtocolError as error:
+            raise PlanningValidationError(str(error)) from error
         if self._trace is not None:
             self._trace.plan("completed", plan.revision)
         return plan
@@ -137,65 +97,6 @@ def _state_payload(state: AgentState, *, conversation_input: Any = None) -> dict
 
 def _parse_plan(output: str, goal: str, expected_revision: int) -> Plan:
     try:
-        document = json.loads(output)
-    except json.JSONDecodeError as error:
-        raise PlanningValidationError("planning output must be strict JSON") from error
-
-    if not isinstance(document, dict):
-        raise PlanningValidationError("planning output must be a JSON object")
-    if set(document) != {"revision", "goal", "steps"}:
-        raise PlanningValidationError("plan must contain exactly revision, goal, and steps")
-    revision = document["revision"]
-    if type(revision) is float and revision.is_integer():
-        revision = int(revision)
-    elif isinstance(revision, str):
-        try:
-            parsed_revision = float(revision.strip())
-        except ValueError:
-            parsed_revision = None
-        if parsed_revision is not None and parsed_revision.is_integer():
-            revision = int(parsed_revision)
-    if type(revision) is not int or revision != expected_revision:
-        raise PlanningValidationError(
-            f"plan revision must be the next sequential revision ({expected_revision})"
-        )
-    # The state owns the goal.  Compatible providers may paraphrase this
-    # redundant response field even when their steps address the supplied
-    # goal, so validate its shape but never let it replace durable state.
-    if not isinstance(document["goal"], str) or not document["goal"].strip():
-        raise PlanningValidationError("plan goal must be a non-empty string")
-    if not isinstance(document["steps"], list):
-        raise PlanningValidationError("plan steps must be a JSON array")
-
-    steps = []
-    for raw_step in document["steps"]:
-        if not isinstance(raw_step, dict) or set(raw_step) != {
-            "id",
-            "intent",
-            "completion_criterion",
-        }:
-            raise PlanningValidationError(
-                "each plan step must contain exactly id, intent, and completion_criterion"
-            )
-        try:
-            step_id = raw_step["id"]
-            # Some OpenAI-compatible providers ignore the string type in the
-            # schema and emit ordinal step IDs as JSON numbers. IDs are opaque
-            # strings in the domain model, so normalize that harmless variant
-            # at the Planner boundary before validation.
-            if type(step_id) is int:
-                step_id = str(step_id)
-            steps.append(
-                PlanStep(
-                    step_id,
-                    raw_step["intent"],
-                    raw_step["completion_criterion"],
-                )
-            )
-        except (TypeError, ValueError) as error:
-            raise PlanningValidationError("plan contains an invalid step") from error
-
-    try:
-        return Plan(expected_revision, goal, tuple(steps))
-    except (TypeError, ValueError) as error:
-        raise PlanningValidationError("plan violates its invariants") from error
+        return decode_plan(output, goal=goal, expected_revision=expected_revision)
+    except LineProtocolError as error:
+        raise PlanningValidationError(str(error)) from error

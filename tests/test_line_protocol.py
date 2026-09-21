@@ -1,0 +1,131 @@
+import asyncio
+
+import pytest
+
+from agent import Planner, PlanningValidationError
+from llm.line_protocol import (
+    CODEC_REGISTRY,
+    LineProtocolError,
+    decode_goal_completion,
+    decode_no_tool,
+    decode_plan,
+    decode_step_completion,
+    parse_line_protocol,
+)
+from memory.state import AgentState
+
+
+def test_plan_protocol_decodes_nested_steps_and_json_literals():
+    document = '''BEGIN PLAN
+REVISION=1
+GOAL="Prepare \\"release\\""
+BEGIN STEP
+ID="inspect"
+INTENT="Inspect the release"
+COMPLETION_CRITERION="Risks are listed"
+END STEP
+END PLAN'''
+
+    plan = decode_plan(document, goal="Prepare release", expected_revision=1)
+
+    assert plan.goal == "Prepare release"
+    assert plan.steps[0].id == "inspect"
+    assert plan.steps[0].intent == "Inspect the release"
+
+
+def test_line_protocol_normalizes_crlf_and_rejects_unexpected_fields():
+    parsed = parse_line_protocol("BEGIN NO_TOOL\r\nEND NO_TOOL\r\n")
+    assert parsed.type == "NO_TOOL"
+
+    with pytest.raises(LineProtocolError):
+        parse_line_protocol("BEGIN PLAN\nREVISION=1\nUNKNOWN=true\nEND PLAN\n")
+
+
+@pytest.mark.parametrize("literal, expected", [
+    ('"quoted \\"text\\""', 'quoted "text"'), ("0", 0), ("-1.5", -1.5),
+    ("true", True), ("false", False), ("null", None),
+])
+def test_parser_preserves_all_json_scalar_literals(literal, expected, monkeypatch):
+    monkeypatch.setitem(CODEC_REGISTRY, "ANSWER", {
+        "fields": frozenset({"VALUE"}), "scalar_arrays": frozenset(), "children": frozenset(),
+    })
+    block = parse_line_protocol(f"BEGIN ANSWER\nVALUE={literal}\nEND ANSWER")
+    assert block.fields == {"VALUE": [expected]}
+
+
+def test_parser_supports_declared_dot_paths_scalar_arrays_and_object_arrays(monkeypatch):
+    monkeypatch.setitem(CODEC_REGISTRY, "ANSWER", {
+        "fields": frozenset({"METADATA.SOURCE", "TAG"}),
+        "scalar_arrays": frozenset({"TAG"}), "children": frozenset({"EVIDENCE"}),
+    })
+    document = (
+        'BEGIN ANSWER\nMETADATA.SOURCE="model"\nTAG="one"\nTAG="two"\n'
+        'BEGIN EVIDENCE\nCATEGORY="confirmed_facts"\nTEXT="fact"\n'
+        'TOOL_CALL_ID="call-1"\nEND EVIDENCE\nEND ANSWER'
+    )
+    block = parse_line_protocol(document)
+    assert block.fields == {"METADATA.SOURCE": ["model"], "TAG": ["one", "two"]}
+    assert block.children[0].type == "EVIDENCE"
+
+
+def test_parser_rejects_repeated_non_array_and_unregistered_child_blocks():
+    with pytest.raises(LineProtocolError):
+        parse_line_protocol('BEGIN ANSWER\nTEXT="one"\nTEXT="two"\nEND ANSWER')
+    with pytest.raises(LineProtocolError):
+        parse_line_protocol('BEGIN ANSWER\nBEGIN STEP\nID="one"\nINTENT="do"\nCOMPLETION_CRITERION="done"\nEND STEP\nEND ANSWER')
+
+
+def test_decodes_goal_completion_and_step_completion_contracts():
+    goal = decode_goal_completion(
+        'BEGIN GOAL_COMPLETION\nANSWER="Done."\nGOAL_SATISFIED=true\nEND GOAL_COMPLETION'
+    )
+    assert goal == "Done."
+
+    completion = decode_step_completion(
+        'BEGIN STEP_COMPLETION\n'
+        'COMPLETED=true\nCOMPLETION_CRITERION_MET=true\nRESULT="Published."\n'
+        'FILES_READ="README.md"\nFILES_MODIFIED="src/app.py"\n'
+        'OBSERVATIONS="Release was published."\nEND STEP_COMPLETION'
+    )
+    assert completion == {
+        "result": "Published.",
+        "files_read": ["README.md"],
+        "files_modified": ["src/app.py"],
+        "observations": ["Release was published."],
+    }
+
+
+def test_step_completion_allows_empty_declared_scalar_arrays():
+    completion = decode_step_completion(
+        'BEGIN STEP_COMPLETION\nCOMPLETED=true\nCOMPLETION_CRITERION_MET=true\n'
+        'RESULT="Done"\nEND STEP_COMPLETION'
+    )
+    assert completion["files_read"] == completion["files_modified"] == completion["observations"] == []
+
+
+def test_no_tool_requires_an_empty_registered_block():
+    assert decode_no_tool("BEGIN NO_TOOL\nEND NO_TOOL") is None
+    with pytest.raises(LineProtocolError):
+        decode_no_tool('BEGIN NO_TOOL\nTEXT="no"\nEND NO_TOOL')
+
+
+def test_planner_decodes_plan_protocol_without_provider_format():
+    class Stream:
+        async def stream_text(self, input, *, instructions=None, tools=None):
+            self.request = {"instructions": instructions}
+            yield 'BEGIN PLAN\nREVISION=1\nGOAL="Prepare release"\nBEGIN STEP\nID="one"\nINTENT="Do one"\nCOMPLETION_CRITERION="One is done"\nEND STEP\nEND PLAN\n'
+
+    stream = Stream()
+    plan = asyncio.run(Planner(stream).plan(AgentState("Prepare release")))
+
+    assert plan.steps[0].id == "one"
+    assert "BEGIN PLAN" in stream.request["instructions"]
+
+
+def test_planner_rejects_malformed_protocol():
+    class Stream:
+        async def stream_text(self, input, *, instructions=None, tools=None):
+            yield "BEGIN PLAN\nREVISION=1\nEND PLAN\n"
+
+    with pytest.raises(PlanningValidationError):
+        asyncio.run(Planner(Stream()).plan(AgentState("Prepare release")))

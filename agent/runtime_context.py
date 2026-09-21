@@ -14,25 +14,28 @@ from typing import Any, Literal, Mapping, Sequence
 
 from langchain_core.messages import HumanMessage
 
-from llm.response_format import ResponseFormat, chat_response_format
+from llm.line_protocol import LineProtocolError, parse_line_protocol
 
 
 DEFAULT_CONTEXT_BUDGET = 128_000
 RAW_ROUND_WINDOW = 3
 
 
-_OBSERVATION_CONTRACT = """Create the Observation for the settled Tool round in the next message.
+_OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
+BEGIN OBSERVATION ... END OBSERVATION.
+Create the Observation for the settled Tool round in the next message.
 Classify tool-confirmed output as confirmed_facts, every raw error as reported_errors,
-and interpretations as model_inferences. Every evidence entry must retain its relevant
-tool_call_ids."""
+and interpretations as model_inferences. Set ROUND to the source round. Every evidence
+entry is one nested EVIDENCE block with CATEGORY, TEXT, and one or more repeated
+TOOL_CALL_ID fields. Use JSON literals after '=' and do not output prose."""
 
-_MERGE_OBSERVATION_CONTRACT = """Merge the Observations in the next message into one Observation.
-Preserve every source tool-call ID and report the latest source round."""
-
-_JSON_OBJECT_SHAPE_GUARANTEE = """Return exactly one JSON object and no Markdown.
-It must contain exactly round, confirmed_facts, reported_errors, and model_inferences.
-Each evidence entry must contain exactly text and tool_call_ids. Preserve the source
-round and every source tool-call ID."""
+_MERGE_OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
+BEGIN OBSERVATION ... END OBSERVATION.
+Merge the Observations in the next message into one Observation. Set ROUND to the
+latest source round and preserve source-round metadata with SOURCE_ROUND_START and
+SOURCE_ROUND_END. Preserve every source tool-call ID. Each evidence entry is one
+nested EVIDENCE block with CATEGORY, TEXT, and repeated TOOL_CALL_ID fields. Use JSON
+literals after '=' and do not output prose."""
 
 
 class ContextMaintenanceError(RuntimeError):
@@ -47,18 +50,12 @@ class _ObservationValidationError(ContextMaintenanceError):
     """The provider response did not satisfy the Observation contract."""
 
 
-def _observation_contract(response_format: ResponseFormat) -> str:
-    return _structured_contract(_OBSERVATION_CONTRACT, response_format)
+def _observation_contract() -> str:
+    return _OBSERVATION_CONTRACT
 
 
-def _merge_observation_contract(response_format: ResponseFormat) -> str:
-    return _structured_contract(_MERGE_OBSERVATION_CONTRACT, response_format)
-
-
-def _structured_contract(contract: str, response_format: ResponseFormat) -> str:
-    if response_format == "json_schema":
-        return contract
-    return f"{contract}\n\n{_JSON_OBJECT_SHAPE_GUARANTEE}"
+def _merge_observation_contract() -> str:
+    return _MERGE_OBSERVATION_CONTRACT
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,19 +133,15 @@ class RuntimeContextPolicy:
         *,
         budget: int = DEFAULT_CONTEXT_BUDGET,
         raw_rounds: int = RAW_ROUND_WINDOW,
-        response_format: ResponseFormat = "json_schema",
         trace: Any | None = None,
     ) -> None:
         if type(budget) is not int or budget <= 0:
             raise ValueError("context budget must be a positive integer")
         if type(raw_rounds) is not int or raw_rounds <= 0:
             raise ValueError("raw_rounds must be a positive integer")
-        if response_format not in {"json_schema", "json_object"}:
-            raise ValueError("response_format must be json_schema or json_object")
         self.model = model
         self.budget = budget
         self.raw_rounds = raw_rounds
-        self._response_format = response_format
         self._trace = trace
         self._raw: list[RawToolResult] = []
         self._observations: list[Observation] = []
@@ -176,7 +169,6 @@ class RuntimeContextPolicy:
             self.model,
             budget=self.budget,
             raw_rounds=self.raw_rounds,
-            response_format=self._response_format,
             trace=self._trace,
         )
 
@@ -314,7 +306,7 @@ class RuntimeContextPolicy:
     async def _request_observation(self, raw: RawToolResult) -> Observation:
         response = await self._structured_invoke(
             [
-                HumanMessage(content=_observation_contract(self._response_format)),
+                HumanMessage(content=_observation_contract()),
                 HumanMessage(content=json.dumps(_raw_payload(raw), default=str)),
             ],
             request_kind="observation",
@@ -324,7 +316,7 @@ class RuntimeContextPolicy:
     async def _merge_observations(self, first: Observation, second: Observation) -> Observation:
         response = await self._structured_invoke(
             [
-                HumanMessage(content=_merge_observation_contract(self._response_format)),
+                HumanMessage(content=_merge_observation_contract()),
                 HumanMessage(
                     content=json.dumps(
                         [_observation_payload(first), _observation_payload(second)],
@@ -351,9 +343,8 @@ class RuntimeContextPolicy:
         self, messages: list[HumanMessage], *, request_kind: str
     ) -> Any:
         self._model_uses += 1
-        schema = _observation_response_format(self._response_format)
         try:
-            bound = self.model.bind(tools=[], response_format=schema)
+            bound = self.model.bind(tools=[])
             if self._trace is not None:
                 callback = getattr(self._trace, "llm_request", None)
                 runtime_context_callback = getattr(self._trace, "runtime_context_llm_request", None)
@@ -366,7 +357,6 @@ class RuntimeContextPolicy:
                         static_shape={
                             "instructions": getattr(messages[0], "content", ""),
                             "request_kind": request_kind,
-                            "response_format": schema,
                         },
                     )
                 else:
@@ -380,7 +370,6 @@ class RuntimeContextPolicy:
                 static_shape = {
                     "instructions": getattr(messages[0], "content", ""),
                     "request_kind": request_kind,
-                    "response_format": schema,
                 }
                 if runtime_context_callback is not None:
                     runtime_context_callback(response, static_shape=static_shape)
@@ -391,69 +380,58 @@ class RuntimeContextPolicy:
             raise _ObservationProviderError(str(error) or "Runtime context model request failed") from error
 
 
-def _observation_response_format(response_format: ResponseFormat) -> dict[str, Any]:
-    """Use the owning component's configured Structured-output mode."""
-    return chat_response_format(
-        response_format,
-        name="tool_round_observation",
-        schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["round", "confirmed_facts", "reported_errors", "model_inferences"],
-            "properties": {
-                "round": {"type": "integer"},
-                **{key: {"type": "array", "items": {"$ref": "#/$defs/evidence"}} for key in ("confirmed_facts", "reported_errors", "model_inferences")},
-            },
-            "$defs": {
-                "evidence": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["text", "tool_call_ids"],
-                    "properties": {"text": {"type": "string", "minLength": 1}, "tool_call_ids": {"type": "array", "items": {"type": "string"}}},
-                }
-            },
-        },
-    )
-
-
 def _parse_observation(response: Any, *, expected_round: int) -> Observation:
     content = getattr(response, "content", response)
-    if isinstance(content, str):
-        try:
-            content = json.loads(content)
-        except json.JSONDecodeError as error:
-            raise _ObservationValidationError("Observation was not valid JSON") from error
-    if not isinstance(content, Mapping):
-        raise _ObservationValidationError("Observation was not an object")
-    required = {"round", "confirmed_facts", "reported_errors", "model_inferences"}
-    if (
-        set(content) != required
-        or type(content["round"]) is not int
-        or content["round"] != expected_round
-    ):
-        raise _ObservationValidationError("Observation schema or round is invalid")
+    if not isinstance(content, str):
+        raise _ObservationValidationError("Observation protocol response must be text")
     try:
-        parsed = {}
-        for key in ("confirmed_facts", "reported_errors", "model_inferences"):
-            if not isinstance(content[key], list):
-                raise TypeError
-            entries = []
-            for item in content[key]:
-                if (
-                    not isinstance(item, Mapping)
-                    or set(item) != {"text", "tool_call_ids"}
-                    or not isinstance(item["text"], str)
-                    or not isinstance(item["tool_call_ids"], list)
-                    or any(not isinstance(call_id, str) for call_id in item["tool_call_ids"])
-                ):
-                    raise TypeError
-                entries.append(Evidence(item["text"], tuple(item["tool_call_ids"])))
-            parsed[key] = tuple(entries)
-    except (KeyError, TypeError):
-        raise _ObservationValidationError("Observation evidence is invalid") from None
-    if any(not evidence.text.strip() for values in parsed.values() for evidence in values):
-        raise _ObservationValidationError("Observation evidence is invalid")
-    return Observation(expected_round, **parsed)
+        block = parse_line_protocol(content)
+        if block.type != "OBSERVATION":
+            raise LineProtocolError("expected BEGIN OBSERVATION")
+        fields = block.fields
+        round_number = _single_protocol_field(fields, "ROUND")
+        if type(round_number) is not int or round_number != expected_round:
+            raise ValueError("round")
+        source_start = _optional_protocol_int(fields, "SOURCE_ROUND_START")
+        source_end = _optional_protocol_int(fields, "SOURCE_ROUND_END")
+        if (source_start is None) != (source_end is None) or (
+            source_start is not None and source_start > source_end
+        ):
+            raise ValueError("source range")
+        parsed: dict[str, tuple[Evidence, ...]] = {
+            "confirmed_facts": (), "reported_errors": (), "model_inferences": ()
+        }
+        for evidence in block.children:
+            block_fields = evidence.fields
+            if set(block_fields) - {"CATEGORY", "TEXT", "TOOL_CALL_ID"}:
+                raise ValueError("evidence fields")
+            category = _single_protocol_field(block_fields, "CATEGORY")
+            if category not in parsed:
+                raise ValueError("category")
+            text = _single_protocol_field(block_fields, "TEXT")
+            ids = block_fields.get("TOOL_CALL_ID", [])
+            if not isinstance(text, str) or not text.strip() or not ids or any(not isinstance(item, str) for item in ids):
+                raise ValueError("evidence")
+            parsed[category] += (Evidence(text, tuple(ids)),)
+        return Observation(expected_round, **parsed, source_round_start=source_start, source_round_end=source_end)
+    except (KeyError, TypeError, ValueError, LineProtocolError) as error:
+        raise _ObservationValidationError("Observation Line Protocol is invalid") from error
+
+
+def _single_protocol_field(fields: Mapping[str, list[Any]], name: str) -> Any:
+    values = fields.get(name)
+    if values is None or len(values) != 1:
+        raise ValueError(name)
+    return values[0]
+
+
+def _optional_protocol_int(fields: Mapping[str, list[Any]], name: str) -> int | None:
+    if name not in fields:
+        return None
+    value = _single_protocol_field(fields, name)
+    if type(value) is not int:
+        raise ValueError(name)
+    return value
 
 
 def _result_error(result: Any) -> str | None:

@@ -16,7 +16,6 @@ def test_model_request_usage_is_attributed_to_a_safe_deterministic_request_famil
             "instructions": "Return a plan.",
             "input": "secret goal one",
             "tools": None,
-            "text": {"format": {"type": "json_schema", "name": "agent_plan"}},
         },
     )
     first.llm_event(
@@ -41,7 +40,6 @@ def test_model_request_usage_is_attributed_to_a_safe_deterministic_request_famil
             "instructions": "Return a plan.",
             "input": "different secret goal",
             "tools": None,
-            "text": {"format": {"type": "json_schema", "name": "agent_plan"}},
         },
     )
     second.llm_usage(
@@ -187,7 +185,6 @@ def test_runtime_context_response_usage_is_attributed_without_global_request_sta
         static_shape={
             "instructions": "Create the Observation.",
             "request_kind": "observation",
-            "response_format": {"type": "json_schema"},
         },
     )
 

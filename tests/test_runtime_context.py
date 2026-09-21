@@ -8,6 +8,21 @@ import pytest
 from agent.runtime_context import DEFAULT_CONTEXT_BUDGET, ContextMaintenanceError, RuntimeContextPolicy
 
 
+def observation_protocol(payload):
+    lines = ["BEGIN OBSERVATION", f"ROUND={payload['round']}"]
+    for category in ("confirmed_facts", "reported_errors", "model_inferences"):
+        for evidence in payload[category]:
+            lines.extend([
+                "BEGIN EVIDENCE",
+                f"CATEGORY={json.dumps(category)}",
+                f"TEXT={json.dumps(evidence['text'])}",
+                *[f"TOOL_CALL_ID={json.dumps(call_id)}" for call_id in evidence["tool_call_ids"]],
+                "END EVIDENCE",
+            ])
+    lines.append("END OBSERVATION")
+    return "\n".join(lines)
+
+
 class ObservationModel:
     def __init__(self, content):
         self.content = content
@@ -19,7 +34,7 @@ class ObservationModel:
 
     async def ainvoke(self, messages):
         self.calls.append(messages)
-        return AIMessage(content=json.dumps(self.content))
+        return AIMessage(content=observation_protocol(self.content) if isinstance(self.content, dict) else self.content)
 
 
 class BlockingObservationModel(ObservationModel):
@@ -33,7 +48,7 @@ class BlockingObservationModel(ObservationModel):
         self.started.set()
         await self.release.wait()
         return AIMessage(
-            content=json.dumps(
+            content=observation_protocol(
                 {
                     "round": 1,
                     "confirmed_facts": [],
@@ -57,7 +72,7 @@ class FirstObservationDelayedModel(BlockingObservationModel):
             self.started.set()
             await self.release.wait()
         return AIMessage(
-            content=json.dumps(
+            content=observation_protocol(
                 {
                     "round": response_round,
                     "confirmed_facts": [
@@ -109,7 +124,9 @@ def test_observation_lifecycle_accounts_model_use_without_consuming_tool_rounds_
 
 def test_invalid_observation_is_diagnosable_and_keeps_raw_fallback():
     async def run():
-        policy = RuntimeContextPolicy(ObservationModel({"round": 1}))
+        policy = RuntimeContextPolicy(
+            ObservationModel("BEGIN OBSERVATION\nROUND=1\nUNKNOWN=true\nEND OBSERVATION")
+        )
 
         await policy.record_tool_round(
             1, [{"id": "call-1", "name": "read", "args": {}}], ["done"]
@@ -263,7 +280,7 @@ class SequencedObservationModel(ObservationModel):
         self.round += 1
         self.calls.append(messages)
         return AIMessage(
-            content=json.dumps(
+            content=observation_protocol(
                 {
                     "round": self.round,
                     "confirmed_facts": [
@@ -279,14 +296,12 @@ class SequencedObservationModel(ObservationModel):
 class MergeObservationModel(SequencedObservationModel):
     async def ainvoke(self, messages):
         self.calls.append(messages)
-        if "merge_observations" in messages[0].content or (
-            len(messages) == 2 and "Merge the Observations" in messages[0].content
-        ):
+        if "Merge the Observations" in messages[0].content:
             payload = json.loads(messages[-1].content)
             observations = payload if isinstance(payload, list) else payload["merge_observations"]
             second_round = observations[1]["round"]
             return AIMessage(
-                content=json.dumps(
+                content=observation_protocol(
                     {
                         "round": second_round,
                         "confirmed_facts": [
@@ -299,7 +314,7 @@ class MergeObservationModel(SequencedObservationModel):
             )
         self.round += 1
         return AIMessage(
-            content=json.dumps(
+            content=observation_protocol(
                 {
                     "round": self.round,
                     "confirmed_facts": [
@@ -383,11 +398,11 @@ def test_policy_retains_explicit_tool_failures_with_the_raw_result():
     assert "reported_errors" in model.calls[0][0].content
 
 
-def test_observation_request_uses_the_component_response_format():
+def test_observation_request_uses_line_protocol_without_provider_response_format():
     model = ObservationModel(
         {"round": 1, "confirmed_facts": [], "reported_errors": [], "model_inferences": []}
     )
-    policy = RuntimeContextPolicy(model, response_format="json_object")
+    policy = RuntimeContextPolicy(model)
 
     async def run():
         await policy.record_tool_round(
@@ -398,10 +413,10 @@ def test_observation_request_uses_the_component_response_format():
 
     asyncio.run(run())
 
-    assert model.bind_options == {"tools": [], "response_format": {"type": "json_object"}}
+    assert model.bind_options == {"tools": []}
     contract, evidence = model.calls[0]
-    assert "Return exactly one JSON object" in contract.content
-    assert "round, confirmed_facts, reported_errors, and model_inferences" in contract.content
+    assert "BEGIN OBSERVATION" in contract.content
+    assert "Return exactly one JSON object" not in contract.content
     assert json.loads(evidence.content)["calls"][0]["id"] == "call-1"
 
 
@@ -431,7 +446,7 @@ def test_observation_request_puts_its_fixed_contract_before_settled_raw_evidence
     assert "Create the Observation" in contract.content
     assert "call-1" not in contract.content
     assert "VERSION" not in contract.content
-    assert "Return exactly one JSON object" not in contract.content
+    assert "BEGIN OBSERVATION" in contract.content
     assert json.loads(evidence.content) == {
         "round": 1,
         "calls": [
@@ -534,7 +549,7 @@ def test_policy_merges_oldest_expired_observations_and_preserves_source_range(mo
     merge_contract, merge_evidence = next(
         call for call in model.calls if len(call) == 2 and "Merge the Observations" in call[0].content
     )
-    assert "Return exactly one JSON object" not in merge_contract.content
+    assert "BEGIN OBSERVATION" in merge_contract.content
     assert [item["round"] for item in json.loads(merge_evidence.content)] == [1, 2]
 
 
@@ -554,7 +569,7 @@ def test_policy_merges_observations_in_round_order_after_out_of_order_completion
             payload = json.loads(messages[1].content)
             if isinstance(payload, list):
                 self.merge_payloads.append(payload)
-                return AIMessage(content=json.dumps({
+                return AIMessage(content=observation_protocol({
                     "round": payload[-1]["round"],
                     "confirmed_facts": [
                         {
@@ -574,7 +589,7 @@ def test_policy_merges_observations_in_round_order_after_out_of_order_completion
                 self.first_started.set()
                 await self.release_first.wait()
             round_number = payload["round"]
-            return AIMessage(content=json.dumps({
+            return AIMessage(content=observation_protocol({
                 "round": round_number,
                 "confirmed_facts": [{"text": f"fact-{round_number}", "tool_call_ids": [f"call-{round_number}"]}],
                 "reported_errors": [],
@@ -625,7 +640,7 @@ def test_observation_merge_request_puts_fixed_contract_before_observations(monke
     assert "Merge the Observations" in contract.content
     assert "call-1" not in contract.content
     assert "call-2" not in contract.content
-    assert "Return exactly one JSON object" not in contract.content
+    assert "BEGIN OBSERVATION" in contract.content
     assert [item["round"] for item in json.loads(evidence.content)] == [1, 2]
     assert [item["confirmed_facts"][0]["tool_call_ids"] for item in json.loads(evidence.content)] == [
         ["call-1"],
@@ -633,10 +648,10 @@ def test_observation_merge_request_puts_fixed_contract_before_observations(monke
     ]
 
 
-def test_observation_merge_request_keeps_json_object_shape_guarantees_in_its_contract(monkeypatch):
+def test_observation_merge_request_omits_provider_response_format(monkeypatch):
     monkeypatch.setattr("agent.runtime_context._estimate_tokens", lambda context: 2 if len(context.observations) > 1 else 1)
     model = MergeObservationModel()
-    policy = RuntimeContextPolicy(model, budget=1, response_format="json_object")
+    policy = RuntimeContextPolicy(model, budget=1)
 
     async def run():
         for round_number in range(1, 6):
@@ -651,11 +666,10 @@ def test_observation_merge_request_keeps_json_object_shape_guarantees_in_its_con
 
     contract, evidence = model.calls[-1]
 
-    assert "Return exactly one JSON object" in contract.content
-    assert "round, confirmed_facts, reported_errors, and model_inferences" in contract.content
+    assert "BEGIN OBSERVATION" in contract.content
     assert "call-1" not in contract.content
     assert [item["round"] for item in json.loads(evidence.content)] == [1, 2]
-    assert model.bind_options == {"tools": [], "response_format": {"type": "json_object"}}
+    assert model.bind_options == {"tools": []}
 
 
 def test_policy_fails_instead_of_merging_an_observation_with_a_recent_raw_round(monkeypatch):

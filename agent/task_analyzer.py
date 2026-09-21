@@ -1,12 +1,11 @@
 """Structured task analysis and deterministic execution-mode routing."""
 
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from agent.execution import ExecutionAnswer, ExecutionMode, ExecutionModeName
-from llm.response_format import ResponseFormat, require_response_format
+from llm.line_protocol import CODEC_REGISTRY, LineProtocolError, parse_line_protocol
 from llm.text_stream import TextStream
 
 
@@ -292,69 +291,35 @@ Do not recommend an architecture, expose chain-of-thought, or include implementa
 """
 
 
-_TASK_ANALYZER_JSON_OBJECT_CONTRACT = """
+_TASK_ANALYSIS_INSTRUCTIONS = _TASK_ANALYZER_INSTRUCTIONS + """
 ## Output requirements
 
-Return JSON only.
+Return exactly one Line Protocol block:
 
-Use exactly this schema:
+BEGIN TASK_ANALYSIS
+TASK_TYPE="research"
+GOAL_CLARITY=0.0
+NEEDS_TOOLS=false
+TOOL_DIVERSITY=0.0
+KNOWN_STEPS=0.0
+PATH_UNCERTAINTY=0.0
+STEP_DEPENDENCY=0.0
+DYNAMIC_BRANCHING=0.0
+EXPECTED_STEPS=1
+EXPECTED_HORIZON="short"
+FAILURE_RECOVERY=0.0
+NEED_REPLANNING=0.0
+OPEN_SUBGOALS=0
+PARALLELIZABLE=false
+RISK_LEVEL="low"
+REASONING_SUMMARY="Briefly explain the main task characteristics without recommending an architecture."
+END TASK_ANALYSIS
 
-{
-    "task_type": "generation | transformation | retrieval | tool_action | workflow | diagnosis | research | coding | planning | mixed",
-    "goal_clarity": 0.0,
-    "needs_tools": false,
-    "tool_diversity": 0.0,
-    "known_steps": 0.0,
-    "path_uncertainty": 0.0,
-    "step_dependency": 0.0,
-    "dynamic_branching": 0.0,
-    "expected_steps": 1,
-    "expected_horizon": "short | medium | long",
-    "failure_recovery": 0.0,
-    "need_replanning": 0.0,
-    "open_subgoals": 0,
-    "parallelizable": false,
-    "risk_level": "low | medium | high",
-    "reasoning_summary": "Briefly explain the main task characteristics without recommending an architecture."
-}
-
-Do not include:
-
-* an architecture recommendation
-* chain-of-thought
-* implementation details
-* markdown
-* additional fields
-
+Use uppercase snake-case field names exactly as shown. Scalar values must be JSON
+literals (strings quoted and escaped). Do not include prose or additional fields.
 """
 
 
-_TASK_ANALYZER_RETRY_INSTRUCTIONS = """
-Your preceding response did not satisfy the task-analysis contract. Return the
-complete task analysis again as JSON only, exactly as required. Include every
-required field, including reasoning_summary. Do not wrap the JSON in Markdown
-or a code fence.
-"""
-
-
-_TASK_ANALYSIS_FIELDS = {
-    "task_type",
-    "goal_clarity",
-    "needs_tools",
-    "tool_diversity",
-    "known_steps",
-    "path_uncertainty",
-    "step_dependency",
-    "dynamic_branching",
-    "expected_steps",
-    "expected_horizon",
-    "failure_recovery",
-    "need_replanning",
-    "open_subgoals",
-    "parallelizable",
-    "risk_level",
-    "reasoning_summary",
-}
 _TASK_TYPES = frozenset(TaskType.__args__)
 _HORIZONS = frozenset(Horizon.__args__)
 _RISK_LEVELS = frozenset(RiskLevel.__args__)
@@ -369,66 +334,45 @@ _SCORES = (
     "need_replanning",
 )
 
-_TEXT_FORMAT = {
-    "type": "json_schema",
-    "name": "task_analysis",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": sorted(_TASK_ANALYSIS_FIELDS),
-        "properties": {
-            "task_type": {"type": "string", "enum": sorted(_TASK_TYPES)},
-            **{name: {"type": "number", "minimum": 0, "maximum": 1} for name in _SCORES},
-            "needs_tools": {"type": "boolean"},
-            "parallelizable": {"type": "boolean"},
-            "expected_steps": {"type": "integer", "minimum": 1},
-            "open_subgoals": {"type": "integer", "minimum": 0},
-            "expected_horizon": {"type": "string", "enum": sorted(_HORIZONS)},
-            "risk_level": {"type": "string", "enum": sorted(_RISK_LEVELS)},
-            "reasoning_summary": {"type": "string", "minLength": 1},
-        },
-    },
+_TASK_ANALYSIS_PROTOCOL_FIELDS = {
+    "TASK_TYPE": "task_type",
+    "GOAL_CLARITY": "goal_clarity",
+    "NEEDS_TOOLS": "needs_tools",
+    "TOOL_DIVERSITY": "tool_diversity",
+    "KNOWN_STEPS": "known_steps",
+    "PATH_UNCERTAINTY": "path_uncertainty",
+    "STEP_DEPENDENCY": "step_dependency",
+    "DYNAMIC_BRANCHING": "dynamic_branching",
+    "EXPECTED_STEPS": "expected_steps",
+    "EXPECTED_HORIZON": "expected_horizon",
+    "FAILURE_RECOVERY": "failure_recovery",
+    "NEED_REPLANNING": "need_replanning",
+    "OPEN_SUBGOALS": "open_subgoals",
+    "PARALLELIZABLE": "parallelizable",
+    "RISK_LEVEL": "risk_level",
+    "REASONING_SUMMARY": "reasoning_summary",
 }
-
 
 class TaskAnalyzer:
     """Ask a model for descriptive task characteristics, never a mode choice."""
 
-    def __init__(self, text_stream: TextStream, *, response_format: ResponseFormat = "json_schema") -> None:
+    def __init__(self, text_stream: TextStream) -> None:
         self._text_stream = text_stream
-        self._response_format = require_response_format(response_format)
 
     async def run(self, goal: str) -> TaskAnalysis:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
-        text_format = _TEXT_FORMAT if self._response_format == "json_schema" else {"type": "json_object"}
-        # The provider-side schema is authoritative when supported, but repeat
-        # the contract in the prompt because compatible endpoints may ignore a
-        # json_schema request and otherwise have no field-level guidance.
-        instructions = _TASK_ANALYZER_INSTRUCTIONS + _TASK_ANALYZER_JSON_OBJECT_CONTRACT
-        for attempt in range(3):
-            output = "".join(
-                [
-                    chunk
-                    async for chunk in self._text_stream.stream_text(
-                        goal,
-                        instructions=(
-                            instructions
-                            if attempt == 0
-                            else f"{instructions} {_TASK_ANALYZER_RETRY_INSTRUCTIONS}"
-                        ),
-                        tools=None,
-                        text_format=text_format,
-                    )
-                ]
-            )
-            try:
-                return _parse_analysis(output)
-            except TaskAnalysisValidationError:
-                if attempt == 2:
-                    raise
-        raise AssertionError("task analysis retry loop exited unexpectedly")
+        output = "".join(
+            [
+                chunk
+                async for chunk in self._text_stream.stream_text(
+                    goal,
+                    instructions=_TASK_ANALYSIS_INSTRUCTIONS,
+                    tools=None,
+                )
+            ]
+        )
+        return _parse_analysis(output)
 
 
 def route(analysis: TaskAnalysis | Mapping[str, Any]) -> ExecutionModeName:
@@ -475,11 +419,24 @@ class TaskRouter:
 
 def _parse_analysis(output: str) -> TaskAnalysis:
     try:
-        document = json.loads(_unfence_json(output))
-    except json.JSONDecodeError as error:
-        raise TaskAnalysisValidationError("task analysis output must be strict JSON") from error
-    if not isinstance(document, dict) or set(document) != _TASK_ANALYSIS_FIELDS:
+        block = parse_line_protocol(output)
+    except LineProtocolError as error:
+        raise TaskAnalysisValidationError(str(error)) from error
+    if block.type != "TASK_ANALYSIS":
+        raise TaskAnalysisValidationError("expected BEGIN TASK_ANALYSIS")
+    if block.children:
+        raise TaskAnalysisValidationError("TASK_ANALYSIS cannot contain child blocks")
+    unexpected = set(block.fields) - set(_TASK_ANALYSIS_PROTOCOL_FIELDS)
+    if unexpected:
+        raise TaskAnalysisValidationError("TASK_ANALYSIS contains undeclared fields")
+    if set(block.fields) != set(_TASK_ANALYSIS_PROTOCOL_FIELDS):
         raise TaskAnalysisValidationError("task analysis must contain exactly the required fields")
+    document: dict[str, Any] = {}
+    for protocol_name, field_name in _TASK_ANALYSIS_PROTOCOL_FIELDS.items():
+        values = block.fields[protocol_name]
+        if len(values) != 1:
+            raise TaskAnalysisValidationError(f"task analysis field {protocol_name} must occur exactly once")
+        document[field_name] = values[0]
     for name in _SCORES:
         value = document[name]
         if type(value) not in {int, float} or not 0 <= value <= 1:
@@ -496,22 +453,6 @@ def _parse_analysis(output: str) -> TaskAnalysis:
     if not isinstance(document["reasoning_summary"], str) or not document["reasoning_summary"].strip():
         raise TaskAnalysisValidationError("task analysis reasoning_summary must be non-empty text")
     return TaskAnalysis(**document)
-
-
-def _unfence_json(output: str) -> str:
-    """Remove one outer Markdown JSON fence while rejecting surrounding prose."""
-    stripped = output.strip()
-    if not (stripped.startswith("```") and stripped.endswith("```")):
-        return stripped
-    body = stripped[3:-3].lstrip()
-    first_line, separator, remainder = body.partition("\n")
-    if first_line.strip().lower() == "json":
-        return remainder.strip()
-    if not separator and not first_line.strip():
-        return ""
-    if not first_line.strip():
-        return remainder.strip()
-    return stripped
 
 
 def _safe_analysis_error() -> str:

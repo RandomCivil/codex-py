@@ -20,6 +20,14 @@ from agent.planner import PlanningValidationError
 from agent.registry import ConfigurationMismatchError, RunBusyError
 
 
+def _task_analysis_protocol(values):
+    return "\n".join([
+        "BEGIN TASK_ANALYSIS",
+        *[f"{key.upper()}={json.dumps(value)}" for key, value in values.items()],
+        "END TASK_ANALYSIS",
+    ])
+
+
 class ControlledRunner:
     def __init__(self, answer=ExecutionAnswer("hello", "completed")):
         self.answer = answer
@@ -104,7 +112,8 @@ def test_conversation_task_analyzer_is_traced_before_routing(monkeypatch, capsys
         async def stream_text(self, goal, **kwargs):
             self.on_request({"model": "model", "input": goal})
             self.on_event(SimpleNamespace(type="response.created"))
-            self.on_event(SimpleNamespace(type="response.output_text.delta", delta=json.dumps(analysis)))
+            document = _task_analysis_protocol(analysis)
+            self.on_event(SimpleNamespace(type="response.output_text.delta", delta=document))
             self.on_event(
                 SimpleNamespace(
                     type="response.completed",
@@ -113,7 +122,7 @@ def test_conversation_task_analyzer_is_traced_before_routing(monkeypatch, capsys
                     ),
                 )
             )
-            yield json.dumps(analysis)
+            yield document
 
         async def close(self):
             pass
@@ -124,7 +133,6 @@ def test_conversation_task_analyzer_is_traced_before_routing(monkeypatch, capsys
             base_url="https://provider.test/v1",
             api_key="secret",
             model_name="model",
-            response_format="json_schema",
         )
     )
 
@@ -162,7 +170,6 @@ def test_conversation_task_analyzer_failure_traces_plan_execute_fallback(monkeyp
             base_url="https://provider.test/v1",
             api_key="secret",
             model_name="model",
-            response_format="json_schema",
         )
     )
 
@@ -211,7 +218,7 @@ def test_direct_mode_renders_conversation_input_as_structured_model_input():
     class Model:
         async def stream_text(self, value, **kwargs):
             self.value = value
-            yield "answer"
+            yield 'BEGIN ANSWER\nTEXT="answer"\nEND ANSWER'
 
     model = Model()
     conversation_input = type(
@@ -232,7 +239,7 @@ def test_direct_mode_renders_conversation_input_as_structured_model_input():
 def test_conversation_exposes_a_safe_planning_validation_failure():
     class PlannerFailureRunner:
         async def run(self, _conversation_input):
-            raise PlanningValidationError("planning output must be strict JSON")
+            raise PlanningValidationError("planning output is invalid")
 
     result = asyncio.run(
         ConversationService(
@@ -241,7 +248,7 @@ def test_conversation_exposes_a_safe_planning_validation_failure():
     )
 
     assert result.status == "failed"
-    assert result.error == "planning failed: planning output must be strict JSON"
+    assert result.error == "planning failed: planning output is invalid"
 
 
 def test_append_to_unknown_conversation_is_rejected_without_creating_one():

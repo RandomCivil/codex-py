@@ -52,10 +52,7 @@ class RunTrace:
                 # Token accounting remains useful at every level.  The full
                 # request/response payload is reserved for info-level tracing.
                 self._llm_usage(event)
-                self.llm_final(getattr(event, "response", event))
-                if self._output_buffer:
-                    self._write("output complete", self._output_buffer)
-                    self._output_buffer = ""
+                self._output_buffer = ""
                 self._llm_attribution = None
             return
 
@@ -209,6 +206,8 @@ class RunTrace:
         self._write(label, value)
 
     def llm_complete(self, revision: int, step_id: str, message: Any) -> None:
+        if self._level != "info":
+            return
         self._line(
             f"[llm complete] revision={revision} step={step_id} "
             f"data={_compact(message)}"

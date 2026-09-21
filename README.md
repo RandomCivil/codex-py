@@ -138,6 +138,7 @@ model:
   base_url: https://your-provider.example/v1
   api_key: your-api-key
   model_name: gpt-4o-mini
+  stream: true
 
 planner:
   model_name: planner-model
@@ -164,6 +165,8 @@ task_analyzer:
 ```
 
 所有非工具模型响应都使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
+
+每个 provider 配置的 `stream` 必须是 YAML 布尔值，表示该组件是否使用 LLM 流式返回；省略时为 `false`。`stream` 也会参与 run 恢复时的配置兼容性检查。
 
 旧配置中的 `response_format` 已移除；包含该字段的 YAML 会在任何模型或工具工作前报出迁移错误。
 

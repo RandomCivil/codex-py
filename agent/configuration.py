@@ -16,6 +16,7 @@ class ProviderConfiguration:
     base_url: str
     api_key: str
     model_name: str
+    stream: bool = False
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,7 @@ class ComponentProviderConfiguration:
     react: ProviderConfiguration | None = None
 
 
-_FIELDS = {"base_url", "api_key", "model_name"}
+_FIELDS = {"base_url", "api_key", "model_name", "stream"}
 
 
 def load_configuration(path: str | Path) -> ComponentProviderConfiguration:
@@ -92,10 +93,13 @@ def _provider(
         value = values[field]
         if not isinstance(value, str) or not value.strip():
             raise ConfigurationError(f"{name}.{field} must be a non-empty string")
+    if "stream" in values and type(values["stream"]) is not bool:
+        raise ConfigurationError(f"{name}.stream must be a boolean")
     return ProviderConfiguration(
         base_url=values["base_url"],
         api_key=values["api_key"],
         model_name=values["model_name"],
+        stream=values.get("stream", False),
     )
 
 

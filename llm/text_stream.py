@@ -22,3 +22,7 @@ class TextCompletion(Protocol):
         instructions: str | None = None,
         tools: Any = None,
     ) -> str: ...
+
+
+class TextModel(TextStream, TextCompletion, Protocol):
+    """Model interface supporting either native streaming or completion calls."""

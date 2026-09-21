@@ -59,6 +59,7 @@ criterion is actually met."""
         base_url: str | None = None,
         api_key: str | None = None,
         model_name: str | None = None,
+        stream: bool = False,
         command: str = "poetry",
         args: tuple[str, ...] = ("run", "atom-mcp"),
         cwd: str = "/home/xzp/workspace/atom-mcp",
@@ -84,6 +85,7 @@ criterion is actually met."""
                 base_url=base_url,
                 api_key=api_key,
                 model=model_name,
+                streaming=stream,
                 max_retries=0,
             )
         self._model = model

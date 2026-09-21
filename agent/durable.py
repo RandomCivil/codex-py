@@ -448,15 +448,17 @@ async def _run(
                         planner_configuration.base_url,
                         planner_configuration.api_key,
                         planner_configuration.model_name,
+                        stream=planner_configuration.stream,
                         on_event=trace.llm_event,
                         on_request=lambda request: trace.llm_request("planner", request),
                         on_response=lambda response: trace.llm_response(response, component="planner"),
                     )
-                    planner = Planner(llm, trace=trace)
+                    planner = Planner(llm, trace=trace, stream=planner_configuration.stream)
                     executor = Executor(
                         base_url=executor_configuration.base_url,
                         api_key=executor_configuration.api_key,
                         model_name=executor_configuration.model_name,
+                        stream=executor_configuration.stream,
                         checkpointer=saver,
                         run_id=run_id,
                         trace=trace,
@@ -466,6 +468,7 @@ async def _run(
                                 base_url=runtime_context_configuration.base_url,
                                 api_key=runtime_context_configuration.api_key,
                                 model=runtime_context_configuration.model_name,
+                                streaming=runtime_context_configuration.stream,
                                 max_retries=0,
                             )
                             if runtime_context_configuration
@@ -490,12 +493,16 @@ async def _run(
                                 analyzer_configuration.base_url,
                                 analyzer_configuration.api_key,
                                 analyzer_configuration.model_name,
+                                stream=analyzer_configuration.stream,
                                 on_event=trace.llm_event,
                                 on_request=lambda request: trace.llm_request("task_analyzer", request),
+                                on_response=lambda response: trace.llm_response(
+                                    response, component="task_analyzer"
+                                ),
                             )
                             try:
                                 router = _task_router(
-                                    TaskAnalyzer(analyzer_llm),
+                                    TaskAnalyzer(analyzer_llm, stream=analyzer_configuration.stream),
                                     run_id=run_id,
                                     configuration=configuration,
                                     durable_agent=durable,

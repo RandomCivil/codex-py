@@ -61,10 +61,13 @@ def configuration_snapshot(
 def _provider_snapshot(provider: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(provider, Mapping):
         provider = vars(provider)
-    return {
+    snapshot = {
         "base_url": provider["base_url"],
         "model_name": provider["model_name"],
     }
+    if "stream" in provider:
+        snapshot["stream"] = provider["stream"]
+    return snapshot
 
 
 def configuration_fingerprint(snapshot: Mapping[str, Any]) -> str:

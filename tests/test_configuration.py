@@ -29,6 +29,43 @@ runtime_context:
     assert configuration.react.model_name == "shared-model"
     assert configuration.runtime_context.model_name == "context-model"
     assert not hasattr(configuration.planner, "response_format")
+    assert configuration.planner.stream is False
+
+
+def test_load_configuration_resolves_stream_boolean_overrides(tmp_path):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        """
+model:
+  base_url: https://provider.test
+  api_key: key
+  model_name: model
+  stream: true
+planner:
+  stream: false
+direct:
+  stream: true
+"""
+    )
+
+    configuration = load_configuration(path)
+
+    assert configuration.planner.stream is False
+    assert configuration.executor.stream is True
+    assert configuration.task_analyzer.stream is False
+    assert configuration.direct.stream is True
+
+
+@pytest.mark.parametrize("value", ("true", 1, [], None))
+def test_load_configuration_rejects_non_boolean_stream(tmp_path, value):
+    path = tmp_path / "agent.yaml"
+    path.write_text(
+        "model:\n  base_url: https://provider.test\n  api_key: key\n"
+        f"  model_name: model\n  stream: {value!r}\n"
+    )
+
+    with pytest.raises(ConfigurationError, match=r"planner\.stream must be a boolean"):
+        load_configuration(path)
 
 
 @pytest.mark.parametrize("value", ("json_schema", "json_object", [], None))

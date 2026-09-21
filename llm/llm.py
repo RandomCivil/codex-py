@@ -11,11 +11,13 @@ class LLM:
         api_key: str,
         model_name: str,
         *,
+        stream: bool = False,
         on_event: Callable[[ResponseStreamEvent], None] | None = None,
         on_request: Callable[[Mapping[str, Any]], None] | None = None,
         on_response: Callable[[Any], None] | None = None,
     ) -> None:
         self._model_name = model_name
+        self._stream = stream
         self._on_event = on_event
         self._on_request = on_request
         self._on_response = on_response

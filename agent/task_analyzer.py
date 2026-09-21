@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from agent.execution import ExecutionAnswer, ExecutionMode, ExecutionModeName
 from llm.line_protocol import CODEC_REGISTRY, LineProtocolError, parse_line_protocol
-from llm.text_stream import TextStream
+from llm.text_stream import TextModel
 
 
 TaskType = Literal[
@@ -356,22 +356,30 @@ _TASK_ANALYSIS_PROTOCOL_FIELDS = {
 class TaskAnalyzer:
     """Ask a model for descriptive task characteristics, never a mode choice."""
 
-    def __init__(self, text_stream: TextStream) -> None:
+    def __init__(self, text_stream: TextModel, *, stream: bool = True) -> None:
         self._text_stream = text_stream
+        self._stream = stream
 
     async def run(self, goal: str) -> TaskAnalysis:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
-        output = "".join(
-            [
-                chunk
-                async for chunk in self._text_stream.stream_text(
-                    goal,
-                    instructions=_TASK_ANALYSIS_INSTRUCTIONS,
-                    tools=None,
-                )
-            ]
-        )
+        if self._stream:
+            output = "".join(
+                [
+                    chunk
+                    async for chunk in self._text_stream.stream_text(
+                        goal,
+                        instructions=_TASK_ANALYSIS_INSTRUCTIONS,
+                        tools=None,
+                    )
+                ]
+            )
+        else:
+            output = await self._text_stream.complete_text(
+                goal,
+                instructions=_TASK_ANALYSIS_INSTRUCTIONS,
+                tools=None,
+            )
         return _parse_analysis(output)
 
 

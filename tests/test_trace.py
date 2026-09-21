@@ -109,7 +109,6 @@ def test_error_level_suppresses_streaming_llm_events_and_final_response_but_keep
 
     assert output.getvalue().splitlines() == [
         "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 cached_tokens=4 reasoning_tokens=1",
-        "[llm output complete] partial",
     ]
 
 
@@ -150,6 +149,26 @@ def test_llm_response_at_error_level_keeps_usage_but_hides_final_response():
     assert output.getvalue().splitlines() == [
         "[llm usage] input_tokens=2 output_tokens=1 total_tokens=3 cached_tokens=None reasoning_tokens=None",
     ]
+
+
+def test_error_level_hides_streamed_and_complete_model_text():
+    output = StringIO()
+    trace = RunTrace(output, level="error")
+
+    trace.llm_event(SimpleNamespace(type="response.created"))
+    trace.llm_event(SimpleNamespace(type="response.output_text.delta", delta="secret"))
+    trace.llm_event(
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                output_text="secret",
+                usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            ),
+        )
+    )
+    trace.llm_complete(1, "step-1", "secret")
+
+    assert "secret" not in output.getvalue()
 
 
 def test_llm_usage_supports_langchain_message_metadata_and_cached_tokens():

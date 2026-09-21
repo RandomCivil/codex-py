@@ -106,9 +106,10 @@ class ExecutionMode(Protocol):
 class DirectMode:
     """Obtain one tool-free answer from a language model."""
 
-    def __init__(self, model: Any, *, trace: Any | None = None) -> None:
+    def __init__(self, model: Any, *, trace: Any | None = None, stream: bool = True) -> None:
         self._model = model
         self._trace = trace
+        self._stream = stream
 
     async def run(self, goal: Any) -> ExecutionAnswer:
         goal = conversation_model_input(goal)
@@ -120,16 +121,23 @@ class DirectMode:
             }
             if not callable(getattr(self._model, "_on_request", None)):
                 trace_llm_context(self._trace, request)
-            output = "".join(
-                [
-                    chunk
-                    async for chunk in self._model.stream_text(
-                        goal,
-                        tools=None,
-                        **{key: value for key, value in request.items() if key not in {"input", "tools"}},
-                    )
-                ]
-            )
+            if self._stream:
+                output = "".join(
+                    [
+                        chunk
+                        async for chunk in self._model.stream_text(
+                            goal,
+                            tools=None,
+                            **{key: value for key, value in request.items() if key not in {"input", "tools"}},
+                        )
+                    ]
+                )
+            else:
+                output = await self._model.complete_text(
+                    goal,
+                    tools=None,
+                    **{key: value for key, value in request.items() if key not in {"input", "tools"}},
+                )
         except Exception:
             return ExecutionAnswer(None, "failed", error="direct model invocation failed")
         try:
@@ -577,7 +585,9 @@ def create_execution_mode(
                 provider.base_url,
                 provider.api_key,
                 provider.model_name,
+                stream=provider.stream,
                 on_event=getattr(trace, "llm_event", None),
+                on_response=(getattr(trace, "llm_response", None) if trace is not None else None),
                 on_request=(
                     (lambda request: trace.llm_request("direct", request))
                     if trace is not None
@@ -589,6 +599,7 @@ def create_execution_mode(
                 base_url=provider.base_url,
                 api_key=provider.api_key,
                 model=provider.model_name,
+                streaming=provider.stream,
                 max_retries=0,
             )
     if mode == "tool_agent":
@@ -609,6 +620,7 @@ def create_execution_mode(
                 base_url=context_configuration.base_url,
                 api_key=context_configuration.api_key,
                 model=context_configuration.model_name,
+                streaming=context_configuration.stream,
                 max_retries=0,
             )
         return ReactMode(
@@ -628,10 +640,11 @@ def create_execution_mode(
             api_key,
             model_name,
             on_event=getattr(trace, "llm_event", None),
+            on_response=(getattr(trace, "llm_response", None) if trace is not None else None),
             on_request=(
                 (lambda request: trace.llm_request("direct", request))
                 if trace is not None
                 else None
             ),
         )
-    return DirectMode(model, trace=trace)
+    return DirectMode(model, trace=trace, stream=(provider.stream if provider is not None else True))

@@ -10,8 +10,19 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agent import Executor, PersistenceError
 from agent.executor import _durable_context_payload
-from agent.runtime_context import RuntimeContext
+from agent.runtime_context import RuntimeContext, RuntimeContextPolicy
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, Plan, PlanStep, StepContext
+
+
+class ObservationModel:
+    def __init__(self, content):
+        self.content = content
+
+    def bind(self, **kwargs):
+        return self
+
+    async def ainvoke(self, messages):
+        return AIMessage(content=json.dumps(self.content))
 
 
 class ControlledModel:
@@ -334,6 +345,153 @@ def test_executor_returns_context_update_and_sends_step_context_separately(monke
         files_modified=("src/agent.py",),
         observations=("The execution boundary is already isolated.",),
     )
+
+
+def test_executor_starts_each_step_with_a_fresh_runtime_context(monkeypatch):
+    class TwoStepModel:
+        def __init__(self):
+            self.calls = []
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"name": "record", "args": {"value": "first-step"}, "id": "first-call"}],
+                )
+            if len(self.calls) == 2:
+                return AIMessage(content="First step work is complete.")
+            if len(self.calls) == 3:
+                return _completion_message("First step completed.")
+            if len(self.calls) == 4:
+                assert "first-step" not in messages[1].content
+                return AIMessage(content="Second step needs no tool work.")
+            return _completion_message("Second step completed.")
+
+    model = TwoStepModel()
+    context_model = ObservationModel(
+        {
+            "round": 1,
+            "confirmed_facts": [],
+            "reported_errors": [],
+            "model_inferences": [],
+        }
+    )
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(
+            model=model,
+            context_policy=RuntimeContextPolicy(context_model),
+        ) as executor:
+            first = await executor.execute(state, 1, "publish")
+            second = await executor.execute(state, 1, "publish")
+            return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first.execution.status == "completed", first.execution.error
+    assert second.execution.status == "completed", second.execution.error
+
+
+def test_executor_continues_from_raw_tool_results_without_waiting_for_observation(monkeypatch):
+    class BlockingContextModel:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.started.set()
+            await self.release.wait()
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "round": 1,
+                        "confirmed_facts": [],
+                        "reported_errors": [],
+                        "model_inferences": [],
+                    }
+                )
+            )
+
+    class ContinueFromRawModel:
+        def __init__(self):
+            self.calls = []
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"name": "record", "args": {"value": "raw-now"}, "id": "raw-call"}],
+                )
+            if len(self.calls) == 2:
+                assert "raw-now" in messages[1].content
+                return AIMessage(content="Tool evidence is sufficient.")
+            if len(self.calls) == 3:
+                assert "raw-now" in messages[1].content
+            return _completion_message("Tool evidence was retained and the step completed.")
+
+    context_model = BlockingContextModel()
+    model = ContinueFromRawModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(
+            model=model,
+            context_policy=RuntimeContextPolicy(context_model),
+        ) as executor:
+            outcome = await asyncio.wait_for(executor.execute(state, 1, "publish"), timeout=1)
+            return outcome
+
+    outcome = asyncio.run(run())
+
+    assert outcome.execution.status == "completed", outcome.execution.error
+    assert context_model.started.is_set()
+
+
+def test_executor_keeps_observation_failure_nonfatal(monkeypatch):
+    class InvalidContextModel(ObservationModel):
+        async def ainvoke(self, messages):
+            return AIMessage(content=json.dumps({"round": 1}))
+
+    model = ControlledModel()
+    tool = StructuredTool.from_function(record)
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", lambda config: ControlledClient())
+    monkeypatch.setattr("agent.executor.load_mcp_tools", _load_tools(tool))
+    _, state = _plan_and_state()
+
+    async def run():
+        async with Executor(
+            model=model,
+            context_policy=RuntimeContextPolicy(InvalidContextModel({})),
+        ) as executor:
+            return await executor.execute(state, 1, "publish")
+
+    outcome = asyncio.run(run())
+
+    assert outcome.execution.status == "completed", outcome.execution.error
 
 
 def test_executor_completes_a_plan_step_without_an_mcp_tool_call(monkeypatch):

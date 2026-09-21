@@ -355,6 +355,13 @@ class ReactMode:
         self._context_model = context_model
         self._context_response_format = context_response_format
 
+    def _policy_for_invocation(self) -> RuntimeContextPolicy | Any | None:
+        """Return an invocation-local Runtime-context policy."""
+        policy = self._context_policy
+        if not isinstance(policy, RuntimeContextPolicy):
+            return policy
+        return policy.fresh_for_invocation()
+
     async def run(self, goal: Any) -> ExecutionAnswer:
         goal = conversation_model_input(goal)
         try:
@@ -369,7 +376,7 @@ class ReactMode:
                 # production ChatOpenAI path always enables it; tests and embedders
                 # may provide a policy explicitly when their model supports that
                 # additional structured request.
-                policy = self._context_policy
+                policy = self._policy_for_invocation()
                 policy_model = self._context_model or self._model
                 if policy is None and (self._context_model is not None or isinstance(self._model, ChatOpenAI)):
                     policy = RuntimeContextPolicy(
@@ -409,7 +416,12 @@ class ReactMode:
                     response = await model.ainvoke(request_messages)
                     _trace_llm_response(self._trace, response)
                     calls = list(getattr(response, "tool_calls", []) or [])
-                    messages.append(response)
+                    # Once Runtime context is active, its instantaneous
+                    # snapshot is the only historical source for subsequent
+                    # requests.  Keep the legacy transcript only for the
+                    # compatibility path that has no policy.
+                    if policy is None:
+                        messages.append(response)
                     if not calls:
                         if self._response_format is not None:
                             completion_model = _bind_response_format(
@@ -469,15 +481,16 @@ class ReactMode:
                             [raw_result for _, _, raw_result in results],
                             [content if is_error else None for content, is_error, _ in results],
                         )
-                    messages.extend(
-                        ToolMessage(
-                            content=content,
-                            tool_call_id=str(call.get("id") or "unknown"),
-                            name=str(call.get("name") or "unknown"),
-                            status="error" if is_error else "success",
+                    if policy is None:
+                        messages.extend(
+                            ToolMessage(
+                                content=content,
+                                tool_call_id=str(call.get("id") or "unknown"),
+                                name=str(call.get("name") or "unknown"),
+                                status="error" if is_error else "success",
+                            )
+                            for call, (content, is_error, _) in zip(calls, results)
                         )
-                        for call, (content, is_error, _) in zip(calls, results)
-                    )
         except Exception:
             return ExecutionAnswer(None, "failed", error="react execution failed")
 

@@ -5,7 +5,7 @@ from langchain_core.messages import AIMessage
 
 from agent import ExecutionAnswer, create_execution_mode
 from agent.conversation import ConversationInput
-from agent.runtime_context import RuntimeContext
+from agent.runtime_context import RuntimeContext, RuntimeContextPolicy
 from agent.configuration import load_configuration
 
 
@@ -549,6 +549,145 @@ def test_react_sends_the_layered_context_to_operational_and_final_requests():
     assert len(policy.requests) == 3
     assert policy.rounds[0][0] == 1
     assert model.completion_calls[0][-2].content.startswith("## Runtime context")
+
+
+def test_react_advances_from_settled_tools_without_waiting_for_observation():
+    class BlockingContextModel:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.started.set()
+            await self.release.wait()
+            return AIMessage(content=json.dumps({
+                "round": 1,
+                "confirmed_facts": [],
+                "reported_errors": [],
+                "model_inferences": [],
+            }))
+
+    class TwoRoundModel:
+        def __init__(self):
+            self.calls = []
+
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                return AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "call-1"}])
+            return AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
+
+    async def run():
+        context_model = BlockingContextModel()
+        model = TwoRoundModel()
+        policy = RuntimeContextPolicy(context_model)
+        answer = await create_execution_mode(
+            "react", model=model, tool_runtime=ToolRuntime("observed"),
+            context_policy=policy,
+        ).run("Do it")
+        assert context_model.started.is_set()
+        assert len(model.calls) == 2
+        assert "call-1" in model.calls[1][-1].content
+        context_model.release.set()
+        return answer
+
+    assert asyncio.run(run()) == ExecutionAnswer("Done.", "completed")
+
+
+def test_react_keeps_observation_failures_nonfatal_and_retains_raw_context():
+    class FailingContextModel:
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            raise RuntimeError("context provider unavailable")
+
+    class TwoRoundModel:
+        def __init__(self):
+            self.calls = []
+
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                return AIMessage(content="", tool_calls=[{"name": "first", "args": {}, "id": "call-1"}])
+            return AIMessage(content=json.dumps({"answer": "Recovered.", "goal_satisfied": True}))
+
+    async def run():
+        policy = RuntimeContextPolicy(FailingContextModel())
+        model = TwoRoundModel()
+        answer = await create_execution_mode(
+            "react", model=model, tool_runtime=ToolRuntime("observed"),
+            context_policy=policy,
+        ).run("Recover")
+        await asyncio.sleep(0)
+        return answer, policy, model
+
+    answer, policy, model = asyncio.run(run())
+
+    assert answer == ExecutionAnswer("Recovered.", "completed")
+    assert "call-1" in model.calls[1][-1].content
+
+
+def test_react_does_not_reuse_runtime_context_between_invocations():
+    class ImmediateContextModel:
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            return AIMessage(content=json.dumps({
+                "round": 1,
+                "confirmed_facts": [],
+                "reported_errors": [],
+                "model_inferences": [],
+            }))
+
+    class ReusableModel:
+        def __init__(self):
+            self.calls = []
+            self.invocation = 0
+
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls.append(list(messages))
+            if len(self.calls) in {1, 3}:
+                self.invocation += 1
+                return AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "first",
+                        "args": {},
+                        "id": f"call-{self.invocation}",
+                    }],
+                )
+            return AIMessage(content=json.dumps({"answer": "Done.", "goal_satisfied": True}))
+
+    async def run():
+        model = ReusableModel()
+        mode = create_execution_mode(
+            "react", model=model, tool_runtime=ToolRuntime("observed"),
+            context_policy=RuntimeContextPolicy(ImmediateContextModel()),
+        )
+        first = await mode.run("First")
+        second = await mode.run("Second")
+        return first, second, model
+
+    first, second, model = asyncio.run(run())
+
+    assert first == ExecutionAnswer("Done.", "completed")
+    assert second == ExecutionAnswer("Done.", "completed")
+    assert "call-1" not in model.calls[3][-1].content
+    assert "call-2" in model.calls[3][-1].content
 
 
 def test_react_strict_schema_uses_tool_guidance_without_repeating_terminal_shape():

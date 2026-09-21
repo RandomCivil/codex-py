@@ -80,7 +80,12 @@ class RunTrace:
             self.llm_final(getattr(event, "response", event))
             self._llm_attribution = None
 
-    def _llm_usage(self, event: Any) -> None:
+    def _llm_usage(
+        self,
+        event: Any,
+        *,
+        attribution: tuple[str, str] | None = None,
+    ) -> None:
         response = getattr(event, "response", event)
         usage = _get_field(response, "usage")
         if usage is None:
@@ -90,9 +95,14 @@ class RunTrace:
             usage = _get_field(metadata, "token_usage") or _get_field(metadata, "usage")
         if usage is None:
             return
-        self._write_llm_usage(usage)
+        self._write_llm_usage(usage, attribution=attribution)
 
-    def _write_llm_usage(self, usage: Any) -> None:
+    def _write_llm_usage(
+        self,
+        usage: Any,
+        *,
+        attribution: tuple[str, str] | None = None,
+    ) -> None:
         input_details = (
             _get_field(usage, "input_tokens_details")
             or _get_field(usage, "input_token_details")
@@ -114,13 +124,14 @@ class RunTrace:
         cached_tokens = _get_field(input_details, "cached_tokens")
         if cached_tokens is None:
             cached_tokens = _get_field(input_details, "cache_read")
-        attribution = ""
-        if self._llm_attribution is not None:
-            component, family = self._llm_attribution
-            attribution = f"component={component} request_family={family} "
+        attribution_text = ""
+        selected_attribution = attribution or self._llm_attribution
+        if selected_attribution is not None:
+            component, family = selected_attribution
+            attribution_text = f"component={component} request_family={family} "
         self._line(
             "[llm usage] "
-            + attribution
+            + attribution_text
             + f"input_tokens={input_tokens} "
             f"output_tokens={output_tokens} "
             f"total_tokens={_get_field(usage, 'total_tokens')} "
@@ -147,17 +158,50 @@ class RunTrace:
         static_shape: Any | None = None,
     ) -> None:
         """Record the terminal response and its usage from a non-streaming model."""
+        attribution = None
         if component is not None:
-            self.llm_request(component, {}, static_shape=static_shape or {})
-        self._llm_usage(response)
+            label = component.strip() if isinstance(component, str) and component.strip() else "unknown"
+            attribution = (label, _request_family(static_shape or {}))
+        self._llm_usage(response, attribution=attribution)
         self.llm_final(response)
-        self._llm_attribution = None
+        # A concurrent Runtime-context response carries its attribution
+        # explicitly and must not consume the foreground request's pending
+        # attribution.
+        if component is None:
+            self._llm_attribution = None
+
+    def runtime_context_llm_request(self, request: Any) -> None:
+        """Trace a concurrent Runtime-context request without global attribution."""
+        self.llm_context(request)
+
+    def runtime_context_llm_response(
+        self,
+        response: Any,
+        *,
+        static_shape: Any,
+    ) -> None:
+        """Attribute a Runtime-context response to its own concurrent request."""
+        self.llm_response(
+            response,
+            component="runtime_context",
+            static_shape=static_shape,
+        )
 
     def llm_context(self, context: Any) -> None:
         """Print the exact request context submitted to a model at info level."""
         if self._level != "info":
             return
         self._line(f"[llm context] data={_compact(context)}")
+
+    def runtime_context_observation(self, outcome: Any) -> None:
+        """Report the transient outcome of an asynchronous Observation attempt."""
+        status = getattr(outcome, "status", "unknown")
+        round_number = getattr(outcome, "round", "unknown")
+        error = getattr(outcome, "error", None)
+        suffix = f" error={error}" if error else ""
+        self._line(
+            f"[runtime context observation] round={round_number} status={status}{suffix}"
+        )
 
     def llm_text(self, label: str, value: Any) -> None:
         if self._level == "error":

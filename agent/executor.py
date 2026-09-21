@@ -182,7 +182,11 @@ class Executor:
             self._active_step = step
             self._active_revision = revision
             self._active_durable_state = _durable_context_payload(state, revision, step, step_context)
-            self._active_context_policy = self._context_policy
+            self._active_context_policy = (
+                self._context_policy.fresh_for_invocation()
+                if self._context_policy is not None
+                else None
+            )
             policy_model = self._context_model or self._model
             if self._active_context_policy is None and (
                 self._context_model is not None or isinstance(self._model, ChatOpenAI)

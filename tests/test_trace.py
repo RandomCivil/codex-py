@@ -175,6 +175,43 @@ def test_llm_usage_supports_langchain_message_metadata_and_cached_tokens():
     )
 
 
+def test_runtime_context_response_usage_is_attributed_without_global_request_state():
+    output = StringIO()
+    trace = RunTrace(output, level="error")
+
+    trace.runtime_context_llm_request([{"dynamic": "tool output"}])
+    trace.runtime_context_llm_response(
+        SimpleNamespace(
+            usage_metadata={"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}
+        ),
+        static_shape={
+            "instructions": "Create the Observation.",
+            "request_kind": "observation",
+            "response_format": {"type": "json_schema"},
+        },
+    )
+
+    assert output.getvalue().startswith(
+        "[llm usage] component=runtime_context request_family=sha256:"
+    )
+
+
+def test_runtime_context_usage_does_not_consume_pending_react_attribution():
+    output = StringIO()
+    trace = RunTrace(output, level="error")
+    trace.llm_request("react", {}, static_shape={"request_kind": "tool_round"})
+
+    trace.runtime_context_llm_response(
+        SimpleNamespace(usage_metadata={"total_tokens": 2}),
+        static_shape={"request_kind": "observation"},
+    )
+    trace.llm_response(SimpleNamespace(usage_metadata={"total_tokens": 3}))
+
+    usage_lines = output.getvalue().splitlines()
+    assert "component=runtime_context" in usage_lines[0]
+    assert "component=react" in usage_lines[1]
+
+
 def test_error_level_keeps_tool_results_and_only_names_tool_calls():
     output = StringIO()
     trace = RunTrace(output, level="error")

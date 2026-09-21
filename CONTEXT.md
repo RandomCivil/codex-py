@@ -205,9 +205,13 @@ The complete request parameters and ordered results, including errors, for one T
 _Avoid_: durable tool trace, observation
 
 **Observation**:
-A schema-validated, concise historical record generated after one Tool round. It records the round number plus tool-call-ID-attributed confirmed facts, reported errors, and model inferences; generation or validation failure fails the active execution.
+A schema-validated, concise historical record generated asynchronously from one Tool round. It records the round number plus tool-call-ID-attributed confirmed facts, reported errors, and model inferences; an unavailable, failed, or invalid Observation is represented by that round's Raw tool result instead.
 _Avoid_: raw tool output, durable fact
 
+**Observation outcome**:
+A transient diagnostic record for one asynchronous Observation attempt. It identifies the Tool round, whether the attempt is pending, succeeded, failed at the provider, was invalid, or was cancelled, and may record the error; it is not Model evidence, Step context, or Durable State.
+_Avoid_: Observation, durable task record
+
 **Runtime context window**:
-The context supplied to every Model request within a tool loop: the three most recent Tool rounds' Raw tool results, compressed Observations for earlier Tool rounds, and the applicable Durable State. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit the required Durable State and Raw tool results, execution fails.
+The context supplied to every Model request within a tool loop: the three most recent Tool rounds' Raw tool results, validated Observations for earlier Tool rounds when available, and the applicable Durable State. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit the required Durable State and Raw tool results, execution fails.
 _Avoid_: Durable State, message transcript

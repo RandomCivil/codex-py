@@ -7,9 +7,10 @@ state.  Callers may use :meth:`assemble` for the current in-memory window and
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from langchain_core.messages import HumanMessage
 
@@ -36,6 +37,14 @@ round and every source tool-call ID."""
 
 class ContextMaintenanceError(RuntimeError):
     """The Runtime context contract could not be maintained."""
+
+
+class _ObservationProviderError(ContextMaintenanceError):
+    """The provider could not complete an asynchronous Observation request."""
+
+
+class _ObservationValidationError(ContextMaintenanceError):
+    """The provider response did not satisfy the Observation contract."""
 
 
 def _observation_contract(response_format: ResponseFormat) -> str:
@@ -81,6 +90,15 @@ class Observation:
                 for call_id in entry.tool_call_ids
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationOutcome:
+    """Transient diagnostic state for one asynchronous Observation attempt."""
+
+    round: int
+    status: Literal["pending", "succeeded", "provider_error", "invalid", "cancelled"]
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +152,8 @@ class RuntimeContextPolicy:
         self._trace = trace
         self._raw: list[RawToolResult] = []
         self._observations: list[Observation] = []
+        self._observation_outcomes: dict[int, ObservationOutcome] = {}
+        self._observation_tasks: set[asyncio.Task[Any]] = set()
         self._model_uses = 0
         self._tool_rounds = 0
 
@@ -144,6 +164,21 @@ class RuntimeContextPolicy:
     @property
     def raw_tool_results(self) -> tuple[RawToolResult, ...]:
         return tuple(self._raw)
+
+    @property
+    def observation_outcomes(self) -> tuple[ObservationOutcome, ...]:
+        """Return transient diagnostics in settled Tool-round order."""
+        return tuple(self._observation_outcomes[item.round] for item in self._raw)
+
+    def fresh_for_invocation(self) -> RuntimeContextPolicy:
+        """Create an equivalent policy with no transient Tool-round history."""
+        return RuntimeContextPolicy(
+            self.model,
+            budget=self.budget,
+            raw_rounds=self.raw_rounds,
+            response_format=self._response_format,
+            trace=self._trace,
+        )
 
     @property
     def model_uses(self) -> int:
@@ -163,8 +198,8 @@ class RuntimeContextPolicy:
         calls: Sequence[Mapping[str, Any]],
         results: Sequence[Any],
         errors: Sequence[str | None] | None = None,
-    ) -> Observation:
-        """Store a settled batch and generate its strict Observation."""
+    ) -> RawToolResult:
+        """Store a settled batch and start its best-effort Observation."""
         if len(calls) != len(results) or (errors is not None and len(calls) != len(errors)):
             raise ValueError("tool calls and settled results must have equal length")
         errors = errors or (None,) * len(results)
@@ -181,12 +216,15 @@ class RuntimeContextPolicy:
                 for call, result, error in zip(calls, results, errors)
             ),
         )
-        observation = await self._request_observation(raw)
         self._raw.append(raw)
-        self._observations.append(observation)
         self._tool_rounds += 1
         self._expire_observations()
-        return observation
+        self._set_observation_outcome(raw.round, "pending")
+        task = asyncio.create_task(self._observe(raw))
+        self._observation_tasks.add(task)
+        task.add_done_callback(self._observation_finished)
+        await asyncio.sleep(0)
+        return raw
 
     def assemble(self, durable_state: Any) -> RuntimeContext:
         """Assemble Durable State, older Observations, and recent Raw results."""
@@ -202,7 +240,20 @@ class RuntimeContextPolicy:
                 )
             )
         )
-        return RuntimeContext(durable_state, observations, tuple(self._raw[-self.raw_rounds :]))
+        observed_rounds = {
+            round_number
+            for item in self._observations
+            for round_number in range(
+                item.source_round_start or item.round,
+                (item.source_round_end or item.round) + 1,
+            )
+        }
+        raw_results = tuple(
+            item
+            for item in self._raw
+            if item.round in recent_rounds or item.round not in observed_rounds
+        )
+        return RuntimeContext(durable_state, observations, raw_results)
 
     async def maintain(self, durable_state: Any) -> RuntimeContext:
         """Assemble a window, merging oldest Observations until it fits."""
@@ -227,6 +278,38 @@ class RuntimeContextPolicy:
         # Observations remain retained in history; assemble() controls whether
         # they are visible while their Raw round is in the recent window.
         return None
+
+    async def _observe(self, raw: RawToolResult) -> None:
+        try:
+            observation = await self._request_observation(raw)
+        except asyncio.CancelledError:
+            self._set_observation_outcome(raw.round, "cancelled", "Observation task was cancelled")
+        except _ObservationProviderError as error:
+            self._set_observation_outcome(raw.round, "provider_error", str(error))
+        except _ObservationValidationError as error:
+            self._set_observation_outcome(raw.round, "invalid", str(error))
+        except ContextMaintenanceError as error:
+            self._set_observation_outcome(raw.round, "invalid", str(error))
+            return
+        else:
+            self._observations.append(observation)
+            self._observations.sort(key=_observation_start_round)
+            self._set_observation_outcome(raw.round, "succeeded")
+
+    def _set_observation_outcome(
+        self,
+        round: int,
+        status: Literal["pending", "succeeded", "provider_error", "invalid", "cancelled"],
+        error: str | None = None,
+    ) -> None:
+        self._observation_outcomes[round] = ObservationOutcome(round, status, error)
+        if self._trace is not None:
+            callback = getattr(self._trace, "runtime_context_observation", None)
+            if callback is not None:
+                callback(self._observation_outcomes[round])
+
+    def _observation_finished(self, task: asyncio.Task[Any]) -> None:
+        self._observation_tasks.discard(task)
 
     async def _request_observation(self, raw: RawToolResult) -> Observation:
         response = await self._structured_invoke(
@@ -273,7 +356,10 @@ class RuntimeContextPolicy:
             bound = self.model.bind(tools=[], response_format=schema)
             if self._trace is not None:
                 callback = getattr(self._trace, "llm_request", None)
-                if callback is not None:
+                runtime_context_callback = getattr(self._trace, "runtime_context_llm_request", None)
+                if runtime_context_callback is not None:
+                    runtime_context_callback(messages)
+                elif callback is not None:
                     callback(
                         "runtime_context",
                         messages,
@@ -290,11 +376,19 @@ class RuntimeContextPolicy:
             response = await bound.ainvoke(messages)
             if self._trace is not None:
                 callback = getattr(self._trace, "llm_response", None)
-                if callback is not None:
+                runtime_context_callback = getattr(self._trace, "runtime_context_llm_response", None)
+                static_shape = {
+                    "instructions": getattr(messages[0], "content", ""),
+                    "request_kind": request_kind,
+                    "response_format": schema,
+                }
+                if runtime_context_callback is not None:
+                    runtime_context_callback(response, static_shape=static_shape)
+                elif callback is not None:
                     callback(response)
             return response
         except Exception as error:
-            raise ContextMaintenanceError("Runtime context model request failed") from error
+            raise _ObservationProviderError(str(error) or "Runtime context model request failed") from error
 
 
 def _observation_response_format(response_format: ResponseFormat) -> dict[str, Any]:
@@ -328,16 +422,16 @@ def _parse_observation(response: Any, *, expected_round: int) -> Observation:
         try:
             content = json.loads(content)
         except json.JSONDecodeError as error:
-            raise ContextMaintenanceError("Observation was not valid JSON") from error
+            raise _ObservationValidationError("Observation was not valid JSON") from error
     if not isinstance(content, Mapping):
-        raise ContextMaintenanceError("Observation was not an object")
+        raise _ObservationValidationError("Observation was not an object")
     required = {"round", "confirmed_facts", "reported_errors", "model_inferences"}
     if (
         set(content) != required
         or type(content["round"]) is not int
         or content["round"] != expected_round
     ):
-        raise ContextMaintenanceError("Observation schema or round is invalid")
+        raise _ObservationValidationError("Observation schema or round is invalid")
     try:
         parsed = {}
         for key in ("confirmed_facts", "reported_errors", "model_inferences"):
@@ -356,9 +450,9 @@ def _parse_observation(response: Any, *, expected_round: int) -> Observation:
                 entries.append(Evidence(item["text"], tuple(item["tool_call_ids"])))
             parsed[key] = tuple(entries)
     except (KeyError, TypeError):
-        raise ContextMaintenanceError("Observation evidence is invalid") from None
+        raise _ObservationValidationError("Observation evidence is invalid") from None
     if any(not evidence.text.strip() for values in parsed.values() for evidence in values):
-        raise ContextMaintenanceError("Observation evidence is invalid")
+        raise _ObservationValidationError("Observation evidence is invalid")
     return Observation(expected_round, **parsed)
 
 
@@ -442,6 +536,10 @@ def _observation_source(observation: Observation) -> str:
     start = observation.source_round_start or observation.round
     end = observation.source_round_end or observation.round
     return f" (source rounds {start}-{end})"
+
+
+def _observation_start_round(observation: Observation) -> int:
+    return observation.source_round_start or observation.round
 
 
 def _prompt_value(value: Any) -> str:

@@ -1,21 +1,35 @@
 # Codex Python Agent
 
-一个基于 Python 3.12、LangGraph 和 OpenAI-compatible provider 的可恢复 Agent。Agent 将用户目标交给 Planner 生成完整的、严格 JSON 校验的 Plan，再由 Executor 按顺序执行每个 Plan step。失败时最多生成三个不可变 Plan revision；预算耗尽后返回 `blocked`。
+一个基于 Python 3.12、LangGraph 和 OpenAI-compatible provider 的可恢复 Agent 运行时。CLI 的 `run` 会先分析目标，再从 `direct`、`tool_agent`、`react` 和 `plan_execute` 中确定性地选择执行模式；只有 `plan_execute` 会生成 Plan 并由 Executor 按顺序执行 Plan step。
 
-Agent 的顶层协调状态和每个 Step execution 都使用 LangGraph checkpoint 持久化到 MySQL，因此进程重启后可以从最新 Checkpoint 恢复。MCP 工具由 Executor 在运行时选择和调用，Plan 本身不包含具体工具调用。
+`plan_execute` 的顶层协调状态和每个 Step execution 都使用 LangGraph checkpoint 持久化到 MySQL，因此进程重启后可以从最新 Checkpoint 恢复。其他三种模式是无 Checkpoint 的 ephemeral execution。MCP 工具由 Tool runtime 提供给 tool-enabled 模式；Plan 本身不包含具体工具调用。
 
 ## 特性
 
 - 异步 LLM 适配器，支持 OpenAI Responses API 的文本流和事件流。
+- 统一的四种 whole-task Execution mode：无工具的 `direct`、单轮工具调用的 `tool_agent`、迭代工具调用的 `react`，以及可恢复的 `plan_execute`。
+- Task Analyzer + Task Router：`run` 只分析一次目标并按任务特征选择模式；`resume` 只恢复已有的 `plan_execute` run，不会重新路由。
 - 基于 `model → ToolNode → model` 的 MCP 工具执行图。
 - 同一模型响应中的 Tool-call batch 并发执行，等待全部调用完成后按请求顺序返回结果；单个调用失败不会丢弃同批的其他结果。
 - 不可变、可校验的 Plan revision 和可审计的 Step execution 历史。
 - MySQL checkpoint、运行登记和 60 秒独占 lease；lease 每 15 秒续租。
 - 配置指纹校验，避免恢复时静默更换模型或 MCP 配置。
+- Runtime-context component 异步生成和压缩 Tool-round Observation；最近三轮保留原始工具结果，Observation 失败时自动回退到原始证据。
 - 通过 CLI 以一行 JSON 输出运行结果，便于脚本调用。
 - 运行过程中将 LLM thought/output、Plan–Execute 状态以及 MCP tool call/result 实时输出到 stderr；最终结果仍只写到 stdout。
 - `run` 先由 Task Router 描述性分析目标，再确定性地选择 direct、tool-agent、ReAct 或 Plan–execute。
 - MySQL 持久化 Conversation：每轮保留独立 run、显式 Execution mode 与有序公开历史。
+
+### 执行模式
+
+| 模式 | 适用场景 | 工具调用 | 是否可恢复 |
+| --- | --- | --- | --- |
+| `direct` | 不需要外部环境或工具的回答 | 无 | 否 |
+| `tool_agent` | 一次模型请求即可完成的简单工具任务 | 最多执行第一个 tool call | 否 |
+| `react` | 需要根据工具结果反复判断的短期任务 | 多轮调用，直到结构化完成结果 | 否 |
+| `plan_execute` | 长流程、多子目标、需要失败重规划的任务 | 每个 Plan step 由 Executor 执行 | 是 |
+
+CLI 不接受手工 `--mode` 参数。Task Router 根据 Task Analyzer 的结构化分析选择模式；选择结果会在 `run` 或 Conversation turn 的 JSON 输出中返回。选定模式失败时不会自动升级到其他模式。
 
 ### 工具调用批次
 
@@ -95,13 +109,26 @@ poetry install
 
 ## 配置
 
-运行前只需要设置 MySQL 连接环境变量：
+运行前设置 MySQL 连接环境变量：
 
 ```bash
 export CODEX_MYSQL_URL='mysql://user:password@127.0.0.1:3306/codex'
 ```
 
 `CODEX_MYSQL_URL` 只用于 MySQL 连接，不能省略。凭据不会写入运行配置快照；Checkpoint 状态目前按原样保存，请为该数据库设置合适的访问控制。
+
+`run`、`resume` 和 Conversation 命令都需要显式的 `--config` YAML；`migrate` 只需要 `CODEX_MYSQL_URL`，不需要模型配置。配置加载时，`model` 提供共享的 Component provider configuration，组件节点只覆盖需要变化的字段：
+
+```text
+model
+├── planner              ─┐
+├── executor              ├─ 继承共享配置，可单独覆盖
+├── task_analyzer        ─┘  默认继承 planner
+├── runtime_context      （可选，默认使用所属工具模式的模型）
+├── direct
+├── tool_agent
+└── react
+```
 
 Planner 和 Executor 的 provider 配置必须写在显式传入的 YAML 文件中。文件使用共享的 `model` 默认值，并可用 `planner`、`executor` 分别覆盖任意字段：
 
@@ -164,6 +191,12 @@ cwd:     /home/xzp/workspace/atom-mcp
 
 ## CLI
 
+所有命令都把最终结果以一行 JSON 写到 stdout，运行日志写到 stderr，因此可以安全地被脚本消费：
+
+```bash
+poetry run agent <command> [options]
+```
+
 首次使用时显式初始化数据库 schema：
 
 ```bash
@@ -177,6 +210,21 @@ poetry run agent run --goal '检查项目中的待办事项并整理摘要' --co
 ```
 
 `run` 的 JSON 结果中的 `status` 是所选 Execution mode 的 `completed`、`failed` 或 `blocked` 状态。
+
+一个不需要工具的目标可能返回 `direct`，简单工具任务可能返回 `tool_agent`，需要迭代观察时返回 `react`，长流程则返回 `plan_execute`。完整结果还可能包含 `execution`、`analysis` 和分析失败时的安全 `analysis_error`：
+
+```json
+{
+  "command": "run",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "execution_mode": "react",
+  "status": "completed",
+  "execution": {"answer": "…", "status": "completed", "error": null},
+  "analysis": {"task_type": "retrieval", "needs_tools": true}
+}
+```
+
+降低日志量时使用 `--log-level error`。该选项不会改变执行结果，只隐藏 LLM 请求、响应、流式事件和中间 thought/output 的详细内容。
 
 `--cwd` 指定 Agent 操作的项目目录。它会被强制写入每一个 Atom MCP 工具调用的 `cwd` 参数；未指定时使用启动 `agent` 命令时的当前目录。恢复 run 时应使用与原 run 相同的 `--cwd`，该目录属于持久化配置的一部分。
 

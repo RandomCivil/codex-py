@@ -22,6 +22,208 @@ class ObservationModel:
         return AIMessage(content=json.dumps(self.content))
 
 
+class BlockingObservationModel(ObservationModel):
+    def __init__(self):
+        super().__init__(None)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        self.started.set()
+        await self.release.wait()
+        return AIMessage(
+            content=json.dumps(
+                {
+                    "round": 1,
+                    "confirmed_facts": [],
+                    "reported_errors": [],
+                    "model_inferences": [],
+                }
+            )
+        )
+
+
+class FirstObservationDelayedModel(BlockingObservationModel):
+    def __init__(self):
+        super().__init__()
+        self.round = 0
+
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        self.round += 1
+        response_round = self.round
+        if response_round == 1:
+            self.started.set()
+            await self.release.wait()
+        return AIMessage(
+            content=json.dumps(
+                {
+                    "round": response_round,
+                    "confirmed_facts": [
+                        {"text": f"fact-{response_round}", "tool_call_ids": [f"call-{response_round}"]}
+                    ],
+                    "reported_errors": [],
+                    "model_inferences": [],
+                }
+            )
+        )
+
+
+class FailingObservationModel(ObservationModel):
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        raise RuntimeError("provider unavailable")
+
+
+class CancelledObservationModel(ObservationModel):
+    def __init__(self):
+        super().__init__(None)
+        self.started = asyncio.Event()
+
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        self.started.set()
+        raise asyncio.CancelledError
+
+
+def test_observation_lifecycle_accounts_model_use_without_consuming_tool_rounds_or_retrying():
+    async def run():
+        model = FailingObservationModel({})
+        policy = RuntimeContextPolicy(model)
+
+        await policy.record_tool_round(
+            1, [{"id": "call-1", "name": "read", "args": {}}], ["done"]
+        )
+        await asyncio.sleep(0)
+
+        assert policy.model_uses == 1
+        assert policy.tool_rounds == 1
+        assert len(model.calls) == 1
+        assert policy.observation_outcomes[0].status == "provider_error"
+        assert "provider unavailable" in policy.observation_outcomes[0].error
+        assert policy.assemble({}).raw_tool_results[0].calls[0].result == "done"
+
+    asyncio.run(run())
+
+
+def test_invalid_observation_is_diagnosable_and_keeps_raw_fallback():
+    async def run():
+        policy = RuntimeContextPolicy(ObservationModel({"round": 1}))
+
+        await policy.record_tool_round(
+            1, [{"id": "call-1", "name": "read", "args": {}}], ["done"]
+        )
+        await asyncio.sleep(0)
+
+        outcome = policy.observation_outcomes[0]
+        assert outcome.status == "invalid"
+        assert "invalid" in outcome.error
+        assert policy.model_uses == 1
+        assert policy.assemble({}).observations == ()
+        assert policy.assemble({}).raw_tool_results[0].calls[0].result == "done"
+
+    asyncio.run(run())
+
+
+def test_cancelled_observation_is_diagnosable_without_cancelling_the_active_policy():
+    async def run():
+        model = CancelledObservationModel()
+        policy = RuntimeContextPolicy(model)
+
+        await policy.record_tool_round(
+            1, [{"id": "call-1", "name": "read", "args": {}}], ["done"]
+        )
+        await model.started.wait()
+        await asyncio.sleep(0)
+
+        assert policy.observation_outcomes[0].status == "cancelled"
+        assert policy.model_uses == 1
+        assert policy.tool_rounds == 1
+        assert policy.assemble({}).raw_tool_results[0].calls[0].result == "done"
+
+    asyncio.run(run())
+
+
+def test_observation_outcomes_are_forwarded_to_runtime_context_trace():
+    class Trace:
+        def __init__(self):
+            self.outcomes = []
+
+        def runtime_context_observation(self, outcome):
+            self.outcomes.append(outcome)
+
+    async def run():
+        trace = Trace()
+        policy = RuntimeContextPolicy(FailingObservationModel({}), trace=trace)
+
+        await policy.record_tool_round(
+            1, [{"id": "call-1", "name": "read", "args": {}}], ["done"]
+        )
+        await asyncio.sleep(0)
+
+        assert [outcome.status for outcome in trace.outcomes] == [
+            "pending",
+            "provider_error",
+        ]
+        assert trace.outcomes[-1].round == 1
+
+    asyncio.run(run())
+
+
+def test_recording_a_tool_round_exposes_raw_evidence_before_observation_finishes():
+    async def run():
+        model = BlockingObservationModel()
+        policy = RuntimeContextPolicy(model)
+
+        await asyncio.wait_for(
+            policy.record_tool_round(
+                1,
+                [{"id": "call-1", "name": "read", "args": {"path": "README.md"}}],
+                ["contents"],
+            ),
+            timeout=0.1,
+        )
+
+        raw = policy.assemble({"goal": "inspect"}).raw_tool_results
+        assert [item.round for item in raw] == [1]
+        assert raw[0].calls[0].result == "contents"
+        assert not model.release.is_set()
+
+        await model.started.wait()
+        model.release.set()
+
+    asyncio.run(run())
+
+
+def test_pending_old_observation_remains_raw_until_a_later_snapshot():
+    async def run():
+        model = FirstObservationDelayedModel()
+        policy = RuntimeContextPolicy(model)
+
+        for round_number in range(1, 5):
+            await policy.record_tool_round(
+                round_number,
+                [{"id": f"call-{round_number}", "name": "read", "args": {}}],
+                [f"result-{round_number}"],
+            )
+        await model.started.wait()
+
+        pending = policy.assemble({"goal": "inspect"})
+        assert [item.round for item in pending.raw_tool_results] == [1, 2, 3, 4]
+        assert pending.observations == ()
+
+        model.release.set()
+        await asyncio.sleep(0.01)
+
+        ready = policy.assemble({"goal": "inspect"})
+        assert [item.round for item in ready.raw_tool_results] == [2, 3, 4]
+        assert [item.round for item in ready.observations] == [1]
+        assert ready.observations[0].source_tool_call_ids == ("call-1",)
+
+    asyncio.run(run())
+
+
 def test_policy_logs_observation_model_response():
     class Trace:
         def __init__(self):
@@ -265,18 +467,21 @@ def test_policy_moves_only_the_fourth_oldest_round_to_observation_context():
     assert context.observations[0].confirmed_facts[0].text == "fact-1"
 
 
-def test_policy_fails_when_observation_schema_is_invalid():
+def test_policy_uses_raw_fallback_when_observation_schema_is_invalid():
     model = ObservationModel({"round": 1, "confirmed_facts": []})
     policy = RuntimeContextPolicy(model)
 
     async def run():
         await policy.record_tool_round(1, [{"id": "call-1", "name": "read", "args": {}}], ["done"])
+        await asyncio.sleep(0)
+        context = policy.assemble({"goal": "inspect"})
+        assert context.raw_tool_results[0].calls[0].result == "done"
+        assert context.observations == ()
 
-    with pytest.raises(ContextMaintenanceError, match="Observation schema"):
-        asyncio.run(run())
+    asyncio.run(run())
 
 
-def test_policy_rejects_invalid_observation_evidence_types():
+def test_policy_uses_raw_fallback_when_observation_evidence_is_invalid():
     model = ObservationModel(
         {
             "round": 1,
@@ -289,9 +494,12 @@ def test_policy_rejects_invalid_observation_evidence_types():
 
     async def run():
         await policy.record_tool_round(1, [{"id": "call-1", "name": "read", "args": {}}], ["done"])
+        await asyncio.sleep(0)
+        context = policy.assemble({"goal": "inspect"})
+        assert context.raw_tool_results[0].calls[0].result == "done"
+        assert context.observations == ()
 
-    with pytest.raises(ContextMaintenanceError, match="evidence"):
-        asyncio.run(run())
+    asyncio.run(run())
 
 
 def test_policy_uses_default_budget_and_accepts_component_override():
@@ -328,6 +536,72 @@ def test_policy_merges_oldest_expired_observations_and_preserves_source_range(mo
     )
     assert "Return exactly one JSON object" not in merge_contract.content
     assert [item["round"] for item in json.loads(merge_evidence.content)] == [1, 2]
+
+
+def test_policy_merges_observations_in_round_order_after_out_of_order_completion(monkeypatch):
+    monkeypatch.setattr("agent.runtime_context._estimate_tokens", lambda context: 2 if len(context.observations) > 1 else 1)
+
+    class OutOfOrderModel:
+        def __init__(self):
+            self.release_first = asyncio.Event()
+            self.first_started = asyncio.Event()
+            self.merge_payloads = []
+
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            payload = json.loads(messages[1].content)
+            if isinstance(payload, list):
+                self.merge_payloads.append(payload)
+                return AIMessage(content=json.dumps({
+                    "round": payload[-1]["round"],
+                    "confirmed_facts": [
+                        {
+                            "text": "merged",
+                            "tool_call_ids": [
+                                call_id
+                                for observation in payload
+                                for fact in observation["confirmed_facts"]
+                                for call_id in fact["tool_call_ids"]
+                            ],
+                        }
+                    ],
+                    "reported_errors": [],
+                    "model_inferences": [],
+                }))
+            if payload["round"] == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            round_number = payload["round"]
+            return AIMessage(content=json.dumps({
+                "round": round_number,
+                "confirmed_facts": [{"text": f"fact-{round_number}", "tool_call_ids": [f"call-{round_number}"]}],
+                "reported_errors": [],
+                "model_inferences": [],
+            }))
+
+    async def run():
+        model = OutOfOrderModel()
+        policy = RuntimeContextPolicy(model, budget=1)
+        for round_number in range(1, 6):
+            await policy.record_tool_round(
+                round_number,
+                [{"id": f"call-{round_number}", "name": "read", "args": {}}],
+                [f"result-{round_number}"],
+            )
+        await model.first_started.wait()
+        model.release_first.set()
+        await asyncio.sleep(0)
+        context = await policy.maintain({"goal": "inspect"})
+        return model, context
+
+    model, context = asyncio.run(run())
+
+    assert [item["round"] for item in model.merge_payloads[0]] == [1, 2]
+    assert context.observations[0].source_round_start == 1
+    assert context.observations[0].source_round_end == 2
+    assert context.observations[0].source_tool_call_ids == ("call-1", "call-2")
 
 
 def test_observation_merge_request_puts_fixed_contract_before_observations(monkeypatch):

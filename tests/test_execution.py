@@ -4,7 +4,8 @@ from io import StringIO
 from langchain_core.messages import AIMessage
 
 from agent import PlanningValidationError
-from agent.execution import DirectMode, ExecutionAnswer, PlanExecuteMode, ReactMode, ToolAgentMode
+from agent.configuration import ComponentProviderConfiguration, ProviderConfiguration
+from agent.execution import DirectMode, ExecutionAnswer, PlanExecuteMode, ReactMode, ToolAgentMode, create_execution_mode
 from agent.trace import RunTrace
 
 
@@ -157,3 +158,33 @@ def test_react_logs_the_original_exception_before_returning_safe_error():
     assert answer == ExecutionAnswer(None, "failed", error="react execution failed")
     assert "[run-123] [execution error] component=react" in output.getvalue()
     assert "RuntimeError: provider exploded" in output.getvalue()
+
+
+def test_react_factory_owns_and_closes_a_fresh_http_client_per_asyncio_run(monkeypatch):
+    """Interactive chat starts a new event loop for each submitted turn."""
+    clients = []
+
+    class ChatModel:
+        def __init__(self, **kwargs):
+            clients.append(kwargs["http_async_client"])
+
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages):
+            return AIMessage(content="Done")
+
+    monkeypatch.setattr("agent.execution.ChatOpenAI", ChatModel)
+    provider = ProviderConfiguration("https://provider.test/v1", "key", "model")
+    configuration = ComponentProviderConfiguration(provider, provider, provider, react=provider)
+
+    async def submit_turn():
+        mode = create_execution_mode("react", configuration=configuration)
+        assert await mode.run("Complete") == ExecutionAnswer("Done", "completed")
+
+    asyncio.run(submit_turn())
+    asyncio.run(submit_turn())
+
+    assert len(clients) == 2
+    assert clients[0] is not clients[1]
+    assert all(client.is_closed for client in clients)

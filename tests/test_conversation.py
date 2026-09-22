@@ -88,18 +88,8 @@ def test_conversation_task_analyzer_is_traced_before_routing(monkeypatch, capsys
         "task_type": "retrieval",
         "goal_clarity": 1.0,
         "needs_tools": True,
-        "tool_diversity": 0.2,
-        "known_steps": 0.8,
-        "path_uncertainty": 0.4,
-        "step_dependency": 0.5,
-        "dynamic_branching": 0.2,
         "expected_steps": 3,
         "expected_horizon": "medium",
-        "failure_recovery": 0.2,
-        "need_replanning": 0.3,
-        "open_subgoals": 1,
-        "parallelizable": False,
-        "risk_level": "low",
         "reasoning_summary": "inspect project files",
     }
 

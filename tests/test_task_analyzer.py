@@ -27,18 +27,8 @@ def valid_analysis() -> str:
 TASK_TYPE="research"
 GOAL_CLARITY=0.9
 NEEDS_TOOLS=true
-TOOL_DIVERSITY=0.4
-KNOWN_STEPS=0.3
-PATH_UNCERTAINTY=0.8
-STEP_DEPENDENCY=0.7
-DYNAMIC_BRANCHING=0.6
 EXPECTED_STEPS=5
 EXPECTED_HORIZON="medium"
-FAILURE_RECOVERY=0.2
-NEED_REPLANNING=0.4
-OPEN_SUBGOALS=2
-PARALLELIZABLE=false
-RISK_LEVEL="low"
 REASONING_SUMMARY="The task needs investigation."
 END TASK_ANALYSIS'''
 
@@ -53,18 +43,8 @@ def test_task_analyzer_decodes_valid_line_protocol_into_existing_analysis_contra
     assert analysis.task_type == "research"
     assert analysis.goal_clarity == 0.9
     assert analysis.needs_tools is True
-    assert analysis.tool_diversity == 0.4
-    assert analysis.known_steps == 0.3
-    assert analysis.path_uncertainty == 0.8
-    assert analysis.step_dependency == 0.7
-    assert analysis.dynamic_branching == 0.6
     assert analysis.expected_steps == 5
     assert analysis.expected_horizon == "medium"
-    assert analysis.failure_recovery == 0.2
-    assert analysis.need_replanning == 0.4
-    assert analysis.open_subgoals == 2
-    assert analysis.parallelizable is False
-    assert analysis.risk_level == "low"
     assert analysis.reasoning_summary == "The task needs investigation."
     assert route(analysis) == "react"
 
@@ -111,7 +91,7 @@ def test_task_analyzer_includes_prior_conversation_history_in_model_input():
         (valid_analysis().replace('TASK_TYPE="research"', 'TASK_TYPE="unknown"'), "unsupported category"),
         (valid_analysis().replace("GOAL_CLARITY=0.9", "GOAL_CLARITY=1.1"), "score"),
         (valid_analysis().replace("EXPECTED_STEPS=5", "EXPECTED_STEPS=0"), "non-negative integer"),
-        (valid_analysis().replace("NEEDS_TOOLS=true", "NEEDS_TOOLS=1"), "booleans"),
+        (valid_analysis().replace("NEEDS_TOOLS=true", "NEEDS_TOOLS=1"), "boolean"),
         (valid_analysis().replace('REASONING_SUMMARY="The task needs investigation."', 'REASONING_SUMMARY="  "'), "non-empty text"),
     ],
 )

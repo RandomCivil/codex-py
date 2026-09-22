@@ -12,18 +12,8 @@ def analysis(**overrides):
         "task_type": "research",
         "goal_clarity": 0.9,
         "needs_tools": True,
-        "tool_diversity": 0.4,
-        "known_steps": 0.5,
-        "path_uncertainty": 0.5,
-        "step_dependency": 0.5,
-        "dynamic_branching": 0.5,
         "expected_steps": 4,
         "expected_horizon": "medium",
-        "failure_recovery": 0.2,
-        "need_replanning": 0.2,
-        "open_subgoals": 1,
-        "parallelizable": False,
-        "risk_level": "low",
         "reasoning_summary": "The task needs investigation.",
     }
     values.update(overrides)
@@ -34,13 +24,9 @@ def analysis(**overrides):
     ("characteristics", "expected"),
     [
         ({"needs_tools": False}, "direct"),
-        ({"expected_steps": 2, "path_uncertainty": 0.299}, "tool_agent"),
-        ({"expected_steps": 3, "path_uncertainty": 0.299}, "react"),
-        ({"expected_steps": 2, "path_uncertainty": 0.3}, "react"),
+        ({"expected_steps": 1}, "tool_agent"),
+        ({"expected_steps": 2}, "react"),
         ({"expected_horizon": "long"}, "plan_execute"),
-        ({"open_subgoals": 3}, "plan_execute"),
-        ({"need_replanning": 0.7}, "react"),
-        ({"need_replanning": 0.701}, "plan_execute"),
     ],
 )
 def test_route_applies_the_ordered_execution_mode_policy(characteristics, expected):
@@ -52,17 +38,12 @@ def test_route_preserves_early_precedence_over_plan_execute_conditions():
         analysis(
             needs_tools=False,
             expected_horizon="long",
-            open_subgoals=4,
-            need_replanning=0.9,
         )
     ) == "direct"
     assert route(
         analysis(
-            expected_steps=2,
-            path_uncertainty=0.2,
+            expected_steps=1,
             expected_horizon="long",
-            open_subgoals=4,
-            need_replanning=0.9,
         )
     ) == "tool_agent"
 
@@ -156,7 +137,7 @@ def test_router_treats_invalid_analysis_as_a_conservative_plan_execute_fallback(
 
 
 def test_router_does_not_run_another_mode_after_selected_mode_fails():
-    analyzer = ControlledAnalyzer(analysis(needs_tools=True, expected_steps=1, path_uncertainty=0.1))
+    analyzer = ControlledAnalyzer(analysis(needs_tools=True, expected_steps=1))
     calls = []
 
     def factory(name):

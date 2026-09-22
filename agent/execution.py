@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Protocol
 
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -217,13 +218,32 @@ class _ToolExecutionError(RuntimeError):
         self.result = result
 
 
+async def _close_owned_http_clients(clients: tuple[Any, ...]) -> None:
+    """Release per-invocation HTTP pools before their event loop is closed."""
+    for client in clients:
+        try:
+            await client.aclose()
+        except Exception:
+            # A close failure must not replace the execution result or obscure its
+            # original error.  The client is only an implementation resource.
+            pass
+
+
 class ToolAgentMode:
     """Make one model request and, at most, one host tool invocation."""
 
-    def __init__(self, model: Any, tool_runtime: Any, trace: Any | None = None) -> None:
+    def __init__(
+        self,
+        model: Any,
+        tool_runtime: Any,
+        trace: Any | None = None,
+        *,
+        owned_http_clients: tuple[Any, ...] = (),
+    ) -> None:
         self._model = model
         self._runtime = tool_runtime
         self._trace = trace
+        self._owned_http_clients = owned_http_clients
 
     async def run(self, goal: Any) -> ExecutionAnswer:
         goal = conversation_model_input(goal)
@@ -275,6 +295,8 @@ class ToolAgentMode:
                 return ExecutionAnswer(render_tool_result(result), "completed")
         except Exception:
             return ExecutionAnswer(None, "failed", error="tool-agent execution failed")
+        finally:
+            await _close_owned_http_clients(self._owned_http_clients)
 
 
 class ReactMode:
@@ -290,6 +312,7 @@ class ReactMode:
         context_policy: RuntimeContextPolicy | None = None,
         context_budget: int = 128_000,
         context_model: Any | None = None,
+        owned_http_clients: tuple[Any, ...] = (),
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
@@ -300,6 +323,7 @@ class ReactMode:
         self._context_policy = context_policy
         self._context_budget = context_budget
         self._context_model = context_model
+        self._owned_http_clients = owned_http_clients
 
     def _policy_for_invocation(self) -> RuntimeContextPolicy | Any | None:
         """Return an invocation-local Runtime-context policy."""
@@ -407,6 +431,9 @@ class ReactMode:
                     "react", error, phase=phase, round_number=round_number or None
                 )
             return ExecutionAnswer(None, "failed", error="react execution failed")
+
+        finally:
+            await _close_owned_http_clients(self._owned_http_clients)
 
         return ExecutionAnswer(None, "failed", error="react execution failed")
 
@@ -578,6 +605,7 @@ def create_execution_mode(
             return _UnavailableMode(mode)
         return PlanExecuteMode(durable_agent, run_id=run_id)
     provider = getattr(configuration, mode, None) if configuration is not None else None
+    owned_http_clients: tuple[Any, ...] = ()
     if provider is not None and model is None:
         if mode == "direct":
             model = LLM(
@@ -594,13 +622,8 @@ def create_execution_mode(
                 ),
             )
         else:
-            model = ChatOpenAI(
-                base_url=provider.base_url,
-                api_key=provider.api_key,
-                model=provider.model_name,
-                streaming=provider.stream,
-                max_retries=0,
-            )
+            model, http_client = _configured_chat_model(provider)
+            owned_http_clients = (http_client,)
     if mode == "tool_agent":
         if model is None:
             return _UnavailableMode(mode)
@@ -608,6 +631,7 @@ def create_execution_mode(
             model,
             tool_runtime or ToolRuntime(trace=trace),
             trace=trace,
+            owned_http_clients=owned_http_clients,
         )
     if mode == "react":
         if model is None:
@@ -615,13 +639,8 @@ def create_execution_mode(
         context_configuration = configuration.runtime_context if configuration is not None else None
         context_model = None
         if context_configuration is not None:
-            context_model = ChatOpenAI(
-                base_url=context_configuration.base_url,
-                api_key=context_configuration.api_key,
-                model=context_configuration.model_name,
-                streaming=context_configuration.stream,
-                max_retries=0,
-            )
+            context_model, context_http_client = _configured_chat_model(context_configuration)
+            owned_http_clients += (context_http_client,)
         return ReactMode(
             model,
             tool_runtime or ToolRuntime(trace=trace),
@@ -630,6 +649,7 @@ def create_execution_mode(
             context_budget=context_budget,
             context_policy=context_policy,
             context_model=context_model,
+            owned_http_clients=owned_http_clients,
         )
     if model is None:
         if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
@@ -647,3 +667,24 @@ def create_execution_mode(
             ),
         )
     return DirectMode(model, trace=trace, stream=(provider.stream if provider is not None else True))
+
+
+def _configured_chat_model(provider: Any) -> tuple[ChatOpenAI, httpx.AsyncClient]:
+    """Create a ChatOpenAI instance whose pool belongs to one mode invocation.
+
+    LangChain otherwise caches its default async client process-wide.  Chat's
+    synchronous shell creates a new asyncio loop per submitted turn, so that
+    cache would retain transports associated with a closed previous loop.
+    """
+    http_client = httpx.AsyncClient()
+    return (
+        ChatOpenAI(
+            base_url=provider.base_url,
+            api_key=provider.api_key,
+            model=provider.model_name,
+            streaming=provider.stream,
+            max_retries=0,
+            http_async_client=http_client,
+        ),
+        http_client,
+    )

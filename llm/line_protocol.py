@@ -290,10 +290,8 @@ CODEC_REGISTRY = {
     },
     "TASK_ANALYSIS": {
         "fields": frozenset({
-            "TASK_TYPE", "GOAL_CLARITY", "NEEDS_TOOLS", "TOOL_DIVERSITY", "KNOWN_STEPS",
-            "PATH_UNCERTAINTY", "STEP_DEPENDENCY", "DYNAMIC_BRANCHING", "EXPECTED_STEPS",
-            "EXPECTED_HORIZON", "FAILURE_RECOVERY", "NEED_REPLANNING", "OPEN_SUBGOALS",
-            "PARALLELIZABLE", "RISK_LEVEL", "REASONING_SUMMARY",
+            "TASK_TYPE", "GOAL_CLARITY", "NEEDS_TOOLS", "EXPECTED_STEPS", "EXPECTED_HORIZON",
+            "REASONING_SUMMARY",
         }),
         "scalar_arrays": frozenset(),
         "children": frozenset(),

@@ -15,10 +15,14 @@
 - MySQL checkpoint、运行登记和 60 秒独占 lease；lease 每 15 秒续租。
 - 配置指纹校验，避免恢复时静默更换模型或 MCP 配置。
 - Runtime-context component 异步生成和压缩 Tool-round Observation；最近三轮保留原始工具结果，Observation 失败时自动回退到原始证据。
+- 按 Tool call 独立应用证据策略：`list_dir`/`glob` 只保留最近三轮原始结果，`grep`/`read_file` 在本次调用中保留全部原始结果，写入类工具异步生成 Observation；不会把原始工具结果写入 Durable State 或 Checkpoint。
+- Runtime context 使用显式 token budget；超出预算时合并较早 Observation，无法容纳必要 Durable State 或工具证据时让执行安全失败，并支持取消、失败和无效 Observation 的诊断追踪。
+- 支持 OpenAI-compatible provider 的 text stream/event stream；日志记录组件、请求形状和 token/cache usage，便于观察多轮工具执行和 provider 缓存效果。
 - 通过 CLI 以一行 JSON 输出运行结果，便于脚本调用。
 - 运行过程中将 LLM thought/output、Plan–Execute 状态以及 MCP tool call/result 实时输出到 stderr；最终结果仍只写到 stdout。
 - `run` 先由 Task Router 描述性分析目标，再确定性地选择 direct、tool-agent、ReAct 或 Plan–execute。
 - MySQL 持久化 Conversation：每轮保留独立 run、显式 Execution mode 与有序公开历史。
+- `conversation chat` 提供可重连的交互式终端会话，自动管理 `conv_id`，并在输入前恢复活动中的 turn。
 
 ### 执行模式
 
@@ -164,7 +168,7 @@ task_analyzer:
   model_name: task-analysis-model
 ```
 
-所有非工具模型响应都使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，短且确定的工具目标使用 tool-agent，长周期/多子目标/高重规划目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
+所有非工具模型响应都使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，预计一步的工具目标使用 tool-agent，长周期工具目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
 
 每个 provider 配置的 `stream` 必须是 YAML 布尔值，表示该组件是否使用 LLM 流式返回；省略时为 `false`。`stream` 也会参与 run 恢复时的配置兼容性检查。
 

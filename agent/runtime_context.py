@@ -28,6 +28,10 @@ EvidenceLifecycle = Literal["current_raw", "recent_raw", "permanent_raw", "obser
 _OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
 BEGIN OBSERVATION ... END OBSERVATION.
 Create the Observation for the settled Tool round in the next message.
+Assess whether the evidence changes the active decision. Set
+AFFECTS_CURRENT_DECISION to true or false and repeat AFFECTED_TARGETS for any of
+confirmed_facts, summary, or durable_state affected. Positive impact requires at
+least one target; negative impact requires none.
 Set ROUND to the source round. Every EVIDENCE block MUST contain CATEGORY, TEXT, and
 at least one TOOL_CALL_ID. Copy TOOL_CALL_ID exactly from the input tool-call ID;
 never omit it and never invent one. Classify tool-confirmed output as confirmed_facts,
@@ -37,6 +41,8 @@ literals after '=' and do not output prose.
 Example:
 BEGIN OBSERVATION
 ROUND=4
+AFFECTS_CURRENT_DECISION=true
+AFFECTED_TARGETS="confirmed_facts"
 BEGIN EVIDENCE
 CATEGORY="confirmed_facts"
 TEXT="The requested files were found"
@@ -48,7 +54,8 @@ _MERGE_OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
 BEGIN OBSERVATION ... END OBSERVATION.
 Merge the Observations in the next message into one Observation. Set ROUND to the
 latest source round and preserve source-round metadata with SOURCE_ROUND_START and
-SOURCE_ROUND_END. Preserve every source tool-call ID. Each evidence entry is one
+SOURCE_ROUND_END. Preserve positive decision impact and the union of all affected
+targets. Preserve every source tool-call ID. Each evidence entry is one
 nested EVIDENCE block with CATEGORY, TEXT, and repeated TOOL_CALL_ID fields. Use JSON
 literals after '=' and do not output prose."""
 
@@ -73,6 +80,22 @@ def _merge_observation_contract() -> str:
     return _MERGE_OBSERVATION_CONTRACT
 
 
+def observation_decision_context(
+    *,
+    goal: str,
+    execution_mode: str,
+    plan_step: Mapping[str, Any] | None = None,
+    completion_criterion: str | None = None,
+) -> dict[str, Any]:
+    """Build the loop-owned context used to assess one Tool call's impact."""
+    return {
+        "goal": goal,
+        "execution_mode": execution_mode,
+        "plan_step": dict(plan_step) if plan_step is not None else None,
+        "completion_criterion": completion_criterion,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class Evidence:
     text: str
@@ -85,6 +108,8 @@ class Observation:
     confirmed_facts: tuple[Evidence, ...]
     reported_errors: tuple[Evidence, ...]
     model_inferences: tuple[Evidence, ...]
+    affects_current_decision: bool
+    affected_targets: tuple[str, ...]
     source_round_start: int | None = None
     source_round_end: int | None = None
 
@@ -168,6 +193,7 @@ class RuntimeContextPolicy:
         self._next_call_order = 0
         self._model_uses = 0
         self._tool_rounds = 0
+        self._decision_summaries: dict[tuple[int, str], Mapping[str, Any]] = {}
 
     @property
     def observations(self) -> tuple[Observation, ...]:
@@ -209,6 +235,7 @@ class RuntimeContextPolicy:
         calls: Sequence[Mapping[str, Any]],
         results: Sequence[Any],
         errors: Sequence[str | None] | None = None,
+        decision_context: Mapping[str, Any] | None = None,
     ) -> RawToolResult:
         """Store a settled batch and observe only successful observation-class calls."""
         if len(calls) != len(results) or (errors is not None and len(calls) != len(errors)):
@@ -235,6 +262,10 @@ class RuntimeContextPolicy:
         for call in raw.calls:
             self._call_order[(raw.round, call.tool_call_id)] = self._next_call_order
             self._next_call_order += 1
+            if call.lifecycle == "observation":
+                summary = dict(decision_context or {})
+                summary["tool"] = {"name": call.name, "arguments": dict(call.arguments)}
+                self._decision_summaries[(raw.round, call.tool_call_id)] = summary
         self._expire_observations()
         for call in (
             call
@@ -243,7 +274,12 @@ class RuntimeContextPolicy:
         ):
             observation_raw = RawToolResult(raw.round, (call,))
             self._set_observation_outcome(raw.round, call.tool_call_id, "pending")
-            task = asyncio.create_task(self._observe(observation_raw))
+            task = asyncio.create_task(
+                self._observe(
+                    observation_raw,
+                    self._decision_summaries.get((raw.round, call.tool_call_id), {}),
+                )
+            )
             self._observation_tasks.add(task)
             task.add_done_callback(self._observation_finished)
             await asyncio.sleep(0)
@@ -259,6 +295,11 @@ class RuntimeContextPolicy:
             for item in self._observations
             for call_id in item.source_tool_call_ids
         }
+        negative_call_ids = {
+            call_id
+            for (_, call_id), outcome in self._observation_outcomes.items()
+            if outcome.status == "succeeded" and call_id not in observed_call_ids
+        }
         raw_results = tuple(
             RawToolResult(
                 item.round,
@@ -266,13 +307,25 @@ class RuntimeContextPolicy:
                     call
                     for call in item.calls
                     if _is_visible_call(
-                        call, item.round, current_rounds, recent_rounds, observed_call_ids
+                        call,
+                        item.round,
+                        current_rounds,
+                        recent_rounds,
+                        observed_call_ids,
+                        negative_call_ids,
                     )
                 ),
             )
             for item in self._raw
             if any(
-                _is_visible_call(call, item.round, current_rounds, recent_rounds, observed_call_ids)
+                _is_visible_call(
+                    call,
+                    item.round,
+                    current_rounds,
+                    recent_rounds,
+                    observed_call_ids,
+                    negative_call_ids,
+                )
                 for call in item.calls
             )
         )
@@ -302,10 +355,12 @@ class RuntimeContextPolicy:
         # they are visible while their Raw round is in the recent window.
         return None
 
-    async def _observe(self, raw: RawToolResult) -> None:
+    async def _observe(
+        self, raw: RawToolResult, decision_summary: Mapping[str, Any]
+    ) -> None:
         call_id = raw.calls[0].tool_call_id
         try:
-            observation = await self._request_observation(raw)
+            observation = await self._request_observation(raw, decision_summary)
         except asyncio.CancelledError:
             self._set_observation_outcome(
                 raw.round, call_id, "cancelled", "Observation task was cancelled"
@@ -318,8 +373,9 @@ class RuntimeContextPolicy:
             self._set_observation_outcome(raw.round, call_id, "invalid", str(error))
             return
         else:
-            self._observations.append(observation)
-            self._observations.sort(key=self._observation_order)
+            if observation.affects_current_decision:
+                self._observations.append(observation)
+                self._observations.sort(key=self._observation_order)
             self._set_observation_outcome(raw.round, call_id, "succeeded")
 
     def _observation_order(self, observation: Observation) -> tuple[int, int]:
@@ -350,11 +406,15 @@ class RuntimeContextPolicy:
     def _observation_finished(self, task: asyncio.Task[Any]) -> None:
         self._observation_tasks.discard(task)
 
-    async def _request_observation(self, raw: RawToolResult) -> Observation:
+    async def _request_observation(
+        self, raw: RawToolResult, decision_summary: Mapping[str, Any]
+    ) -> Observation:
+        payload = _raw_payload(raw)
+        payload["decision_summary"] = dict(decision_summary)
         response = await self._structured_invoke(
             [
                 HumanMessage(content=_observation_contract()),
-                HumanMessage(content=json.dumps(_raw_payload(raw), default=str)),
+                HumanMessage(content=json.dumps(payload, default=str, sort_keys=True)),
             ],
             request_kind="observation",
         )
@@ -386,6 +446,8 @@ class RuntimeContextPolicy:
             merged.confirmed_facts,
             merged.reported_errors,
             merged.model_inferences,
+            any(item.affects_current_decision for item in (first, second)),
+            tuple(dict.fromkeys(first.affected_targets + second.affected_targets)),
             source_round_start=first.source_round_start or first.round,
             source_round_end=second.source_round_end or second.round,
         )
@@ -454,6 +516,15 @@ def _parse_observation(
             source_start is not None and source_start > source_end
         ):
             raise ValueError("source range")
+        impact = _single_protocol_field(fields, "AFFECTS_CURRENT_DECISION")
+        if type(impact) is not bool:
+            raise ValueError("AFFECTS_CURRENT_DECISION")
+        targets = fields.get("AFFECTED_TARGETS", [])
+        valid_targets = {"confirmed_facts", "summary", "durable_state"}
+        if any(target not in valid_targets for target in targets):
+            raise ValueError("AFFECTED_TARGETS")
+        if (impact and not targets) or (not impact and targets):
+            raise ValueError("decision impact targets")
         parsed: dict[str, tuple[Evidence, ...]] = {
             "confirmed_facts": (), "reported_errors": (), "model_inferences": ()
         }
@@ -472,13 +543,17 @@ def _parse_observation(
         observation = Observation(
             expected_round,
             **parsed,
+            affects_current_decision=impact,
+            affected_targets=tuple(dict.fromkeys(targets)),
             source_round_start=source_start,
             source_round_end=source_end,
         )
         if expected_tool_call_id is not None:
             source_ids = set(observation.source_tool_call_ids)
-            if source_ids != {expected_tool_call_id}:
+            if source_ids and source_ids != {expected_tool_call_id}:
                 raise ValueError("source tool-call attribution")
+            if impact and source_ids != {expected_tool_call_id}:
+                raise ValueError("positive impact requires source tool-call attribution")
             if source_start is not None and (
                 source_start != expected_round or source_end != expected_round
             ):
@@ -518,12 +593,20 @@ def _is_visible_call(
     current_rounds: set[int],
     recent_rounds: set[int],
     observed_call_ids: set[str],
+    negative_call_ids: set[str],
 ) -> bool:
     return (
         (call.lifecycle == "current_raw" and round in current_rounds)
         or (call.lifecycle == "recent_raw" and round in recent_rounds)
         or call.lifecycle == "permanent_raw"
-        or (call.lifecycle == "observation" and call.tool_call_id not in observed_call_ids)
+        or (
+            call.lifecycle == "observation"
+            and call.tool_call_id not in observed_call_ids
+            and (
+                call.tool_call_id not in negative_call_ids
+                or round in recent_rounds
+            )
+        )
     )
 
 
@@ -584,6 +667,8 @@ def _evidence_payload(item: Evidence) -> dict[str, Any]:
 def _observation_payload(item: Observation) -> dict[str, Any]:
     return {
         "round": item.round,
+        "affects_current_decision": item.affects_current_decision,
+        "affected_targets": list(item.affected_targets),
         "source_round_start": item.source_round_start or item.round,
         "source_round_end": item.source_round_end or item.round,
         "confirmed_facts": [_evidence_payload(value) for value in item.confirmed_facts],
@@ -598,7 +683,7 @@ def _raw_payload(item: RawToolResult) -> dict[str, Any]:
 
 def _runtime_context_prompt(context: RuntimeContext) -> str:
     """Render Runtime context as explicit prompt sections instead of one JSON blob."""
-    durable_state, goal = _runtime_durable_state_and_goal(context.durable_state)
+    durable_state, goal, steps = _runtime_durable_state_goal_and_steps(context.durable_state)
     sections = [
         "## Runtime context",
         "",
@@ -633,6 +718,8 @@ def _runtime_context_prompt(context: RuntimeContext) -> str:
         sections.append("- (none)")
 
     sections.extend(("", "### Goal", _prompt_value(goal)))
+    if steps is not None:
+        sections.extend(("", "### Steps", _prompt_value(steps)))
     return "\n".join(sections)
 
 
@@ -687,22 +774,43 @@ def _native_read_entries(call: RawToolCall) -> list[tuple[str, Any]] | None:
     return None
 
 
-def _runtime_durable_state_and_goal(value: Any) -> tuple[Any, Any]:
-    """Remove only the displayed goal from the Durable State presentation."""
+def _runtime_durable_state_goal_and_steps(value: Any) -> tuple[Any, Any, Any | None]:
+    """Move a Plan execution's steps to the final Runtime context section."""
     if not isinstance(value, Mapping):
-        return value, None
+        return value, None, None
     if "goal" in value:
         durable_state = dict(value)
         goal = durable_state.pop("goal")
-        return durable_state, goal
+        return durable_state, goal, None
     agent_state = value.get("agent_state")
     if isinstance(agent_state, Mapping) and "goal" in agent_state:
         durable_state = dict(value)
         displayed_agent_state = dict(agent_state)
         goal = displayed_agent_state.pop("goal")
+        steps = _extract_plan_steps(displayed_agent_state)
         durable_state["agent_state"] = displayed_agent_state
-        return durable_state, goal
-    return value, None
+        return durable_state, goal, steps
+    return value, None, None
+
+
+def _extract_plan_steps(agent_state: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Remove plan steps while retaining their revision association."""
+    plan_history = agent_state.get("plan_history")
+    if not isinstance(plan_history, list):
+        return None
+
+    displayed_history: list[Any] = []
+    steps: list[dict[str, Any]] = []
+    for plan in plan_history:
+        if not isinstance(plan, Mapping) or "steps" not in plan:
+            displayed_history.append(plan)
+            continue
+        displayed_plan = dict(plan)
+        plan_steps = displayed_plan.pop("steps")
+        displayed_history.append(displayed_plan)
+        steps.append({"revision": plan.get("revision"), "steps": plan_steps})
+    agent_state["plan_history"] = displayed_history
+    return steps
 
 
 def _evidence_section(title: str, values: tuple[Evidence, ...]) -> list[str]:

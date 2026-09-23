@@ -64,7 +64,13 @@ class _FirstObservationBlocked:
         if self.calls == 1:
             self.started.set()
             await self.release.wait()
-        return AIMessage(content="BEGIN OBSERVATION\nROUND=%d\nEND OBSERVATION" % self.calls)
+        return AIMessage(
+            content=(
+                "BEGIN OBSERVATION\nROUND=%d\nAFFECTS_CURRENT_DECISION=false\n"
+                "END OBSERVATION"
+            )
+            % self.calls
+        )
 
 
 def test_react_round_five_uses_raw_fallback_for_pending_round_one():

@@ -46,7 +46,7 @@ All other evidence retains its existing presentation and retention behavior.
 12. As a tool-calling model, I want `(unfiled)` entries to show the native tool name and arguments, complete result, and error where present, so that I can diagnose why no file group was possible.
 13. As an operator, I want tool-call IDs and complete Raw tool-result data to remain available to diagnostics, so that rendering does not weaken provenance.
 14. As an application owner, I want `grep` and `read_file` to remain permanent-raw evidence and never request Observations, so that this change does not make exact read evidence lossy.
-15. As an application integrator, I want `list_dir`, `glob`, observation-class calls, and `exec` calls to retain their existing rendering and evidence lifecycle, so that this feature is limited to native read presentation.
+15. As an application integrator, I want `list_dir`, `glob`, native reads, and failed calls to retain their existing rendering and evidence lifecycle, while successful observation-class calls use the decision-impact policy, so that native-read presentation remains lossless and observation evidence remains task-relevant.
 16. As a ReAct caller, I want the same goal placement and native-read grouping on every operational and terminal model request, so that context formatting is consistent through the tool loop.
 17. As a Plan–execute caller, I want the Plan-step Executor to use the same rendering behavior for its invocation-local Runtime context, so that execution modes do not diverge.
 18. As an application owner, I want context-budget behavior to remain unchanged, so that required Raw evidence remains lossless and context-maintenance failure remains explicit.
@@ -61,6 +61,8 @@ All other evidence retains its existing presentation and retention behavior.
 - Collect file groups across all selected Raw tool results. Preserve each group's entries in ascending Tool-round order and original request order within a batch. Retain relevant round and tool-call provenance in the rendered entry.
 - Place a native read into `(unfiled)` whenever it reports an error, has no safely resolvable path, or contains result content that cannot be assigned to a file. Render its native request, complete unmodified result, and error rather than discarding or summarizing it.
 - Continue to render non-native-read Raw calls, Observations, and empty states under their existing contracts.
+- For every successful observation-class call, provide the Runtime-context component a deterministic decision summary containing the Goal, execution mode, applicable Plan step and completion criterion, and the triggering tool name and arguments. Require `affects_current_decision` and `affected_targets` (`confirmed_facts`, `summary`, and/or `durable_state`) in its Observation. A positive Observation replaces its Raw fallback; a negative result keeps Raw evidence only through its existing window, then leaves Runtime context. Do not block either loop for this asynchronous decision.
+- Retain Raw fallback for a pending, failed, or invalid decision-impact Observation. Require nonempty targets for a positive impact and no targets for a negative one; when budget merging positive Observations, retain positive impact and union their targets. Treat `durable_state` strictly as explanatory metadata, never as a state mutation.
 - Preserve Raw tool-result retention, per-call classification, asynchronous Observation lifecycle, token budgeting, tracing, Checkpoint exclusion, and recovery boundaries defined by ADR-0018.
 
 ## Testing Decisions
@@ -73,6 +75,7 @@ All other evidence retains its existing presentation and retention behavior.
 - Test grep output containing path-prefixed matches for multiple files and verify each match appears in the appropriate file group.
 - Test explicit grep paths, malformed or pathless grep output, tool errors, and read failures; verify that these retain native request, complete result, and error in `(unfiled)`.
 - Test that native `grep` and `read_file` retain their permanent-raw lifecycle and do not invoke the Observation model.
+- Test positive and negative decision-impact Observations for each existing observation-class tool, including `exec`; verify negative calls retain Raw evidence through their normal window before omission, invalid or failed judgments retain Raw fallback, and merged Observations union their affected targets without mutating Durable State.
 - Test that non-native-read calls retain their existing rendering and that no existing context-budget, Raw-evidence, or provenance behavior regresses.
 - Retain high-level ReAct and Plan-step Executor tests as confirmation that both modes pass the resulting Runtime context to later model requests.
 
@@ -80,7 +83,7 @@ All other evidence retains its existing presentation and retention behavior.
 
 - Changing Agent state, Plan, Checkpoint, recovery, or Planner schemas.
 - Changing Raw tool-result retention, Observation generation, Tool-call batch concurrency, request settlement order, or context-budget policy.
-- Grouping `exec` output or attempting to parse arbitrary shell commands or their output into files.
+- Grouping `exec` output or attempting to parse arbitrary shell commands or their output into files. The existing conservative static classification still decides whether an `exec` call is observation-class; this feature does not make permanent-raw read commands subject to decision-impact omission.
 - Grouping `list_dir`, `glob`, write-class calls, or Observations by file.
 - Adding a new diagnostic store, changing trace contents, or persisting Runtime-context evidence.
 - Changing tool schemas, tool permissions, execution-mode selection, or provider configuration.

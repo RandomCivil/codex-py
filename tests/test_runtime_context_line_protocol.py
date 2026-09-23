@@ -43,6 +43,8 @@ class MergeLineProtocolModel(ObservationLineProtocolModel):
                         f"ROUND={payload[-1]['round']}",
                         f"SOURCE_ROUND_START={payload[0]['source_round_start']}",
                         f"SOURCE_ROUND_END={payload[-1]['source_round_end']}",
+                        "AFFECTS_CURRENT_DECISION=true",
+                        'AFFECTED_TARGETS="confirmed_facts"',
                         "BEGIN EVIDENCE",
                         'CATEGORY="confirmed_facts"',
                         'TEXT="merged facts"',
@@ -58,6 +60,8 @@ class MergeLineProtocolModel(ObservationLineProtocolModel):
                 [
                     "BEGIN OBSERVATION",
                     f"ROUND={self.round}",
+                    "AFFECTS_CURRENT_DECISION=true",
+                    'AFFECTED_TARGETS="confirmed_facts"',
                     "BEGIN EVIDENCE",
                     'CATEGORY="confirmed_facts"',
                     f'TEXT="fact-{self.round}"',
@@ -75,6 +79,8 @@ def test_valid_observation_line_protocol_is_decoded_without_provider_response_fo
             [
                 "BEGIN OBSERVATION",
                 "ROUND=1",
+                "AFFECTS_CURRENT_DECISION=true",
+                'AFFECTED_TARGETS="confirmed_facts"',
                 "BEGIN EVIDENCE",
                 'CATEGORY="confirmed_facts"',
                 'TEXT="version is 1.4.0"',
@@ -102,7 +108,8 @@ def test_valid_observation_line_protocol_is_decoded_without_provider_response_fo
 
 def test_malformed_observation_line_protocol_keeps_raw_fallback():
     model = ObservationLineProtocolModel(
-        "BEGIN OBSERVATION\nROUND=1\nBEGIN EVIDENCE\nTEXT=7\nEND EVIDENCE\nEND OBSERVATION"
+        "BEGIN OBSERVATION\nROUND=1\nAFFECTS_CURRENT_DECISION=true\n"
+        'AFFECTED_TARGETS="confirmed_facts"\nBEGIN EVIDENCE\nTEXT=7\nEND EVIDENCE\nEND OBSERVATION'
     )
     policy = RuntimeContextPolicy(model)
 
@@ -121,7 +128,8 @@ def test_malformed_observation_line_protocol_keeps_raw_fallback():
 
 def test_observation_evidence_requires_tool_call_id():
     model = ObservationLineProtocolModel(
-        "BEGIN OBSERVATION\nROUND=1\n"
+        "BEGIN OBSERVATION\nROUND=1\nAFFECTS_CURRENT_DECISION=true\n"
+        'AFFECTED_TARGETS="confirmed_facts"\n'
         "BEGIN EVIDENCE\nCATEGORY=\"confirmed_facts\"\nTEXT=\"fact\"\n"
         "END EVIDENCE\nEND OBSERVATION"
     )

@@ -366,8 +366,11 @@ CODEC_REGISTRY = {
         "children": frozenset(),
     },
     "OBSERVATION": {
-        "fields": frozenset({"ROUND", "SOURCE_ROUND_START", "SOURCE_ROUND_END"}),
-        "scalar_arrays": frozenset(),
+        "fields": frozenset({
+            "ROUND", "SOURCE_ROUND_START", "SOURCE_ROUND_END",
+            "AFFECTS_CURRENT_DECISION", "AFFECTED_TARGETS",
+        }),
+        "scalar_arrays": frozenset({"AFFECTED_TARGETS"}),
         "children": frozenset({"EVIDENCE"}),
     },
     "EVIDENCE": {

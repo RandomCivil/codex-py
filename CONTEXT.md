@@ -217,15 +217,19 @@ The Runtime-context presentation of permanent-raw native `grep` and `read_file` 
 _Avoid_: raw-result compaction, observation
 
 **Observation**:
-A schema-validated, concise historical record generated asynchronously for one successful observation-class Tool call. It records the call's Tool round and tool-call ID plus confirmed facts and model inferences; until it succeeds, or if it is unavailable, failed, or invalid, that call is represented by its Raw tool result instead. A failed Tool call never starts an Observation request and remains Raw evidence.
+A schema-validated, concise historical record generated asynchronously for one successful observation-class Tool call. It records the call's Tool round, tool-call ID, evidence, and decision impact; an impact-positive Observation replaces its Raw tool result, while an impact-negative call retains Raw evidence through its existing window and then leaves Runtime context. A failed Tool call never starts an Observation request and remains Raw evidence.
 _Avoid_: raw tool output, durable fact
+
+**Observation decision impact**:
+The Observation-owned, explainable assessment of whether one successful observation-class Tool call changes the active tool-loop decision. It contains `affects_current_decision` and its affected targets: confirmed facts, summary, and/or Durable State.
+_Avoid_: command intent, implicit context refresh
 
 **Observation outcome**:
 A transient diagnostic record for one asynchronous Observation attempt. It identifies the Tool call and its Tool round, whether the attempt is pending, succeeded, failed at the provider, was invalid, or was cancelled, and may record the error; it is not Model evidence, Step context, or Durable State.
 _Avoid_: Observation, durable task record
 
 **Tool-call evidence policy**:
-The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest Tool round; `grep` and `read_file` retain raw evidence for the whole invocation; successful `apply_patch`, `write_file`, and write-class `exec` calls use asynchronous Observations with Raw tool-result fallback, while failed calls remain Raw and never invoke the Runtime-context component.
+The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest Tool round; `grep` and `read_file` retain raw evidence for the whole invocation; successful observation-class calls use asynchronous decision-impact Observations with Raw tool-result fallback, while failed calls remain Raw and never invoke the Runtime-context component.
 _Avoid_: round-level context policy, universal observation policy
 
 **Exec command class**:

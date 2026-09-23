@@ -17,7 +17,7 @@ from agent.model_request import tool_request_shape, trace_llm_context, trace_llm
 from agent.planner import PlanningValidationError
 from llm.llm import LLM
 from llm.text_stream import validated_text, validation_feedback_instructions
-from agent.runtime_context import RuntimeContextPolicy
+from agent.runtime_context import RuntimeContextPolicy, observation_decision_context
 from agent.tool_binding import canonical_mcp_tool_set
 from agent.tool_results import tool_result_failed
 from llm.line_protocol import CompletionJudgment, LineProtocolError, decode_answer, decode_completion_judgment
@@ -88,6 +88,12 @@ Each completed criterion must contain its one-based NUMBER and concise, directly
 EVIDENCE. Do not infer completion from the ReAct model's accompanying prose.
 ANSWER is a JSON-string field inside COMPLETION_PROGRESS; never emit BEGIN ANSWER or
 END ANSWER.
+The host records progress only from COMPLETED_CRITERION blocks. A complete-looking
+ANSWER, a summary of the implementation, or a claim in the ReAct response does not
+change the locally recorded criterion state. Set ALL_COMPLETED=true only when every
+criterion is already recorded as complete or is proven in this batch and reported in a
+COMPLETED_CRITERION block. If this batch proves no new criteria and some criteria remain
+pending, return ALL_COMPLETED=false with no ANSWER.
 
 Example with progress:
 BEGIN COMPLETION_PROGRESS
@@ -98,7 +104,7 @@ EVIDENCE="The requested file exists"
 END COMPLETED_CRITERION
 END COMPLETION_PROGRESS
 
-Example with no progress:
+Example with no progress, even when the answer sounds complete:
 BEGIN COMPLETION_PROGRESS
 ALL_COMPLETED=false
 END COMPLETION_PROGRESS
@@ -492,6 +498,10 @@ class ReactMode:
                             calls,
                             [raw_result for _, _, raw_result in results],
                             [content if is_error else None for content, is_error, _ in results],
+                            decision_context=observation_decision_context(
+                                goal=goal,
+                                execution_mode="react",
+                            ),
                         )
                     if policy is None:
                         messages.extend(

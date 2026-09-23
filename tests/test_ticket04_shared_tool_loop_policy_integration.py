@@ -15,6 +15,8 @@ def _observation(round_number, tool_call_id):
         [
             "BEGIN OBSERVATION",
             f"ROUND={round_number}",
+            "AFFECTS_CURRENT_DECISION=true",
+            'AFFECTED_TARGETS="confirmed_facts"',
             "BEGIN EVIDENCE",
             'CATEGORY="confirmed_facts"',
             'TEXT="write completed"',

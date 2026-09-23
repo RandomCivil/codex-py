@@ -11,6 +11,8 @@ def _observation(round_number, tool_call_id, text):
         [
             "BEGIN OBSERVATION",
             f"ROUND={round_number}",
+            "AFFECTS_CURRENT_DECISION=true",
+            'AFFECTED_TARGETS="confirmed_facts"',
             "BEGIN EVIDENCE",
             'CATEGORY="confirmed_facts"',
             f"TEXT={json.dumps(text)}",
@@ -62,6 +64,8 @@ class OutcomeObservationModel:
                     (
                         "BEGIN OBSERVATION",
                         f"ROUND={payload['round']}",
+                        "AFFECTS_CURRENT_DECISION=true",
+                        'AFFECTED_TARGETS="confirmed_facts"',
                         "SOURCE_ROUND_START=999",
                         "SOURCE_ROUND_END=1000",
                         "BEGIN EVIDENCE",

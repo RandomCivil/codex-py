@@ -9,7 +9,14 @@ from agent.runtime_context import DEFAULT_CONTEXT_BUDGET, ContextMaintenanceErro
 
 
 def observation_protocol(payload):
-    lines = ["BEGIN OBSERVATION", f"ROUND={payload['round']}"]
+    impact = payload.get("affects_current_decision", True)
+    targets = payload.get("affected_targets", ["confirmed_facts"] if impact else [])
+    lines = [
+        "BEGIN OBSERVATION",
+        f"ROUND={payload['round']}",
+        f"AFFECTS_CURRENT_DECISION={json.dumps(impact)}",
+        *[f"AFFECTED_TARGETS={json.dumps(target)}" for target in targets],
+    ]
     for category in ("confirmed_facts", "reported_errors", "model_inferences"):
         for evidence in payload[category]:
             lines.extend([
@@ -638,6 +645,9 @@ def test_observation_request_puts_its_fixed_contract_before_settled_raw_evidence
                 "error": None,
             }
         ],
+        "decision_summary": {
+            "tool": {"name": "read", "arguments": {"path": "VERSION"}}
+        },
     }
     assert policy.observations[0].confirmed_facts[0].tool_call_ids == ("call-1",)
 

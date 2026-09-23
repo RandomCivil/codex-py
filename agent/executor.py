@@ -10,7 +10,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
-from agent.runtime_context import RuntimeContextPolicy
+from agent.runtime_context import RuntimeContextPolicy, observation_decision_context
 from agent.model_request import tool_request_shape, trace_llm_request
 from agent.tool_binding import canonical_mcp_tool_set
 from agent.tool_results import tool_result_failed
@@ -406,11 +406,23 @@ class Executor:
     async def _record_executor_round(self, response: BaseMessage, results: list[BaseMessage]) -> None:
         if not isinstance(response, AIMessage):
             return
+        step = self._active_step
         await self._active_context_policy.record_tool_round(
             self._rounds,
             response.tool_calls,
             [message.content for message in results],
             [_tool_error(message) for message in results],
+            decision_context=observation_decision_context(
+                goal=self._active_durable_state["agent_state"]["goal"],
+                execution_mode="plan_execute",
+                plan_step={
+                    "revision": self._active_revision,
+                    "id": step.id,
+                    "intent": step.intent,
+                    "completion_criterion": step.completion_criterion,
+                },
+                completion_criterion=step.completion_criterion,
+            ),
         )
 
     def _require_active(self) -> None:

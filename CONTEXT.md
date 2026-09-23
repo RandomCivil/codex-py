@@ -212,8 +212,12 @@ _Avoid_: individual tool call, model turn
 The complete request parameters and result, including an error where present, for one Tool call. Raw tool results are transient Model context, never Step context or Durable State; complete diagnostic tracing may record them outside that state.
 _Avoid_: durable tool trace, observation
 
+**File-grouped native-read rendering**:
+The Runtime-context presentation of permanent-raw native `grep` and `read_file` evidence, grouped by resolved file path across Tool rounds with each result kept in round and request order. A call whose path cannot be resolved, or which reports an error, is retained in the `(unfiled)` group with its native request and complete result.
+_Avoid_: raw-result compaction, observation
+
 **Observation**:
-A schema-validated, concise historical record generated asynchronously for one observation-class Tool call. It records the call's Tool round and tool-call ID plus confirmed facts, reported errors, and model inferences; until it succeeds, or if it is unavailable, failed, or invalid, that call is represented by its Raw tool result instead.
+A schema-validated, concise historical record generated asynchronously for one successful observation-class Tool call. It records the call's Tool round and tool-call ID plus confirmed facts and model inferences; until it succeeds, or if it is unavailable, failed, or invalid, that call is represented by its Raw tool result instead. A failed Tool call never starts an Observation request and remains Raw evidence.
 _Avoid_: raw tool output, durable fact
 
 **Observation outcome**:
@@ -221,7 +225,7 @@ A transient diagnostic record for one asynchronous Observation attempt. It ident
 _Avoid_: Observation, durable task record
 
 **Tool-call evidence policy**:
-The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest three Tool rounds; `grep` and `read_file` retain raw evidence for the whole invocation; `apply_patch`, `write_file`, and write-class `exec` calls use asynchronous Observations with Raw tool-result fallback.
+The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest three Tool rounds; `grep` and `read_file` retain raw evidence for the whole invocation; successful `apply_patch`, `write_file`, and write-class `exec` calls use asynchronous Observations with Raw tool-result fallback, while failed calls remain Raw and never invoke the Runtime-context component.
 _Avoid_: round-level context policy, universal observation policy
 
 **Exec command class**:
@@ -229,5 +233,5 @@ The conservative static classification of an `exec` command under the Tool-call 
 _Avoid_: command intent, heuristic safety classification
 
 **Runtime context window**:
-The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
+The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. Its rendered Goal is a distinct final section, while the durable goal remains part of Agent state. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
 _Avoid_: Durable State, message transcript

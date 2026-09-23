@@ -209,7 +209,7 @@ class RuntimeContextPolicy:
         results: Sequence[Any],
         errors: Sequence[str | None] | None = None,
     ) -> RawToolResult:
-        """Store a settled batch and start its best-effort Observation."""
+        """Store a settled batch and observe only successful observation-class calls."""
         if len(calls) != len(results) or (errors is not None and len(calls) != len(errors)):
             raise ValueError("tool calls and settled results must have equal length")
         errors = errors or (None,) * len(results)
@@ -235,7 +235,11 @@ class RuntimeContextPolicy:
             self._call_order[(raw.round, call.tool_call_id)] = self._next_call_order
             self._next_call_order += 1
         self._expire_observations()
-        for call in (call for call in raw.calls if call.lifecycle == "observation"):
+        for call in (
+            call
+            for call in raw.calls
+            if call.lifecycle == "observation" and call.error is None
+        ):
             observation_raw = RawToolResult(raw.round, (call,))
             self._set_observation_outcome(raw.round, call.tool_call_id, "pending")
             task = asyncio.create_task(self._observe(observation_raw))
@@ -588,11 +592,12 @@ def _raw_payload(item: RawToolResult) -> dict[str, Any]:
 
 def _runtime_context_prompt(context: RuntimeContext) -> str:
     """Render Runtime context as explicit prompt sections instead of one JSON blob."""
+    durable_state, goal = _runtime_durable_state_and_goal(context.durable_state)
     sections = [
         "## Runtime context",
         "",
         "### Durable state",
-        _prompt_value(context.durable_state),
+        _prompt_value(durable_state),
         "",
         "### Observations",
     ]
@@ -607,22 +612,91 @@ def _runtime_context_prompt(context: RuntimeContext) -> str:
         sections.append("- (none)")
 
     sections.extend(("", "### Raw tool results"))
-    if context.raw_tool_results:
-        for result in context.raw_tool_results:
-            sections.append(f"#### Round {result.round}")
-            if not result.calls:
-                sections.append("- (no tool calls)")
-            for call in result.calls:
-                sections.append(
-                    f"- {call.name} (tool_call_id={call.tool_call_id})"
-                )
-                sections.append(f"  - arguments: {_prompt_value(call.arguments)}")
-                sections.append(f"  - result: {_prompt_value(call.result)}")
-                if call.error is not None:
-                    sections.append(f"  - error: {call.error}")
-    else:
+    native_groups, round_results = _group_native_read_results(context.raw_tool_results)
+    for result in round_results:
+        sections.append(f"#### Round {result.round}")
+        if not result.calls:
+            sections.append("- Native read evidence is grouped below by file.")
+        for call in result.calls:
+            sections.extend(_render_raw_call(call, call.result))
+    for path, entries in native_groups:
+        sections.append(f"#### File: {path}")
+        for round_number, call, result in entries:
+            sections.extend(_render_raw_call(call, result, prefix=f"Round {round_number} "))
+    if not round_results and not native_groups:
         sections.append("- (none)")
+
+    sections.extend(("", "### Goal", _prompt_value(goal)))
     return "\n".join(sections)
+
+
+def _render_raw_call(call: RawToolCall, result: Any, *, prefix: str = "") -> list[str]:
+    lines = [f"- {prefix}{call.name} (tool_call_id={call.tool_call_id})"]
+    lines.append(f"  - arguments: {_prompt_value(call.arguments)}")
+    lines.append(f"  - result: {_prompt_value(result)}")
+    if call.error is not None:
+        lines.append(f"  - error: {call.error}")
+    return lines
+
+
+def _group_native_read_results(
+    raw_results: tuple[RawToolResult, ...],
+) -> tuple[list[tuple[str, list[tuple[int, RawToolCall, Any]]]], list[RawToolResult]]:
+    groups: dict[str, list[tuple[int, RawToolCall, Any]]] = {}
+    round_results: list[RawToolResult] = []
+    for raw in raw_results:
+        other_calls: list[RawToolCall] = []
+        for call in raw.calls:
+            if call.name not in {"grep", "read_file"} or call.lifecycle != "permanent_raw":
+                other_calls.append(call)
+                continue
+            entries = _native_read_entries(call)
+            if call.error is not None or entries is None:
+                groups.setdefault("(unfiled)", []).append((raw.round, call, call.result))
+                continue
+            for path, result in entries:
+                groups.setdefault(path, []).append((raw.round, call, result))
+        round_results.append(RawToolResult(raw.round, tuple(other_calls)))
+    ordered = []
+    for path, entries in groups.items():
+        entries.sort(key=lambda entry: entry[0])
+        ordered.append((path, entries))
+    return ordered, round_results
+
+
+def _native_read_entries(call: RawToolCall) -> list[tuple[str, Any]] | None:
+    value = call.arguments.get("path")
+    if isinstance(value, str) and value.strip():
+        return [(value.strip(), call.result)]
+    if call.name == "grep" and isinstance(call.result, str):
+        lines = [line for line in call.result.splitlines() if line]
+        parsed = [
+            (line.split(":", 1)[0].strip(), line)
+            for line in lines
+            if ":" in line
+        ]
+        paths = [path for path, _ in parsed]
+        if lines and len(paths) == len(lines) and all(paths):
+            return parsed
+    return None
+
+
+def _runtime_durable_state_and_goal(value: Any) -> tuple[Any, Any]:
+    """Remove only the displayed goal from the Durable State presentation."""
+    if not isinstance(value, Mapping):
+        return value, None
+    if "goal" in value:
+        durable_state = dict(value)
+        goal = durable_state.pop("goal")
+        return durable_state, goal
+    agent_state = value.get("agent_state")
+    if isinstance(agent_state, Mapping) and "goal" in agent_state:
+        durable_state = dict(value)
+        displayed_agent_state = dict(agent_state)
+        goal = displayed_agent_state.pop("goal")
+        durable_state["agent_state"] = displayed_agent_state
+        return durable_state, goal
+    return value, None
 
 
 def _evidence_section(title: str, values: tuple[Evidence, ...]) -> list[str]:

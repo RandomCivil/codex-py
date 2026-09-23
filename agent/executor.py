@@ -13,6 +13,7 @@ from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, 
 from agent.runtime_context import RuntimeContextPolicy
 from agent.model_request import tool_request_shape, trace_llm_request
 from agent.tool_binding import canonical_mcp_tool_set
+from agent.tool_results import tool_result_failed
 
 
 class ExecutorGraphState(MessagesState, total=False):
@@ -28,8 +29,14 @@ class Executor:
 
     _INSTRUCTIONS = (
         "Use the available MCP tools when they are needed to complete the selected Plan step. "
+        "Treat the selected Plan step's completion_criterion as fixed and authoritative. "
+        "Before every tool call, check whether the requested step outcome has actually been "
+        "produced, the available evidence directly verifies the completion_criterion to a "
+        "level proportionate to risk, and no required part of the step remains. "
+        "If the criterion is met, stop using tools and return the final handoff; otherwise, "
+        "call only a tool that closes a specific remaining gap. Do not repeat an equivalent "
+        "inspection or gather extra corroboration after the criterion is met. "
         "If a native tool call is emitted, the host executes it even when the response also has text. "
-        "When the selected Plan step is complete, respond with its final handoff and do not request a tool. "
         "A final response does not need a Line Protocol format."
     )
 
@@ -170,9 +177,6 @@ class Executor:
         step_id: str,
     ) -> ExecutionOutcome:
         try:
-            tool_messages = [message for message in graph_result["messages"] if isinstance(message, ToolMessage)]
-            if tool_messages and not any(_tool_error(message) is None for message in tool_messages):
-                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not complete a successful MCP tool call"))
             operational_final = graph_result["messages"][-1]
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="tool round budget exhausted"))
@@ -181,6 +185,9 @@ class Executor:
             handoff = operational_final.content
             if not handoff.strip():
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="model did not return a final text response"))
+            # Earlier failed ToolMessages are part of the model's correction
+            # history. A later no-tool response is the completion proof, even
+            # when the failed call was not followed by a successful tool call.
             if self._trace is not None:
                 self._trace.llm_complete(
                     revision,
@@ -233,7 +240,18 @@ class Executor:
             if self._active_context_policy is not None:
                 self._active_context_policy.record_model_use()
                 context = await self._active_context_policy.maintain(self._active_durable_state)
-                request = [SystemMessage(content=self._INSTRUCTIONS), *context.as_messages()]
+                trailing_tool_messages: list[ToolMessage] = []
+                for previous in reversed(state["messages"]):
+                    if not isinstance(previous, ToolMessage):
+                        break
+                    if getattr(previous, "status", None) == "error":
+                        trailing_tool_messages.append(previous)
+                trailing_tool_messages.reverse()
+                request = [
+                    SystemMessage(content=self._INSTRUCTIONS),
+                    *context.as_messages(),
+                    *trailing_tool_messages,
+                ]
             trace_llm_request(
                 self._trace,
                 "executor",
@@ -505,6 +523,8 @@ def _tool_error(message: BaseMessage) -> str | None:
     if not isinstance(message, ToolMessage):
         return None
     if getattr(message, "status", None) == "error":
+        return f"MCP tool failed: {message.content}"
+    if tool_result_failed(message.content):
         return f"MCP tool failed: {message.content}"
     if getattr(message, "name", None) in {"exec", "atom.exec"}:
         exit_code = _exit_code(message.content)

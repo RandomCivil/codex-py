@@ -130,6 +130,23 @@ def test_react_returns_freeform_content_when_no_tool_call_is_present():
     assert len(model.requests) == 1
     assert "BEGIN NO_TOOL" not in model.requests[0][0].content
     assert "GOAL_COMPLETION" not in model.requests[0][0].content
+    assert "requested outcome as the fixed" in model.requests[0][0].content
+    assert "completion standard" in model.requests[0][0].content
+    assert "Before every tool call, check all three conditions" in model.requests[0][0].content
+    assert "Do not repeat an" in model.requests[0][0].content
+    assert "equivalent inspection" in model.requests[0][0].content
+
+
+def test_react_rejects_an_empty_final_response_without_tool_calls():
+    model = ToolModel(AIMessage(content=""))
+
+    answer = asyncio.run(ReactMode(model, Runtime()).run("Complete"))
+
+    assert answer == ExecutionAnswer(
+        None,
+        "failed",
+        error="react model returned an empty final response",
+    )
 
 
 def test_react_executes_tool_calls_with_accompanying_text():
@@ -140,6 +157,11 @@ def test_react_executes_tool_calls_with_accompanying_text():
     runtime = Runtime()
     answer = asyncio.run(ReactMode(model, runtime).run("Inspect"))
     assert answer == ExecutionAnswer("The source tree is inspected.", "completed")
+    assert len(model.requests) == 2
+    assert all(
+        "Before every tool call, check all three conditions" in request[0].content
+        for request in model.requests
+    )
     assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
         {"name": "list_dir", "args": {}, "id": "1"}
     ]

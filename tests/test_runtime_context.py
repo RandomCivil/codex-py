@@ -122,6 +122,29 @@ def test_observation_lifecycle_accounts_model_use_without_consuming_tool_rounds_
     asyncio.run(run())
 
 
+def test_failed_observation_class_tool_call_stays_raw_without_an_observation_request():
+    async def run():
+        model = ObservationModel({})
+        policy = RuntimeContextPolicy(model)
+
+        await policy.record_tool_round(
+            1,
+            [{"id": "patch-1", "name": "apply_patch", "args": {"patch": "bad"}}],
+            [{"error": "invalid patch"}],
+            ["invalid patch"],
+        )
+        await asyncio.sleep(0)
+
+        assert model.calls == []
+        assert policy.model_uses == 0
+        assert policy.observation_outcomes == ()
+        raw_call = policy.assemble({}).raw_tool_results[0].calls[0]
+        assert raw_call.result == {"error": "invalid patch"}
+        assert raw_call.error == "invalid patch"
+
+    asyncio.run(run())
+
+
 def test_invalid_observation_is_diagnosable_and_keeps_raw_fallback():
     async def run():
         policy = RuntimeContextPolicy(
@@ -378,12 +401,160 @@ def test_runtime_context_renders_as_prompt_sections():
 
     prompt = context.as_messages()[0].content
 
-    assert "### Durable state\n{\"goal\": \"inspect\"}" in prompt
+    assert "### Durable state\n{}" in prompt
     assert "### Observations\n- (none)" in prompt
     assert "### Raw tool results\n- (none)" in prompt
+    assert prompt.endswith('### Goal\n"inspect"')
 
 
-def test_policy_retains_explicit_tool_failures_with_the_raw_result():
+def test_native_read_results_are_grouped_by_file_across_rounds_in_request_order():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    async def run():
+        await policy.record_tool_round(
+            2,
+            [
+                {"id": "call-2b", "name": "read_file", "args": {"path": "src/app.py"}},
+                {"id": "call-2c", "name": "read_file", "args": {"path": "README.md"}},
+            ],
+            ["app round 2", "readme round 2"],
+        )
+        await policy.record_tool_round(
+            1,
+            [{"id": "call-1", "name": "read_file", "args": {"path": "src/app.py"}}],
+            ["app round 1"],
+        )
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert "#### File: src/app.py" in prompt
+    assert prompt.index("#### File: src/app.py") < prompt.index("#### File: README.md")
+    assert prompt.index("app round 1") < prompt.index("app round 2")
+    assert "tool_call_id=call-1" in prompt
+    assert "tool_call_id=call-2b" in prompt
+    assert "#### Round 1\n- Native read evidence is grouped below by file." in prompt
+
+
+def test_non_native_results_keep_their_round_order_before_grouped_native_reads():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [
+                {"id": "read-1", "name": "read_file", "args": {"path": "src/app.py"}},
+                {"id": "list-1", "name": "list_dir", "args": {"path": "src"}},
+            ],
+            ["app contents", "directory contents"],
+        )
+        await policy.record_tool_round(
+            2,
+            [{"id": "list-2", "name": "list_dir", "args": {"path": "tests"}}],
+            ["test directory contents"],
+        )
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert prompt.index("#### Round 1") < prompt.index("#### Round 2")
+    assert prompt.index("directory contents") < prompt.index("test directory contents")
+    assert prompt.index("#### Round 2") < prompt.index("#### File: src/app.py")
+    assert prompt.index("app contents") > prompt.index("#### File: src/app.py")
+
+
+def test_native_grep_results_split_path_prefixed_matches_into_file_groups():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [{"id": "grep-1", "name": "grep", "args": {"pattern": "TODO"}}],
+            ["src/app.py:TODO: fix this\nREADME.md:TODO: document this"],
+        )
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert "#### File: src/app.py" in prompt
+    assert "#### File: README.md" in prompt
+    assert "src/app.py:TODO: fix this" in prompt
+    assert "README.md:TODO: document this" in prompt
+
+
+def test_native_read_failures_and_unresolvable_results_are_lossless_in_unfiled_group():
+    model = ObservationModel({})
+    policy = RuntimeContextPolicy(model)
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [
+                {"id": "bad-read", "name": "read_file", "args": {}},
+                {"id": "bad-grep", "name": "grep", "args": {"pattern": "TODO"}},
+                {"id": "failed-read", "name": "read_file", "args": {"path": "missing.py"}},
+            ],
+            ["pathless", "malformed output", {"error": "not found", "details": [1, 2]}],
+            [None, None, "read failed"],
+        )
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert "#### File: (unfiled)" in prompt
+    assert '"pattern": "TODO"' in prompt
+    assert "malformed output" in prompt
+    assert '"details": [1, 2]' in prompt
+    assert "error: read failed" in prompt
+    assert model.calls == []
+
+
+def test_native_grep_with_an_explicit_path_keeps_the_complete_result_in_that_group():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [{"id": "grep-1", "name": "grep", "args": {"path": "src/app.py", "pattern": "TODO"}}],
+            ["TODO: fix this\nTODO: add a test"],
+        )
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert "#### File: src/app.py" in prompt
+    assert 'TODO: fix this\\nTODO: add a test' in prompt
+    assert "#### File: (unfiled)" not in prompt
+
+
+def test_runtime_context_renders_direct_goal_as_final_section_without_durable_goal():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+    context = policy.assemble(durable_state={"goal": "inspect", "budget": 3})
+
+    prompt = context.as_messages()[0].content
+
+    assert "### Durable state\n{\"budget\": 3}" in prompt
+    assert prompt.endswith('### Goal\n"inspect"')
+    assert prompt.index("### Goal") > prompt.index("### Raw tool results")
+
+
+def test_runtime_context_renders_nested_agent_state_goal_and_preserves_durable_state():
+    durable_state = {
+        "agent_state": {"goal": "write note", "plan": [{"id": "write"}]},
+        "step_context": {"files_read": ["README.md"]},
+    }
+    policy = RuntimeContextPolicy(ObservationModel({}))
+    context = policy.assemble(durable_state)
+
+    prompt = context.as_messages()[0].content
+
+    assert '"agent_state": {"plan": [{"id": "write"}]}' in prompt
+    assert '"step_context": {"files_read": ["README.md"]}' in prompt
+    assert prompt.endswith('### Goal\n"write note"')
+    assert context.durable_state == durable_state
+
+
+def test_policy_retains_explicit_tool_failures_as_raw_evidence_without_observation():
     model = ObservationModel(
         {"round": 1, "confirmed_facts": [], "reported_errors": [], "model_inferences": []}
     )
@@ -402,7 +573,8 @@ def test_policy_retains_explicit_tool_failures_with_the_raw_result():
     call = policy.assemble({"goal": "inspect"}).raw_tool_results[0].calls[0]
     assert call.result == {"returncode": 1, "stderr": "failed"}
     assert call.error == "command exited with status 1"
-    assert "reported_errors" in model.calls[0][0].content
+    assert model.calls == []
+    assert policy.observation_outcomes == ()
 
 
 def test_observation_request_uses_line_protocol_without_provider_response_format():

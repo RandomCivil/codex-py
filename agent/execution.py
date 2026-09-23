@@ -19,6 +19,7 @@ from llm.llm import LLM
 from llm.text_stream import validated_text, validation_feedback_instructions
 from agent.runtime_context import RuntimeContextPolicy
 from agent.tool_binding import canonical_mcp_tool_set
+from agent.tool_results import tool_result_failed
 from llm.line_protocol import LineProtocolError, decode_answer
 
 
@@ -59,12 +60,16 @@ _TOOL_AGENT_INSTRUCTIONS = (
 )
 
 
-_REACT_TOOL_LOOP_PROMPT = """You are an execution agent. Work iteratively: use an available tool when
-evidence or an external action is needed, inspect each result, and correct course when a
-tool fails. Do not claim the goal is complete until the available evidence supports it.
-When the goal is complete, respond with the final answer and do not request a tool. Native
-function tool calls take precedence over accompanying text; the host executes the calls and
-ignores that text. A final response does not need a Line Protocol format.
+_REACT_TOOL_LOOP_PROMPT = """You are an execution agent. Treat the user's requested outcome as the fixed
+completion standard. Before every tool call, check all three conditions: the requested
+action or deliverable actually exists (investigation alone does not complete a change
+request); available evidence directly verifies the outcome to a level proportionate to its
+risk; and no required part of the request remains. If all conditions are met, stop using
+tools and return the final answer. Otherwise, call only a tool that closes a specific
+remaining gap, inspect its result, and correct course when it fails. Do not repeat an
+equivalent inspection or gather extra corroboration after the completion standard is met.
+Native function tool calls take precedence over accompanying text; the host executes the
+calls and ignores that text. A final response does not need a Line Protocol format.
 """
 
 
@@ -204,8 +209,8 @@ class ToolRuntime:
             self._trace.tool_call(name, args, call.get("id"))
         result = await tool.ainvoke(args)
         if self._trace is not None:
-            self._trace.tool_result(name, result, error=_tool_result_failed(result))
-        if _tool_result_failed(result):
+            self._trace.tool_result(name, result, error=tool_result_failed(result))
+        if tool_result_failed(result):
             raise _ToolExecutionError("tool returned a non-success result", result)
         return result
 
@@ -355,6 +360,7 @@ class ReactMode:
                     ),
                     HumanMessage(content=goal),
                 ]
+                pending_tool_messages: list[ToolMessage] = []
                 for round_number in range(1, self._max_rounds + 1):
                     request_messages = messages
                     if policy is not None:
@@ -365,7 +371,8 @@ class ReactMode:
                         # once it is active; old AI/Tool messages must not become
                         # an undocumented second memory channel.
                         request_messages = [
-                            messages[0], messages[1], *context.as_messages()
+                            messages[0], messages[1], *context.as_messages(),
+                            *pending_tool_messages,
                         ]
                     trace_llm_request(
                         self._trace,
@@ -384,6 +391,12 @@ class ReactMode:
                     calls = list(getattr(response, "tool_calls", []) or [])
                     content = _message_text(response) if getattr(response, "content", None) not in (None, "") else ""
                     if not calls:
+                        if not content.strip():
+                            return ExecutionAnswer(
+                                None,
+                                "failed",
+                                error="react model returned an empty final response",
+                            )
                         return ExecutionAnswer(content, "completed")
                     # Once Runtime context is active, its instantaneous
                     # snapshot is the only historical source for subsequent
@@ -415,6 +428,22 @@ class ReactMode:
                             )
                             for call, (content, is_error, _) in zip(calls, results)
                         )
+                    else:
+                        # A failed tool result must remain an actual tool
+                        # message at the end of the next model request. The
+                        # Runtime context keeps the durable evidence, while
+                        # this message gives the model an immediate correction
+                        # signal in the role expected by tool-calling APIs.
+                        pending_tool_messages = [
+                            ToolMessage(
+                                content=content,
+                                tool_call_id=str(call.get("id") or "unknown"),
+                                name=str(call.get("name") or "unknown"),
+                                status="error",
+                            )
+                            for call, (content, is_error, _) in zip(calls, results)
+                            if is_error
+                        ]
         except LineProtocolError as error:
             if self._trace is not None:
                 self._trace.execution_error(
@@ -440,6 +469,8 @@ class ReactMode:
     async def _invoke_for_react(self, runtime: Any, call: Mapping[str, Any]) -> tuple[str, bool, Any]:
         try:
             result = await runtime.invoke(call)
+            if tool_result_failed(result):
+                return f"MCP tool failed: {render_tool_result(result)}", True, result
             return render_tool_result(result), False, result
         except Exception as error:
             if self._trace is not None:
@@ -448,7 +479,8 @@ class ReactMode:
                     str(error),
                     error=True,
                 )
-            return f"MCP tool failed: {error}", True, getattr(error, "result", {"error": str(error)})
+            result = getattr(error, "result", {"error": str(error)})
+            return f"MCP tool failed: {render_tool_result(result)}", True, result
 
 
 def render_tool_result(value: Any) -> str:
@@ -473,16 +505,6 @@ def _message_text(message: Any) -> str:
     if isinstance(content, str):
         return content
     return render_tool_result(content)
-
-
-def _tool_result_failed(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        if value.get("isError") is True or value.get("error"):
-            return True
-        return isinstance(value.get("returncode"), int) and value["returncode"] != 0
-    return getattr(value, "isError", False) is True or (
-        isinstance(getattr(value, "returncode", None), int) and value.returncode != 0
-    )
 
 
 def _trace_ignored(trace: Any, call: Mapping[str, Any]) -> None:

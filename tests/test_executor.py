@@ -49,6 +49,9 @@ def test_executor_returns_freeform_content_without_a_completion_receipt(monkeypa
     assert len(model.requests) == 1
     assert "NO_TOOL" not in model.requests[0][0].content
     assert "STEP_COMPLETION" not in model.requests[0][0].content
+    assert "completion_criterion as fixed and authoritative" in model.requests[0][0].content
+    assert "Before every tool call" in model.requests[0][0].content
+    assert "Do not repeat an equivalent inspection" in model.requests[0][0].content
 
 
 def test_executor_returns_content_verbatim_without_line_protocol_parsing(monkeypatch):
@@ -103,3 +106,8 @@ def test_executor_executes_a_tool_call_with_accompanying_text(monkeypatch):
     outcome = asyncio.run(run())
     assert outcome.execution.status == "completed", outcome.execution.error
     assert outcome.execution.result == "Recorded."
+    assert len(model.requests) == 2
+    assert all(
+        "completion_criterion as fixed and authoritative" in request[0].content
+        for request in model.requests
+    )

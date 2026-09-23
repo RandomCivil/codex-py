@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
 from agent.execution import ExecutionAnswer, ReactMode
@@ -74,6 +74,21 @@ class ReactRuntime:
         return {"written": "note"}
 
 
+class FailingReactRuntime(ReactRuntime):
+    async def invoke(self, _call):
+        raise RuntimeError("patch rejected")
+
+
+class ErrorResultReactRuntime(ReactRuntime):
+    async def invoke(self, _call):
+        return [
+            {
+                "type": "text",
+                "text": "[1201] invalid patch: hunk line counts do not match header",
+            }
+        ]
+
+
 class Session:
     async def __aenter__(self):
         return self
@@ -140,6 +155,78 @@ def test_react_uses_pending_raw_write_evidence_without_waiting_for_observation()
     asyncio.run(run())
 
 
+def test_react_retries_with_failed_tool_message_at_the_end_of_context():
+    class FailingObservationModel:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, _messages):
+            self.calls.append(_messages)
+            return AIMessage(
+                content=_observation(1, "write-1").replace(
+                    'TEXT="write completed"', 'TEXT="patch rejected"'
+                )
+            )
+
+    async def run():
+        model = ReactModel()
+        model.responses = iter(
+            (
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
+                ),
+                AIMessage(content="Recovered"),
+            )
+        )
+
+        observation_model = FailingObservationModel()
+        answer = await ReactMode(
+            model,
+            FailingReactRuntime(),
+            context_policy=RuntimeContextPolicy(observation_model),
+        ).run("Apply the patch")
+
+        assert answer == ExecutionAnswer("Recovered", "completed")
+        assert observation_model.calls == []
+        failed_message = model.requests[1][-1]
+        assert isinstance(failed_message, ToolMessage)
+        assert failed_message.status == "error"
+        assert failed_message.tool_call_id == "write-1"
+        assert "patch rejected" in failed_message.content
+
+    asyncio.run(run())
+
+
+def test_react_retries_with_mcp_text_error_message_at_the_end_of_context():
+    async def run():
+        model = ReactModel()
+        model.responses = iter(
+            (
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
+                ),
+                AIMessage(content="Recovered"),
+            )
+        )
+
+        answer = await ReactMode(
+            model,
+            ErrorResultReactRuntime(),
+            context_policy=RuntimeContextPolicy(BlockingObservationModel()),
+        ).run("Apply the patch")
+
+        assert answer == ExecutionAnswer("Recovered", "completed")
+        failed_message = model.requests[1][-1]
+        assert isinstance(failed_message, ToolMessage)
+        assert failed_message.status == "error"
+        assert failed_message.tool_call_id == "write-1"
+        assert "invalid patch" in failed_message.content
+
+    asyncio.run(run())
+
+
 def test_executor_uses_pending_raw_write_evidence_without_waiting_for_observation(monkeypatch):
     def write_file(path: str) -> str:
         """Write a note."""
@@ -167,5 +254,97 @@ def test_executor_uses_pending_raw_write_evidence_without_waiting_for_observatio
 
         observation_model.release.set()
         await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_executor_retries_with_failed_tool_message_at_the_end_of_context(monkeypatch):
+    def reject_patch() -> str:
+        """Reject the patch for retry testing."""
+        raise RuntimeError("patch rejected")
+
+    async def load_tools(_session):
+        return [StructuredTool.from_function(reject_patch, name="apply_patch")]
+
+    class FailingObservationModel:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, _messages):
+            self.calls.append(_messages)
+            return AIMessage(
+                content=_observation(1, "write-1").replace(
+                    'TEXT="write completed"', 'TEXT="patch rejected"'
+                )
+            )
+
+    async def run():
+        model = ExecutorModel()
+        model.responses = iter(
+            (
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
+                ),
+                AIMessage(content="Recovered"),
+            )
+        )
+        monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+        monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+
+        observation_model = FailingObservationModel()
+        async with Executor(
+            model=model,
+            context_policy=RuntimeContextPolicy(observation_model),
+        ) as executor:
+            outcome = await executor.execute(_step_state(), 1, "write")
+
+        assert outcome.execution.result == "Recovered"
+        assert observation_model.calls == []
+        failed_message = model.requests[1][-1]
+        assert isinstance(failed_message, ToolMessage)
+        assert failed_message.status == "error"
+        assert failed_message.tool_call_id == "write-1"
+        assert "patch rejected" in failed_message.content
+
+    asyncio.run(run())
+
+
+def test_executor_retries_with_mcp_text_error_message_at_the_end_of_context(monkeypatch):
+    def reject_patch() -> list[dict[str, str]]:
+        """Return Atom's structured patch-validation failure."""
+        return [
+            {
+                "type": "text",
+                "text": "[1201] invalid patch: hunk line counts do not match header",
+            }
+        ]
+
+    async def load_tools(_session):
+        return [StructuredTool.from_function(reject_patch, name="apply_patch")]
+
+    async def run():
+        model = ExecutorModel()
+        model.responses = iter(
+            (
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
+                ),
+                AIMessage(content="Recovered"),
+            )
+        )
+        monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
+        monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+
+        async with Executor(model=model) as executor:
+            outcome = await executor.execute(_step_state(), 1, "write")
+
+        assert outcome.execution.result == "Recovered"
+        failed_message = model.requests[1][-1]
+        assert isinstance(failed_message, ToolMessage)
+        assert failed_message.status == "error"
+        assert failed_message.tool_call_id == "write-1"
+        assert failed_message.content[0]["text"].startswith("[1201] invalid patch")
 
     asyncio.run(run())

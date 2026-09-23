@@ -97,6 +97,20 @@ flowchart LR
 
 Plan steps 始终串行；只有同一模型响应内相互独立的工具调用会在 `ToolNode` 中并发执行。
 
+### ReAct 与 Plan–execute 的 Runtime context 和收敛
+
+ReAct 和 Plan–execute 的单步 Executor 共用同一套 Runtime-context policy。每次模型请求都会由 host 重建上下文，分为 Durable State、Observation 和 Raw tool results；启用该 policy 后，不会再把整段 AI/Tool 对话历史作为另一条隐式记忆通道。ReAct 的 Durable State 包含 Goal，Plan-step Executor 还包含当前 Plan step、完成标准、已有 step 执行记录，以及已完成 Step 交接来的 `files_read`、`files_modified` 和 observations。
+
+上下文证据按单个 Tool call 管理：
+
+- `list_dir` 和 `glob` 保留最近一个 Tool round 的原始结果；更早的结果从后续上下文移除。
+- `grep` 和 `read_file` 的原始结果在本次 ReAct invocation 或 Plan-step execution 中持续保留。
+- 成功的 `apply_patch`、`write_file` 和写入类 `exec` 在整个 batch settle 后异步生成 Observation。生成期间先保留原始结果；有效且判定影响当前决策的 Observation 会在后续上下文中替换它。判定无影响时，原始结果只保留到其既有窗口结束；模型请求失败、取消或输出无效时，保留原始结果作为 fallback。失败的工具调用不请求 Observation，并保留原始错误供下一轮纠正。
+
+Observation 包含按 `confirmed_facts`、`reported_errors`、`model_inferences` 分类的证据，并关联源 tool-call ID。它会收到 Goal、执行模式、适用的 Plan step/完成标准及工具名和参数作为决策背景。Observation 不阻塞工具循环，也不能修改 Durable State；只有为满足显式 Runtime-context token budget 而压缩时，才会同步合并较早的 Observation，并保留来源和受影响目标。原始证据和 Durable State 不会为适配预算而截断或重新摘要；连同必要 Raw evidence 仍超预算时，该次执行安全失败。
+
+两种工具循环都按“检查完成标准、只处理具体缺口、验证后停止”收敛。ReAct 每轮收到当前证据；Task Analyzer 提供的 completion criteria 会附加 host 记录的逐项状态。每个有成功工具结果的 batch 后，独立的无工具 completion judge 只能根据该 batch 的成功原始结果报告新完成项；格式校验通过后，host 更新状态。只有所有 criteria 均由 host 记录为完成，judge 才能返回最终答案并结束 ReAct。未提供 criteria 的 ReAct 使用终止模型响应作为完成信号；达到轮数上限则失败。Plan-step Executor 则始终以当前 step 的 `completion_criterion` 为准：工具结果进入后续 Runtime context，模型直接返回最终文本 handoff 即表示该 step 完成，不再额外请求 completion receipt；Criterion 未满足时应继续处理明确缺口，满足后停止额外检查。同批工具仍并发执行，工具失败结果会留在下一轮以便纠正。
+
 ## 安装
 
 要求：

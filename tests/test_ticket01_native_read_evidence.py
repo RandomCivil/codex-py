@@ -43,7 +43,7 @@ def test_native_tool_calls_keep_their_own_evidence_lifecycle():
             for call in result.calls
         ]
 
-        assert visible_ids == ["grep-1", "file-1", "glob-2", "glob-3", "glob-4"]
+        assert visible_ids == ["grep-1", "file-1", "glob-4"]
         retained = {
             call.tool_call_id: call
             for result in context.raw_tool_results

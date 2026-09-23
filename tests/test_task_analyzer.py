@@ -30,6 +30,7 @@ NEEDS_TOOLS=true
 EXPECTED_STEPS=5
 EXPECTED_HORIZON="medium"
 REASONING_SUMMARY="The task needs investigation."
+COMPLETION_CRITERION="The report root cause is identified."
 END TASK_ANALYSIS'''
 
 
@@ -46,6 +47,7 @@ def test_task_analyzer_decodes_valid_line_protocol_into_existing_analysis_contra
     assert analysis.expected_steps == 5
     assert analysis.expected_horizon == "medium"
     assert analysis.reasoning_summary == "The task needs investigation."
+    assert analysis.completion_criteria == ("The report root cause is identified.",)
     assert route(analysis) == "react"
 
 
@@ -87,6 +89,10 @@ def test_task_analyzer_includes_prior_conversation_history_in_model_input():
     ("output", "message"),
     [
         (valid_analysis().replace('REASONING_SUMMARY="The task needs investigation."\n', ""), "required fields"),
+        (valid_analysis().replace('COMPLETION_CRITERION="The report root cause is identified."\n', ""), "requires completion criteria"),
+        (valid_analysis().replace('COMPLETION_CRITERION="The report root cause is identified."', 'COMPLETION_CRITERION="  "'), "non-empty text"),
+        (valid_analysis().replace('COMPLETION_CRITERION="The report root cause is identified."', 'COMPLETION_CRITERION="Same"\nCOMPLETION_CRITERION="Same"'), "distinct"),
+        (valid_analysis().replace("NEEDS_TOOLS=true", "NEEDS_TOOLS=false"), "only valid for react"),
         (valid_analysis().replace("END TASK_ANALYSIS", "EXTRA=true\nEND TASK_ANALYSIS"), "undeclared"),
         (valid_analysis().replace('TASK_TYPE="research"', 'TASK_TYPE="unknown"'), "unsupported category"),
         (valid_analysis().replace("GOAL_CLARITY=0.9", "GOAL_CLARITY=1.1"), "score"),
@@ -98,6 +104,15 @@ def test_task_analyzer_includes_prior_conversation_history_in_model_input():
 def test_task_analyzer_rejects_invalid_line_protocol(output, message):
     with pytest.raises(TaskAnalysisValidationError, match=message):
         asyncio.run(TaskAnalyzer(TextStream(output)).run("Investigate the report"))
+
+
+def test_task_analyzer_omits_completion_criteria_for_non_react_analysis():
+    output = valid_analysis().replace("NEEDS_TOOLS=true", "NEEDS_TOOLS=false").replace(
+        'COMPLETION_CRITERION="The report root cause is identified."\n', ""
+    )
+    analysis = asyncio.run(TaskAnalyzer(TextStream(output)).run("Answer the question"))
+
+    assert analysis.completion_criteria == ()
 
 
 class CountingTextStream(TextStream):

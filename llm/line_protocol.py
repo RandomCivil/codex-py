@@ -26,6 +26,13 @@ class ParsedBlock:
     children: list["ParsedBlock"] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class CompletionJudgment:
+    completed: tuple[tuple[int, str], ...]
+    all_completed: bool
+    answer: str | None = None
+
+
 def parse_line_protocol(document: str) -> ParsedBlock:
     """Parse one complete protocol block, without coercing scalar values."""
     if not isinstance(document, str):
@@ -187,6 +194,56 @@ def decode_goal_completion(document: str) -> str:
     return answer.strip()
 
 
+def decode_completion_progress(
+    document: str, *, criterion_count: int, completed_criteria: frozenset[int] = frozenset()
+) -> tuple[tuple[int, str], ...]:
+    """Decode newly completed ReAct criteria and their concise supporting evidence."""
+    return decode_completion_judgment(
+        document, criterion_count=criterion_count, completed_criteria=completed_criteria
+    ).completed
+
+
+def decode_completion_judgment(
+    document: str, *, criterion_count: int, completed_criteria: frozenset[int] = frozenset()
+) -> CompletionJudgment:
+    """Decode a judge verdict and its all-criteria completion decision."""
+    block = parse_line_protocol(document)
+    if block.type != "COMPLETION_PROGRESS" or set(block.fields) - {"ALL_COMPLETED", "ANSWER"} or any(
+        child.type != "COMPLETED_CRITERION" for child in block.children
+    ):
+        raise LineProtocolError("COMPLETION_PROGRESS fields are invalid")
+    all_completed = _single(block, "ALL_COMPLETED")
+    if type(all_completed) is not bool:
+        raise LineProtocolError("ALL_COMPLETED must be a boolean")
+    judgments: list[tuple[int, str]] = []
+    for child in block.children:
+        if child.children or set(child.fields) != {"NUMBER", "EVIDENCE"}:
+            raise LineProtocolError("COMPLETED_CRITERION fields are invalid")
+        number = _single(child, "NUMBER")
+        evidence = _single(child, "EVIDENCE")
+        if type(number) is not int or not 1 <= number <= criterion_count:
+            raise LineProtocolError("completed criterion number is out of range")
+        if number in completed_criteria:
+            raise LineProtocolError("completed criterion was already recorded")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise LineProtocolError("completed criterion requires non-empty evidence")
+        judgments.append((number, evidence.strip()))
+    numbers = [number for number, _ in judgments]
+    if len(numbers) != len(set(numbers)):
+        raise LineProtocolError("completed criterion numbers must be distinct")
+    recorded = completed_criteria | frozenset(numbers)
+    if all_completed != (len(recorded) == criterion_count):
+        raise LineProtocolError("ALL_COMPLETED must match locally recorded criterion state")
+    answer = _single(block, "ANSWER") if "ANSWER" in block.fields else None
+    if all_completed:
+        if not isinstance(answer, str) or not answer.strip():
+            raise LineProtocolError("completed judgment requires a non-empty ANSWER")
+        return CompletionJudgment(tuple(judgments), True, answer.strip())
+    if answer is not None:
+        raise LineProtocolError("incomplete judgment cannot include ANSWER")
+    return CompletionJudgment(tuple(judgments), False)
+
+
 def decode_step_completion(document: str) -> dict[str, Any]:
     """Decode the locally validated Plan-step completion receipt."""
     block = parse_line_protocol(document)
@@ -255,6 +312,8 @@ __all__ = [
     "decode_answer",
     "decode_goal_completion",
     "decode_no_tool",
+    "decode_completion_progress",
+    "decode_completion_judgment",
     "normalize_no_tool",
     "parse_line_protocol",
     "decode_step_completion",
@@ -280,6 +339,16 @@ CODEC_REGISTRY = {
         "scalar_arrays": frozenset(),
         "children": frozenset(),
     },
+    "COMPLETION_PROGRESS": {
+        "fields": frozenset({"ALL_COMPLETED", "ANSWER"}),
+        "scalar_arrays": frozenset(),
+        "children": frozenset({"COMPLETED_CRITERION"}),
+    },
+    "COMPLETED_CRITERION": {
+        "fields": frozenset({"NUMBER", "EVIDENCE"}),
+        "scalar_arrays": frozenset(),
+        "children": frozenset(),
+    },
     "STEP_COMPLETION": {
         "fields": frozenset({
             "COMPLETED", "COMPLETION_CRITERION_MET", "RESULT",
@@ -291,9 +360,9 @@ CODEC_REGISTRY = {
     "TASK_ANALYSIS": {
         "fields": frozenset({
             "TASK_TYPE", "GOAL_CLARITY", "NEEDS_TOOLS", "EXPECTED_STEPS", "EXPECTED_HORIZON",
-            "REASONING_SUMMARY",
+            "REASONING_SUMMARY", "COMPLETION_CRITERION",
         }),
-        "scalar_arrays": frozenset(),
+        "scalar_arrays": frozenset({"COMPLETION_CRITERION"}),
         "children": frozenset(),
     },
     "OBSERVATION": {

@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from agent.execution import ExecutionAnswer, ExecutionMode, ExecutionModeName
-from llm.line_protocol import CODEC_REGISTRY, LineProtocolError, parse_line_protocol
+from llm.line_protocol import LineProtocolError, parse_line_protocol
 from llm.text_stream import TextModel, validated_text
 from agent.model_request import trace_llm_validation_retry
 
@@ -38,6 +38,7 @@ class TaskAnalysis:
     expected_steps: int
     expected_horizon: Horizon
     reasoning_summary: str
+    completion_criteria: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +143,11 @@ Then typically:
 * expected_horizon = long
 
 Do not recommend an architecture, expose chain-of-thought, or include implementation details.
+
+For tasks whose own characteristics are needs_tools=true, expected_steps>1,
+and expected_horizon is not "long", also list each independently verifiable
+completion criterion for the user's requested outcome. Keep criteria concise,
+specific, and in stable order. For other tasks, omit completion criteria.
 """
 
 
@@ -157,10 +163,13 @@ NEEDS_TOOLS=false
 EXPECTED_STEPS=1
 EXPECTED_HORIZON="short"
 REASONING_SUMMARY="Briefly explain the main task characteristics without recommending an architecture."
+COMPLETION_CRITERION="One independently verifiable requested outcome"
 END TASK_ANALYSIS
 
 Use uppercase snake-case field names exactly as shown. Scalar values must be JSON
-literals (strings quoted and escaped). Do not include prose or additional fields.
+literals (strings quoted and escaped). Repeat COMPLETION_CRITERION for each
+criterion when the task characteristics require it; otherwise omit it. Do not
+include prose or additional fields.
 """
 
 
@@ -254,7 +263,7 @@ class TaskRouter:
     def __init__(
         self,
         analyzer: TaskAnalyzer,
-        mode_factory: Callable[[ExecutionModeName], ExecutionMode],
+        mode_factory: Callable[[ExecutionModeName, TaskAnalysis | None], ExecutionMode],
     ) -> None:
         self._analyzer = analyzer
         self._mode_factory = mode_factory
@@ -268,7 +277,7 @@ class TaskRouter:
             analysis = None
             mode = "plan_execute"
             analysis_error = _safe_analysis_error()
-        execution = await self._mode_factory(mode).run(goal)
+        execution = await self._mode_factory(mode, analysis).run(goal)
         return RoutedExecutionAnswer(execution, mode, analysis, analysis_error)
 
 
@@ -281,10 +290,10 @@ def _parse_analysis(output: str) -> TaskAnalysis:
         raise TaskAnalysisValidationError("expected BEGIN TASK_ANALYSIS")
     if block.children:
         raise TaskAnalysisValidationError("TASK_ANALYSIS cannot contain child blocks")
-    unexpected = set(block.fields) - set(_TASK_ANALYSIS_PROTOCOL_FIELDS)
+    unexpected = set(block.fields) - set(_TASK_ANALYSIS_PROTOCOL_FIELDS) - {"COMPLETION_CRITERION"}
     if unexpected:
         raise TaskAnalysisValidationError("TASK_ANALYSIS contains undeclared fields")
-    if set(block.fields) != set(_TASK_ANALYSIS_PROTOCOL_FIELDS):
+    if set(block.fields) - {"COMPLETION_CRITERION"} != set(_TASK_ANALYSIS_PROTOCOL_FIELDS):
         raise TaskAnalysisValidationError("task analysis must contain exactly the required fields")
     document: dict[str, Any] = {}
     for protocol_name, field_name in _TASK_ANALYSIS_PROTOCOL_FIELDS.items():
@@ -307,6 +316,17 @@ def _parse_analysis(output: str) -> TaskAnalysis:
         raise TaskAnalysisValidationError("task analysis contains an unsupported category")
     if not isinstance(document["reasoning_summary"], str) or not document["reasoning_summary"].strip():
         raise TaskAnalysisValidationError("task analysis reasoning_summary must be non-empty text")
+    criteria = block.fields.get("COMPLETION_CRITERION", [])
+    if any(not isinstance(item, str) or not item.strip() for item in criteria):
+        raise TaskAnalysisValidationError("completion criteria must be non-empty text")
+    if len(criteria) != len({item.strip() for item in criteria}):
+        raise TaskAnalysisValidationError("completion criteria must be distinct")
+    is_react = route(document) == "react"
+    if is_react and not criteria:
+        raise TaskAnalysisValidationError("react task analysis requires completion criteria")
+    if not is_react and criteria:
+        raise TaskAnalysisValidationError("completion criteria are only valid for react tasks")
+    document["completion_criteria"] = tuple(criteria)
     return TaskAnalysis(**document)
 
 

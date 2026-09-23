@@ -9,6 +9,7 @@ from llm.line_protocol import (
     decode_goal_completion,
     decode_no_tool,
     decode_plan,
+    decode_completion_progress,
     decode_step_completion,
     normalize_no_tool,
     parse_line_protocol,
@@ -110,6 +111,27 @@ def test_no_tool_requires_an_empty_registered_block():
     assert normalize_no_tool("answer\n\n_NO_TOOL_") == "BEGIN NO_TOOL\nEND NO_TOOL"
     with pytest.raises(LineProtocolError):
         decode_no_tool('BEGIN NO_TOOL\nTEXT="no"\nEND NO_TOOL')
+
+
+def test_completion_progress_decodes_empty_and_evidenced_judgments():
+    assert decode_completion_progress(
+        "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nEND COMPLETION_PROGRESS", criterion_count=2
+    ) == ()
+    assert decode_completion_progress(
+        "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n"
+        'EVIDENCE="The file exists"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS',
+        criterion_count=2,
+    ) == ((1, "The file exists"),)
+
+
+@pytest.mark.parametrize("document", [
+    ('BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=""\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS',),
+    ('BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN COMPLETED_CRITERION\nNUMBER=3\nEVIDENCE="out"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS',),
+    ('BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE="one"\nEND COMPLETED_CRITERION\nBEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE="two"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS',),
+])
+def test_completion_progress_rejects_invalid_contracts(document):
+    with pytest.raises(LineProtocolError):
+        decode_completion_progress(document, criterion_count=2)
 
 
 def test_planner_decodes_plan_protocol_without_provider_format():

@@ -20,8 +20,9 @@ from llm.line_protocol import LineProtocolError, parse_line_protocol
 
 DEFAULT_CONTEXT_BUDGET = 128_000
 RAW_ROUND_WINDOW = 3
+NATIVE_LISTING_ROUND_WINDOW = 1
 
-EvidenceLifecycle = Literal["recent_raw", "permanent_raw", "observation"]
+EvidenceLifecycle = Literal["current_raw", "recent_raw", "permanent_raw", "observation"]
 
 
 _OBSERVATION_CONTRACT = """Return exactly one UTF-8 Line Protocol block:
@@ -251,6 +252,7 @@ class RuntimeContextPolicy:
     def assemble(self, durable_state: Any) -> RuntimeContext:
         """Assemble Durable State, older Observations, and recent Raw results."""
         recent_rounds = {item.round for item in self._raw[-self.raw_rounds :]}
+        current_rounds = {item.round for item in self._raw[-NATIVE_LISTING_ROUND_WINDOW :]}
         observations = tuple(self._observations)
         observed_call_ids = {
             call_id
@@ -263,12 +265,14 @@ class RuntimeContextPolicy:
                 tuple(
                     call
                     for call in item.calls
-                    if _is_visible_call(call, item.round, recent_rounds, observed_call_ids)
+                    if _is_visible_call(
+                        call, item.round, current_rounds, recent_rounds, observed_call_ids
+                    )
                 ),
             )
             for item in self._raw
             if any(
-                _is_visible_call(call, item.round, recent_rounds, observed_call_ids)
+                _is_visible_call(call, item.round, current_rounds, recent_rounds, observed_call_ids)
                 for call in item.calls
             )
         )
@@ -511,11 +515,13 @@ def _result_error(result: Any) -> str | None:
 def _is_visible_call(
     call: RawToolCall,
     round: int,
+    current_rounds: set[int],
     recent_rounds: set[int],
     observed_call_ids: set[str],
 ) -> bool:
     return (
-        (call.lifecycle == "recent_raw" and round in recent_rounds)
+        (call.lifecycle == "current_raw" and round in current_rounds)
+        or (call.lifecycle == "recent_raw" and round in recent_rounds)
         or call.lifecycle == "permanent_raw"
         or (call.lifecycle == "observation" and call.tool_call_id not in observed_call_ids)
     )
@@ -563,7 +569,7 @@ def _contains_uncertain_shell_syntax(command: str) -> bool:
 
 def _native_evidence_lifecycle(name: str, arguments: Mapping[str, Any] | None = None) -> EvidenceLifecycle:
     if name in {"list_dir", "glob"}:
-        return "recent_raw"
+        return "current_raw"
     if name in {"grep", "read_file"}:
         return "permanent_raw"
     if name in {"exec", "atom.exec"}:

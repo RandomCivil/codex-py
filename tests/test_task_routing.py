@@ -76,8 +76,8 @@ def test_router_analyzes_selects_one_mode_and_preserves_completed_answer():
     mode = ControlledMode(ExecutionAnswer("Done.", "completed"))
     selected = []
 
-    def factory(name):
-        selected.append(name)
+    def factory(name, task_analysis):
+        selected.append((name, task_analysis))
         return mode
 
     result = asyncio.run(TaskRouter(analyzer, factory).run("Answer the question"))
@@ -86,7 +86,7 @@ def test_router_analyzes_selects_one_mode_and_preserves_completed_answer():
         ExecutionAnswer("Done.", "completed"), "direct", analysis(needs_tools=False)
     )
     assert analyzer.goals == ["Answer the question"]
-    assert selected == ["direct"]
+    assert selected == [("direct", analysis(needs_tools=False))]
     assert mode.goals == ["Answer the question"]
 
 
@@ -95,8 +95,8 @@ def test_router_falls_back_to_plan_execute_once_with_safe_analysis_error():
     mode = ControlledMode(ExecutionAnswer(None, "failed", error="selected mode failed"))
     selected = []
 
-    def factory(name):
-        selected.append(name)
+    def factory(name, task_analysis):
+        selected.append((name, task_analysis))
         return mode
 
     result = asyncio.run(TaskRouter(analyzer, factory).run("Investigate it"))
@@ -105,7 +105,7 @@ def test_router_falls_back_to_plan_execute_once_with_safe_analysis_error():
     assert result.execution_mode == "plan_execute"
     assert result.analysis is None
     assert result.analysis_error == "task analysis failed"
-    assert selected == ["plan_execute"]
+    assert selected == [("plan_execute", None)]
     assert mode.goals == ["Investigate it"]
     assert "provider secret" not in result.analysis_error
 
@@ -122,8 +122,8 @@ def test_router_treats_invalid_analysis_as_a_conservative_plan_execute_fallback(
     mode = ControlledMode(ExecutionAnswer("Planned.", "completed"))
     selected = []
 
-    def factory(name):
-        selected.append(name)
+    def factory(name, task_analysis):
+        selected.append((name, task_analysis))
         return mode
 
     result = asyncio.run(TaskRouter(analyzer, factory).run("Handle it"))
@@ -133,22 +133,43 @@ def test_router_treats_invalid_analysis_as_a_conservative_plan_execute_fallback(
     assert result.analysis is None
     assert result.analysis_error == "task analysis failed"
     assert "secret" not in result.analysis_error
-    assert selected == ["plan_execute"]
+    assert selected == [("plan_execute", None)]
 
 
 def test_router_does_not_run_another_mode_after_selected_mode_fails():
     analyzer = ControlledAnalyzer(analysis(needs_tools=True, expected_steps=1))
     calls = []
 
-    def factory(name):
-        calls.append(name)
+    def factory(name, task_analysis):
+        calls.append((name, task_analysis))
         return ControlledMode(ExecutionAnswer(None, "failed", error="no"))
 
     result = asyncio.run(TaskRouter(analyzer, factory).run("Use the tool"))
 
     assert result.execution_mode == "tool_agent"
     assert result.execution.status == "failed"
-    assert calls == ["tool_agent"]
+    assert calls == [("tool_agent", analysis(needs_tools=True, expected_steps=1))]
+
+
+def test_router_passes_react_analysis_with_ordered_criteria_to_factory_and_result():
+    task_analysis = analysis(completion_criteria=("Inspect the evidence.", "Report the cause."))
+    analyzer = ControlledAnalyzer(task_analysis)
+    mode = ControlledMode(ExecutionAnswer("Cause reported.", "completed"))
+    received = []
+
+    def factory(name, selected_analysis):
+        received.append((name, selected_analysis))
+        return mode
+
+    result = asyncio.run(TaskRouter(analyzer, factory).run("Investigate the issue"))
+
+    assert received == [("react", task_analysis)]
+    assert received[0][1].completion_criteria == ("Inspect the evidence.", "Report the cause.")
+    assert result.analysis is task_analysis
+    assert _routed_result("run-id", result)["analysis"]["completion_criteria"] == (
+        "Inspect the evidence.",
+        "Report the cause.",
+    )
 
 
 def test_run_entry_router_uses_the_existing_mode_factory(monkeypatch):
@@ -182,6 +203,34 @@ def test_run_entry_router_uses_the_existing_mode_factory(monkeypatch):
     assert selected[0][1]["durable_agent"] is durable_agent
     assert selected[0][1]["run_id"] == "run-entry-id"
     assert selected[0][1]["tool_runtime"]._tool_cwd == "/workspace/project"
+
+
+def test_run_entry_router_passes_react_criteria_to_execution_mode(monkeypatch):
+    criteria = ("Inspect the evidence.", "Report the cause.")
+    analyzer = ControlledAnalyzer(analysis(completion_criteria=criteria))
+    selected = []
+    mode = ControlledMode(ExecutionAnswer("Cause reported.", "completed"))
+
+    def factory(name, **kwargs):
+        selected.append((name, kwargs))
+        return mode
+
+    monkeypatch.setattr("agent.durable.create_execution_mode", factory)
+
+    result = asyncio.run(
+        _task_router(
+            analyzer,
+            run_id="run-entry-id",
+            configuration=object(),
+            durable_agent=object(),
+            tool_cwd="/workspace/project",
+            trace=object(),
+        ).run("Investigate the issue")
+    )
+
+    assert result.execution.status == "completed"
+    assert selected[0][0] == "react"
+    assert selected[0][1]["completion_criteria"] == criteria
 
 
 def test_run_entry_plan_execute_reuses_the_cli_run_id():

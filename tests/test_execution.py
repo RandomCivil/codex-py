@@ -7,6 +7,7 @@ from agent import PlanningValidationError
 from agent.configuration import ComponentProviderConfiguration, ProviderConfiguration
 from agent.execution import DirectMode, ExecutionAnswer, PlanExecuteMode, ReactMode, ToolAgentMode, create_execution_mode
 from agent.trace import RunTrace
+from tests.helpers import Runtime, ToolModel
 
 
 class TextModel:
@@ -14,21 +15,6 @@ class TextModel:
     async def stream_text(self, input, **kwargs):
         self.requests.append((input, kwargs))
         yield next(self.responses)
-
-
-class ToolModel:
-    def __init__(self, *responses): self.responses = iter(responses); self.requests = []; self.tools = None
-    def bind_tools(self, tools): self.tools = tools; return self
-    async def ainvoke(self, messages):
-        self.requests.append(list(messages))
-        return next(self.responses)
-
-
-class Runtime:
-    def __init__(self): self.tools = []; self.calls = []
-    async def __aenter__(self): return self
-    async def __aexit__(self, *args): pass
-    async def invoke(self, call): self.calls.append(call); return {"value": "done"}
 
 
 def test_plan_execute_reports_a_safe_actionable_provider_status():
@@ -135,6 +121,9 @@ def test_react_returns_freeform_content_when_no_tool_call_is_present():
     assert "Before every tool call, check all three conditions" in model.requests[0][0].content
     assert "Do not repeat an" in model.requests[0][0].content
     assert "equivalent inspection" in model.requests[0][0].content
+    assert "pending requested outcome requires modifying a file" in model.requests[0][0].content
+    assert "available bound write tool" in model.requests[0][0].content
+    assert "Do not make further read-only" in model.requests[0][0].content
 
 
 def test_react_rejects_an_empty_final_response_without_tool_calls():
@@ -165,6 +154,172 @@ def test_react_executes_tool_calls_with_accompanying_text():
     assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
         {"name": "list_dir", "args": {}, "id": "1"}
     ]
+
+
+def test_react_executes_empty_text_tool_call_with_completion_criteria():
+    model = ToolModel(
+        AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "1"}]),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER="The evidence is inspected."\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n'
+            'EVIDENCE="The evidence is inspected."\nEND COMPLETED_CRITERION\n'
+            'END COMPLETION_PROGRESS'
+        )),
+        AIMessage(content='BEGIN ANSWER\nTEXT="The evidence is inspected."\nEND ANSWER'),
+    )
+    runtime = Runtime()
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            runtime,
+            completion_criteria=("Inspect the evidence.",),
+        ).run("Investigate the issue")
+    )
+
+    assert answer == ExecutionAnswer("The evidence is inspected.", "completed")
+    assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
+        {"name": "inspect", "args": {}, "id": "1"}
+    ]
+    assert "Inspect the evidence." not in model.requests[0][0].content
+
+
+def test_react_repairs_a_prefixed_final_answer_with_completion_criteria():
+    model = ToolModel(
+        AIMessage(content=(
+            '这是意外输出的正文。\n\nBEGIN ANSWER\nTEXT="已完成。"\nEND ANSWER'
+        )),
+        AIMessage(content='BEGIN ANSWER\nTEXT="已完成。"\nEND ANSWER'),
+    )
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            Runtime(),
+            max_rounds=1,
+            completion_criteria=("提供结果。",),
+        ).run("提供结果")
+    )
+
+    assert answer == ExecutionAnswer(None, "failed", "react round budget exhausted")
+    assert len(model.requests) == 2
+    assert model.request_tools == [[], ()]
+    assert "Validation error: invalid line or text outside a block" in model.requests[1][0].content
+
+
+def test_react_ignores_unparseable_tool_call_reasoning_with_completion_criteria():
+    model = ToolModel(
+        AIMessage(
+            content="Let me inspect the README before making the update.",
+            tool_calls=[{"name": "inspect", "args": {}, "id": "1"}],
+        ),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER="The README was inspected."\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n'
+            'EVIDENCE="The README was inspected."\nEND COMPLETED_CRITERION\n'
+            'END COMPLETION_PROGRESS'
+        )),
+        AIMessage(content='BEGIN ANSWER\nTEXT="The README was inspected."\nEND ANSWER'),
+    )
+    runtime = Runtime()
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            runtime,
+            completion_criteria=("Inspect the README.",),
+        ).run("Update the README")
+    )
+
+    assert answer == ExecutionAnswer("The README was inspected.", "completed")
+    assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
+        {"name": "inspect", "args": {}, "id": "1"}
+    ]
+    assert "Inspect the README." not in model.requests[0][0].content
+
+
+def test_react_accumulates_tool_round_progress_and_requires_all_criteria_at_final():
+    model = ToolModel(
+        AIMessage(
+            content=(
+                'intermediate'
+            ),
+            tool_calls=[{"name": "inspect", "args": {}, "id": "1"}],
+        ),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n'
+            'EVIDENCE="Evidence inspected"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS'
+        )),
+        AIMessage(content=[{"type": "text", "text": "intermediate"}], tool_calls=[{"name": "report", "args": {}, "id": "2"}]),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER="Both outcomes are verified."\nBEGIN COMPLETED_CRITERION\nNUMBER=2\n'
+            'EVIDENCE="Cause reported"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS'
+        )),
+        AIMessage(content='BEGIN ANSWER\nTEXT="Both outcomes are verified."\nEND ANSWER'),
+    )
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            Runtime(),
+            max_rounds=3,
+            completion_criteria=("Inspect the evidence.", "Report the cause."),
+        ).run("Investigate the issue")
+    )
+
+    assert answer == ExecutionAnswer("Both outcomes are verified.", "completed")
+    assert model.requests[0][-1].content == (
+        "Completion criteria status:\n"
+        "1. [pending] Inspect the evidence.\n2. [pending] Report the cause."
+    )
+    assert model.requests[2][-1].content == (
+        "Completion criteria status:\n"
+        "1. [completed] Inspect the evidence.\n2. [pending] Report the cause."
+    )
+
+
+def test_react_rejects_progress_for_an_undeclared_criterion():
+    model = ToolModel(AIMessage(content='BEGIN ANSWER\nTEXT="Done"\nEND ANSWER'))
+
+    answer = asyncio.run(
+        ReactMode(model, Runtime(), max_rounds=1, completion_criteria=("Inspect the evidence.",)).run("Investigate")
+    )
+
+    assert answer.status == "failed"
+    assert answer.error == "react round budget exhausted"
+
+
+def test_react_continues_after_a_final_response_leaves_criteria_pending():
+    model = ToolModel(
+        AIMessage(content='BEGIN ANSWER\nTEXT="The evidence is inspected."\nEND ANSWER'),
+        AIMessage(content='BEGIN ANSWER\nTEXT="The cause is reported."\nEND ANSWER'),
+    )
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            Runtime(),
+            max_rounds=2,
+            completion_criteria=("Inspect the evidence.", "Report the cause."),
+        ).run("Investigate")
+    )
+
+    assert answer == ExecutionAnswer(None, "failed", error="react round budget exhausted")
+    assert len(model.requests) == 2
+    assert "Inspect the evidence." not in model.requests[1][0].content
+
+
+def test_react_fails_when_round_budget_expires_with_pending_criteria():
+    model = ToolModel(AIMessage(content='BEGIN ANSWER\nTEXT="One outcome is done."\nEND ANSWER'))
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            Runtime(),
+            max_rounds=1,
+            completion_criteria=("Inspect the evidence.", "Report the cause."),
+        ).run("Investigate")
+    )
+
+    assert answer == ExecutionAnswer(None, "failed", error="react round budget exhausted")
 
 
 def test_react_logs_the_original_exception_before_returning_safe_error():

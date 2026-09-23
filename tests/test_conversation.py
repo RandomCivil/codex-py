@@ -4,6 +4,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from agent.conversation import (
     ConversationBusyError,
@@ -12,12 +13,14 @@ from agent.conversation import (
     ConversationTurn,
     InMemoryConversationStore,
     ConversationInput,
+    ConversationModeSelection,
     _select_conversation_mode,
 )
-from agent.execution import ExecutionAnswer
+from agent.execution import ExecutionAnswer, ReactMode
 from agent.execution import DirectMode
 from agent.planner import PlanningValidationError
 from agent.registry import ConfigurationMismatchError, RunBusyError
+from agent.task_analyzer import TaskAnalysis
 
 
 def _task_analysis_protocol(values):
@@ -82,6 +85,138 @@ def test_task_analyzer_selects_the_persisted_mode_before_running_the_turn():
     assert selected[0][0].current_input == "Investigate this"
 
 
+def test_routed_react_conversation_passes_ordered_completion_criteria_to_runner():
+    store = InMemoryConversationStore()
+    runner = ControlledRunner()
+    runner.store = store
+    criteria = ("Inspect the evidence.", "Report the cause.")
+    analysis = TaskAnalysis(
+        "research", 1.0, True, 3, "medium", "inspect project files", criteria
+    )
+    selected = []
+
+    async def select_mode(_conversation_input, _run_id):
+        return ConversationModeSelection("react", analysis)
+
+    def make_runner(mode, run_id, completion_criteria):
+        selected.append((mode, run_id, completion_criteria))
+        return runner
+
+    result = asyncio.run(
+        ConversationService(
+            store,
+            make_runner,
+            mode_selector=select_mode,
+        ).run(user_input="Investigate this")
+    )
+
+    assert result.execution_mode == "react"
+    assert selected[0][0] == "react"
+    assert selected[0][2] == criteria
+
+
+def test_conversation_does_not_pass_completion_criteria_to_non_react_runner():
+    store = InMemoryConversationStore()
+    runner = ControlledRunner()
+    runner.store = store
+    calls = []
+
+    def make_runner(*args):
+        calls.append(args)
+        return runner
+
+    result = asyncio.run(
+        ConversationService(store, make_runner).run(
+            user_input="Answer this", execution_mode="direct"
+        )
+    )
+
+    assert result.status == "completed"
+    assert calls == [("direct", result.run_id)]
+
+
+def test_routed_react_conversation_uses_criteria_for_the_terminal_answer():
+    store = InMemoryConversationStore()
+    criteria = ("Inspect the evidence.",)
+    analysis = TaskAnalysis(
+        "research", 1.0, True, 3, "medium", "inspect project files", criteria
+    )
+
+    class Model:
+        def __init__(self):
+            self.requests = []
+            self.responses = iter([
+                AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
+                AIMessage(content=(
+                    "BEGIN COMPLETION_PROGRESS\n"
+                    "ALL_COMPLETED=true\nANSWER=\"Investigated.\"\n"
+                    "BEGIN COMPLETED_CRITERION\n"
+                    "NUMBER=1\nEVIDENCE=\"evidence inspected\"\n"
+                    "END COMPLETED_CRITERION\nEND COMPLETION_PROGRESS"
+                )),
+                AIMessage(content='BEGIN ANSWER\nTEXT="Investigated."\nEND ANSWER'),
+            ])
+
+        def bind_tools(self, _tools):
+            return self
+
+        async def ainvoke(self, messages):
+            self.requests.append(list(messages))
+            return next(self.responses)
+
+    class Runtime:
+        tools = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def invoke(self, _call):
+            return {"evidence": "inspected"}
+
+    model = Model()
+
+    async def select_mode(_conversation_input, _run_id):
+        return ConversationModeSelection("react", analysis)
+
+    def make_runner(mode, _run_id, received_criteria):
+        assert mode == "react"
+        assert received_criteria == criteria
+        return ReactMode(model, Runtime(), completion_criteria=received_criteria)
+
+    result = asyncio.run(
+        ConversationService(store, make_runner, mode_selector=select_mode).run(
+            user_input="Investigate this"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "Investigated."
+    assert store.get(result.conv_id).turns[0].status == "completed"
+    assert model.requests[0][-1].content == "Completion criteria status:\n1. [pending] Inspect the evidence."
+
+
+def test_one_argument_conversation_runner_factory_still_receives_run_id():
+    store = InMemoryConversationStore()
+    runner = ControlledRunner()
+    runner.store = store
+    received = []
+
+    def make_runner(run_id):
+        received.append(run_id)
+        return runner
+
+    result = asyncio.run(
+        ConversationService(store, make_runner).run(
+            user_input="Answer this", execution_mode="direct"
+        )
+    )
+
+    assert received == [result.run_id]
+
+
 def test_conversation_task_analyzer_is_traced_before_routing(monkeypatch, capsys):
     created = []
     analysis = {
@@ -91,6 +226,7 @@ def test_conversation_task_analyzer_is_traced_before_routing(monkeypatch, capsys
         "expected_steps": 3,
         "expected_horizon": "medium",
         "reasoning_summary": "inspect project files",
+        "completion_criterion": "Inspect the project components",
     }
 
     class Model:

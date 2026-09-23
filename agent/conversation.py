@@ -12,6 +12,7 @@ from typing import Any, Callable, Literal, Mapping, Protocol
 from .execution import ExecutionAnswer, ExecutionModeName, ToolRuntime, create_execution_mode
 from .planner import PlanningValidationError
 from .registry import ConfigurationMismatchError, MySQLRunRegistry, RunBusyError
+from .task_analyzer import TaskAnalysis
 
 
 ConversationStatus = Literal["pending", "running", "completed", "failed", "blocked"]
@@ -31,6 +32,15 @@ class ConversationBusyError(ConversationError):
         self.sequence = sequence
         self.run_id = run_id
         super().__init__(f"conversation busy: turn {sequence} (run {run_id}) is active")
+
+
+class ConversationModeSelection(str):
+    """A selected mode together with the analysis needed to construct it."""
+
+    def __new__(cls, mode: ExecutionModeName, analysis: TaskAnalysis | None = None):
+        selected = super().__new__(cls, mode)
+        selected.analysis = analysis
+        return selected
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,10 +251,15 @@ class ConversationService:
 
         run_id = str(uuid.uuid4())
         conversation_input = ConversationInput(conv_id, history, user_input)
+        completion_criteria: tuple[str, ...] = ()
         if execution_mode is None and self._mode_selector is not None:
-            execution_mode = await _maybe_await(
+            selection = await _maybe_await(
                 _call_factory(self._mode_selector, conversation_input, run_id)
             )
+            analysis = getattr(selection, "analysis", None)
+            execution_mode = str(selection)
+            if execution_mode == "react" and isinstance(analysis, TaskAnalysis):
+                completion_criteria = analysis.completion_criteria
             if execution_mode not in {"direct", "tool_agent", "react", "plan_execute"}:
                 raise TypeError("task analyzer returned an invalid execution mode")
         if execution_mode is None:
@@ -256,7 +271,7 @@ class ConversationService:
         if execution_mode in {"direct", "tool_agent", "react"}:
             self._active_ephemeral_runs.add(run_id)
 
-        runner = self._make_runner(execution_mode, run_id)
+        runner = self._make_runner(execution_mode, run_id, completion_criteria)
         try:
             answer = await runner.run(conversation_input)
             if not isinstance(answer, ExecutionAnswer):
@@ -322,8 +337,16 @@ class ConversationService:
         conversation = await _maybe_await(self._store.get(conv_id))
         return [turn.public() for turn in conversation.turns]
 
-    def _make_runner(self, mode: str, run_id: str) -> Any:
-        return _call_factory(self._runner_factory, mode, run_id)
+    def _make_runner(self, mode: str, run_id: str, completion_criteria: tuple[str, ...] = ()) -> Any:
+        if mode != "react":
+            return _call_factory(self._runner_factory, mode, run_id, one_argument=run_id)
+        return _call_factory(
+            self._runner_factory,
+            mode,
+            run_id,
+            completion_criteria,
+            one_argument=run_id,
+        )
 
     def _make_recovery_runner(self, run_id: str) -> Any:
         return _call_factory(self._recovery_factory, run_id)
@@ -410,7 +433,9 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
     from .durable import DurableConversationRunner
     from .migration import _connection_pool, _parse_url, ensure_schema_initialized
 
-    def runner_factory(mode: str, run_id: str) -> Any:
+    def runner_factory(
+        mode: str, run_id: str, completion_criteria: tuple[str, ...] = ()
+    ) -> Any:
         if mode == "plan_execute":
             return DurableConversationRunner(
                 _MySQLDurableAgent(
@@ -427,9 +452,10 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
             configuration=kwargs["configuration"],
             cwd=kwargs.get("cwd"),
             log_level=kwargs.get("log_level", "info"),
+            completion_criteria=completion_criteria,
         )
 
-    async def select_mode(conversation_input: ConversationInput, run_id: str) -> ExecutionModeName:
+    async def select_mode(conversation_input: ConversationInput, run_id: str) -> ConversationModeSelection:
         return await _select_conversation_mode(
             conversation_input,
             run_id,
@@ -460,7 +486,7 @@ async def _select_conversation_mode(
     *,
     configuration: Any,
     log_level: str,
-) -> ExecutionModeName:
+) -> ConversationModeSelection:
     from llm import LLM
     from .task_analyzer import TaskAnalyzer, route
     from .trace import RunTrace
@@ -477,21 +503,20 @@ async def _select_conversation_mode(
         on_response=trace.llm_response,
     )
     try:
-        mode = route(
-            await TaskAnalyzer(
-                analyzer_llm,
-                trace=trace,
-                stream=getattr(analyzer_configuration, "stream", True),
-            ).run(
-                conversation_input.current_input,
-                conversation_input=conversation_input,
-            )
+        analysis = await TaskAnalyzer(
+            analyzer_llm,
+            trace=trace,
+            stream=getattr(analyzer_configuration, "stream", True),
+        ).run(
+            conversation_input.current_input,
+            conversation_input=conversation_input,
         )
+        mode = route(analysis)
         trace.task_route(mode)
-        return mode
+        return ConversationModeSelection(mode, analysis)
     except Exception:
         trace.task_route("plan_execute", analysis_failed=True)
-        return "plan_execute"
+        return ConversationModeSelection("plan_execute")
     finally:
         await analyzer_llm.close()
 
@@ -503,19 +528,22 @@ def _make_ephemeral_runner(
     configuration: Any,
     cwd: str | None,
     log_level: str,
+    completion_criteria: tuple[str, ...] = (),
 ) -> Any:
     """Create an ephemeral mode with the same host-selected tool boundary as durable runs."""
     from .trace import RunTrace
 
     tool_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     trace = RunTrace(level=log_level, run_id=run_id)
-    return create_execution_mode(
-        mode,
-        configuration=configuration,
-        run_id=run_id,
-        trace=trace,
-        tool_runtime=ToolRuntime(tool_cwd=tool_cwd, trace=trace),
-    )
+    options = {
+        "configuration": configuration,
+        "run_id": run_id,
+        "trace": trace,
+        "tool_runtime": ToolRuntime(tool_cwd=tool_cwd, trace=trace),
+    }
+    if mode == "react":
+        options["completion_criteria"] = completion_criteria
+    return create_execution_mode(mode, **options)
 
 
 async def _resume_mysql_conversation(
@@ -613,13 +641,29 @@ async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
-def _call_factory(factory: Callable[..., Any], *args: Any) -> Any:
+_MISSING = object()
+
+
+def _call_factory(factory: Callable[..., Any], *args: Any, one_argument: Any = _MISSING) -> Any:
     try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
         return factory(*args)
-    except TypeError as error:
-        if "positional" not in str(error) and "required" not in str(error):
-            raise
-        return factory(args[-1])
+    if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()):
+        return factory(*args)
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    required = sum(parameter.default is inspect.Parameter.empty for parameter in positional)
+    if required <= len(args) <= len(positional):
+        return factory(*args)
+    if len(positional) == 1 and required <= 1:
+        return factory(args[-1] if one_argument is _MISSING else one_argument)
+    if required <= len(args) - 1 <= len(positional):
+        return factory(*args[:-1])
+    return factory(*args)
 
 
 def _validate_uuid4(value: str) -> None:

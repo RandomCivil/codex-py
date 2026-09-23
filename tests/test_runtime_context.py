@@ -457,8 +457,9 @@ def test_non_native_results_keep_their_round_order_before_grouped_native_reads()
     asyncio.run(run())
     prompt = policy.assemble({}).as_messages()[0].content
 
-    assert prompt.index("#### Round 1") < prompt.index("#### Round 2")
-    assert prompt.index("directory contents") < prompt.index("test directory contents")
+    assert '- result: "directory contents"' not in prompt
+    assert "#### Round 1\n- Native read evidence is grouped below by file." in prompt
+    assert "#### Round 2" in prompt
     assert prompt.index("#### Round 2") < prompt.index("#### File: src/app.py")
     assert prompt.index("app contents") > prompt.index("#### File: src/app.py")
 

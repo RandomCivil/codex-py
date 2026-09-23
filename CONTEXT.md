@@ -225,7 +225,7 @@ A transient diagnostic record for one asynchronous Observation attempt. It ident
 _Avoid_: Observation, durable task record
 
 **Tool-call evidence policy**:
-The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest three Tool rounds; `grep` and `read_file` retain raw evidence for the whole invocation; successful `apply_patch`, `write_file`, and write-class `exec` calls use asynchronous Observations with Raw tool-result fallback, while failed calls remain Raw and never invoke the Runtime-context component.
+The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest Tool round; `grep` and `read_file` retain raw evidence for the whole invocation; successful `apply_patch`, `write_file`, and write-class `exec` calls use asynchronous Observations with Raw tool-result fallback, while failed calls remain Raw and never invoke the Runtime-context component.
 _Avoid_: round-level context policy, universal observation policy
 
 **Exec command class**:

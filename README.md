@@ -14,8 +14,8 @@
 - 不可变、可校验的 Plan revision 和可审计的 Step execution 历史。
 - MySQL checkpoint、运行登记和 60 秒独占 lease；lease 每 15 秒续租。
 - 配置指纹校验，避免恢复时静默更换模型或 MCP 配置。
-- Runtime-context component 异步生成和压缩 Tool-round Observation；最近三轮保留原始工具结果，Observation 失败时自动回退到原始证据。
-- 按 Tool call 独立应用证据策略：`list_dir`/`glob` 只保留最近三轮原始结果，`grep`/`read_file` 在本次调用中保留全部原始结果，写入类工具异步生成 Observation；不会把原始工具结果写入 Durable State 或 Checkpoint。
+- Runtime-context component 异步生成和压缩 Tool-round Observation；当前一轮保留原始目录/匹配结果，Observation 失败时自动回退到原始证据。
+- 按 Tool call 独立应用证据策略：`list_dir`/`glob` 只保留当前 Tool round 的原始结果，`grep`/`read_file` 在本次调用中保留全部原始结果，写入类工具异步生成 Observation；不会把原始工具结果写入 Durable State 或 Checkpoint。
 - Runtime context 使用显式 token budget；超出预算时合并较早 Observation，无法容纳必要 Durable State 或工具证据时让执行安全失败，并支持取消、失败和无效 Observation 的诊断追踪。
 - 支持 OpenAI-compatible provider 的 text stream/event stream；日志记录组件、请求形状和 token/cache usage，便于观察多轮工具执行和 provider 缓存效果。
 - 通过 CLI 以一行 JSON 输出运行结果，便于脚本调用。

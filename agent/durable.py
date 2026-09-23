@@ -602,13 +602,14 @@ def _task_router(
     """Compose the one run-entry router with the existing mode-factory seam."""
     return TaskRouter(
         analyzer,
-        lambda mode: create_execution_mode(
+        lambda mode, analysis: create_execution_mode(
             mode,
             configuration=configuration,
             durable_agent=durable_agent,
             run_id=run_id,
             tool_runtime=ToolRuntime(tool_cwd=tool_cwd, trace=trace),
             trace=trace,
+            completion_criteria=(analysis.completion_criteria if mode == "react" and analysis else ()),
         ),
     )
 

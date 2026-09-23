@@ -97,6 +97,75 @@ flowchart LR
 
 Plan steps 始终串行；只有同一模型响应内相互独立的工具调用会在 `ToolNode` 中并发执行。
 
+### Checkpoint 持久化
+
+`plan_execute` 模式使用 LangGraph 的 checkpoint 机制将执行状态持久化到 MySQL，确保进程重启后可以从最新状态恢复。
+
+#### 持久化架构
+
+系统采用双层持久化策略：
+
+1. **LangGraph Checkpoint**：通过 `AIOMySQLSaver` 将 `GraphState` 序列化到 MySQL。每个图节点（plan、mark_running、execute、replan、complete、blocked）执行完成后自动触发 checkpoint。
+
+2. **Recovery Store**：独立的 `step_recovery_attempts` 表记录每个 Step 的执行尝试，包含状态、结果、错误和上下文更新。用于在 checkpoint 基础上重建可信的领域状态。
+
+#### GraphState 结构
+
+```python
+class GraphState(TypedDict, total=False):
+    agent_state: AgentState           # 核心领域状态（Plan、Step 执行记录）
+    files_read: list[str]             # 已读取的文件路径
+    files_modified: list[str]         # 已修改的文件路径
+    observations: list[str]           # 从文件中提取的关键发现
+    persistence_version: int          # 持久化版本号，用于 checkpoint 和 recovery 对齐
+    recovery_attempt: int             # 当前恢复尝试次数
+    recovery_step: tuple[int, str]    # 正在恢复的 (revision, step_id)
+    recovery_active: bool             # 是否处于恢复模式
+    run_id: str                       # 运行标识
+    status: str                       # 运行状态（resuming, completed, blocked 等）
+```
+
+#### Checkpoint 触发点
+
+- **plan**：生成或更新 Plan 后
+- **mark_running**：将 Step 标记为 running 并写入 recovery store 后
+- **execute**：Step 执行完成（成功或失败）并更新上下文后
+- **replan**：生成新的 Plan revision 后
+- **complete/blocked**：进入终态后
+
+每次 checkpoint 都会递增 `persistence_version`，确保 recovery store 和 checkpoint 的版本对齐。
+
+### Resume 恢复策略
+
+当进程中断后，可以通过 `resume` 命令从最新的 checkpoint 恢复执行。
+
+#### 恢复流程
+
+1. **加载 Checkpoint**：从 LangGraph checkpoint 读取最新的 `GraphState`
+2. **加载 Recovery Snapshot**：从 `step_recovery_attempts` 表读取该 run 的所有执行尝试
+3. **版本对齐校验**：检查 checkpoint 的 `persistence_version` 与 recovery store 的最新版本是否一致，不一致则拒绝恢复
+4. **恢复上下文**：从 recovery snapshot 重建 `files_read`、`files_modified` 和 `observations`
+5. **标记中断状态**：将所有 `running` 状态的 Step 标记为 `interrupted`
+6. **应用恢复决策**：根据 `--recovery` 参数决定如何处理中断的 Step
+7. **继续执行**：从 checkpoint 恢复图执行
+
+#### 恢复决策
+
+中断的 Step 必须通过 `--recovery` 参数显式指定处理策略：
+
+- **`fail`**：将中断的 Step 标记为 `failed`，触发 replanning。适用于可以安全重试的操作。
+- **`abort`**：将 run 标记为 `blocked`，停止执行。适用于不确定是否安全的操作。
+
+当前 Atom MCP 工具没有声明幂等性，因此不支持 `retry` 策略。
+
+#### Lease 管理
+
+每个 run 在执行期间持有 60 秒的独占 lease，每 15 秒自动续租。这确保同一时刻只有一个进程可以执行该 run。恢复时会检查 lease 状态，过期的 lease 可以被新进程接管。
+
+#### 配置指纹校验
+
+恢复时会验证当前配置与原始 run 的配置指纹是否一致。指纹包含 planner、executor、task_analyzer 的模型配置和 MCP 配置。配置不匹配时会拒绝恢复，防止静默更换模型或工具配置导致的不一致。
+
 ### ReAct 与 Plan–execute 的 Runtime context 和收敛
 
 ReAct 和 Plan–execute 的单步 Executor 共用同一套 Runtime-context policy。每次模型请求都会由 host 重建上下文，分为 Durable State、Observation 和 Raw tool results；启用该 policy 后，不会再把整段 AI/Tool 对话历史作为另一条隐式记忆通道。ReAct 的 Durable State 包含 Goal，Plan-step Executor 还包含当前 Plan step、完成标准、已有 step 执行记录，以及已完成 Step 交接来的 `files_read`、`files_modified` 和 observations。

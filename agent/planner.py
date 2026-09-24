@@ -86,6 +86,7 @@ def _state_payload(state: AgentState, *, conversation_input: Any = None) -> dict
                 "status": execution.status,
                 "result": execution.result,
                 "error": execution.error,
+                "completion_evidence": execution.completion_evidence,
             }
             for execution in state.step_executions
         ],

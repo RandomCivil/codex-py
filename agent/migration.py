@@ -83,6 +83,7 @@ async def _migrate_database(
                         status VARCHAR(16) NOT NULL,
                         result TEXT NULL,
                         error TEXT NULL,
+                        completion_evidence TEXT NULL,
                         context_update JSON NULL,
                         recovery BOOLEAN NOT NULL DEFAULT FALSE,
                         common_version BIGINT UNSIGNED NOT NULL,
@@ -95,6 +96,18 @@ async def _migrate_database(
                     )
                     """
                 )
+                await cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM information_schema.columns
+                    WHERE table_schema=DATABASE()
+                      AND table_name='step_recovery_attempts'
+                      AND column_name='completion_evidence'
+                    """
+                )
+                if (await cursor.fetchone())[0] == 0:
+                    await cursor.execute(
+                        "ALTER TABLE step_recovery_attempts ADD COLUMN completion_evidence TEXT NULL"
+                    )
                 await cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS conversations (

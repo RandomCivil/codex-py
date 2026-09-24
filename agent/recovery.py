@@ -63,12 +63,13 @@ class InMemoryStepRecoveryStore:
             if latest is not None and latest.execution.status in {"pending", "running"}
             else len({item.attempt for item in prior}) + 1
         )
+        durable_execution = _durable_execution(execution)
         record = RecoveryAttempt(
             run_id,
-            execution.revision,
-            execution.step_id,
+            durable_execution.revision,
+            durable_execution.step_id,
             attempt,
-            execution,
+            durable_execution,
             context_update,
             recovery,
             version,
@@ -130,8 +131,8 @@ class MySQLStepRecoveryStore:
                     """
                     INSERT INTO step_recovery_attempts
                     (run_id, revision, step_id, attempt, status, result, error,
-                     context_update, recovery, common_version)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     completion_evidence, context_update, recovery, common_version)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         run_id,
@@ -141,13 +142,23 @@ class MySQLStepRecoveryStore:
                         execution.status,
                         execution.result,
                         execution.error,
+                        _durable_execution(execution).completion_evidence,
                         _context_json(context_update),
                         recovery,
                         version,
                     ),
                 )
             await connection.commit()
-        return RecoveryAttempt(run_id, execution.revision, execution.step_id, attempt, execution, context_update, recovery, version)
+        return RecoveryAttempt(
+            run_id,
+            execution.revision,
+            execution.step_id,
+            attempt,
+            _durable_execution(execution),
+            context_update,
+            recovery,
+            version,
+        )
 
     async def restore(self, run_id: str, checkpoint_version: int) -> RecoverySnapshot:
         async with self._pool.acquire() as connection:
@@ -155,7 +166,7 @@ class MySQLStepRecoveryStore:
                 await cursor.execute(
                     """
                     SELECT revision, step_id, attempt, status, result, error,
-                           context_update, recovery, common_version
+                           completion_evidence, context_update, recovery, common_version
                     FROM step_recovery_attempts WHERE run_id=%s
                     ORDER BY common_version, record_id
                     """,
@@ -221,7 +232,11 @@ def _context_json(update: ContextUpdate | None) -> str | None:
 
 
 def _row_to_attempt(run_id: str, row: tuple[Any, ...]) -> RecoveryAttempt:
-    revision, step_id, attempt, status, result, error, raw_context, recovery, version = row
+    if len(row) == 9:
+        revision, step_id, attempt, status, result, error, raw_context, recovery, version = row
+        completion_evidence = None
+    else:
+        revision, step_id, attempt, status, result, error, completion_evidence, raw_context, recovery, version = row
     context = json.loads(raw_context) if raw_context else None
     update = ContextUpdate(**context) if context else None
     return RecoveryAttempt(
@@ -229,8 +244,32 @@ def _row_to_attempt(run_id: str, row: tuple[Any, ...]) -> RecoveryAttempt:
         revision,
         step_id,
         attempt,
-        StepExecution(revision, step_id, status, result=result, error=error),
+        _durable_execution(
+            StepExecution(
+                revision,
+                step_id,
+                status,
+                result=result,
+                error=error,
+                completion_evidence=completion_evidence,
+            )
+        ),
         update,
         bool(recovery),
         version,
+    )
+
+
+def _durable_execution(execution: StepExecution) -> StepExecution:
+    """Drop attempt-local judge evidence unless the Step is finally complete."""
+    if execution.status == "completed":
+        return execution
+    if execution.completion_evidence is None:
+        return execution
+    return StepExecution(
+        execution.revision,
+        execution.step_id,
+        execution.status,
+        result=execution.result,
+        error=execution.error,
     )

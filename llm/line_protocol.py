@@ -15,8 +15,8 @@ class LineProtocolError(ValueError):
 
 
 _NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
-_BOUNDARY = re.compile(r"^(BEGIN|END) ([A-Z][A-Z0-9_]*)$")
-_SCALAR = re.compile(r"^([A-Z][A-Z0-9_]*(?:\.[A-Z][A-Z0-9_]*)*)=(.+)$")
+_BOUNDARY = re.compile(r"^(BEGIN|END)[ _]([A-Z][A-Z0-9_]*)$", re.IGNORECASE)
+_SCALAR = re.compile(r"^([A-Z][A-Z0-9_]*(?:\.[A-Z][A-Z0-9_]*)*)=(.+)$", re.IGNORECASE)
 
 
 @dataclass
@@ -50,6 +50,7 @@ def parse_line_protocol(document: str) -> ParsedBlock:
         boundary = _BOUNDARY.match(line)
         if boundary:
             kind, type_name = boundary.groups()
+            kind, type_name = kind.upper(), type_name.upper()
             if kind == "BEGIN":
                 if not _NAME.fullmatch(type_name):
                     raise LineProtocolError("invalid block type")
@@ -69,6 +70,7 @@ def parse_line_protocol(document: str) -> ParsedBlock:
         scalar = _SCALAR.match(line)
         if scalar and stack:
             path, literal = scalar.groups()
+            path = path.upper()
             if literal != literal.strip():
                 raise LineProtocolError(f"whitespace around JSON literal for {path}")
             try:
@@ -203,6 +205,40 @@ def decode_completion_progress(
     ).completed
 
 
+def decode_step_completion_progress(
+    document: str, *, completed: bool = False
+) -> tuple[tuple[int, str], bool]:
+    """Decode the single-criterion progress contract used by a Plan step judge."""
+    block = parse_line_protocol(document)
+    if block.type != "STEP_COMPLETION_PROGRESS" or set(block.fields) != {"ALL_COMPLETED"} or any(
+        child.type != "COMPLETED_CRITERION" for child in block.children
+    ):
+        raise LineProtocolError("STEP_COMPLETION_PROGRESS fields are invalid")
+    all_completed = _single(block, "ALL_COMPLETED")
+    if type(all_completed) is not bool:
+        raise LineProtocolError("ALL_COMPLETED must be a boolean")
+    if completed:
+        raise LineProtocolError("Plan step completion criterion was already recorded")
+    judgments: list[tuple[int, str]] = []
+    for child in block.children:
+        if child.children or set(child.fields) != {"NUMBER", "EVIDENCE"}:
+            raise LineProtocolError("COMPLETED_CRITERION fields are invalid")
+        number = _single(child, "NUMBER")
+        evidence = _single(child, "EVIDENCE")
+        if type(number) is not int or number != 1:
+            raise LineProtocolError("Plan step completion criterion must be numbered 1")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise LineProtocolError("completed criterion requires non-empty evidence")
+        judgments.append((number, evidence.strip()))
+    if len(judgments) > 1:
+        raise LineProtocolError("Plan step completion criterion must be reported at most once")
+    if all_completed != bool(judgments) and not (not all_completed and not judgments):
+        raise LineProtocolError("ALL_COMPLETED must match locally recorded criterion state")
+    if completed and all_completed:
+        raise LineProtocolError("completed Plan step criterion cannot be reported again")
+    return (tuple(judgments), all_completed)
+
+
 def decode_completion_judgment(
     document: str, *, criterion_count: int, completed_criteria: frozenset[int] = frozenset()
 ) -> CompletionJudgment:
@@ -314,6 +350,7 @@ __all__ = [
     "decode_no_tool",
     "decode_completion_progress",
     "decode_completion_judgment",
+    "decode_step_completion_progress",
     "normalize_no_tool",
     "parse_line_protocol",
     "decode_step_completion",
@@ -341,6 +378,11 @@ CODEC_REGISTRY = {
     },
     "COMPLETION_PROGRESS": {
         "fields": frozenset({"ALL_COMPLETED", "ANSWER"}),
+        "scalar_arrays": frozenset(),
+        "children": frozenset({"COMPLETED_CRITERION"}),
+    },
+    "STEP_COMPLETION_PROGRESS": {
+        "fields": frozenset({"ALL_COMPLETED"}),
         "scalar_arrays": frozenset(),
         "children": frozenset({"COMPLETED_CRITERION"}),
     },

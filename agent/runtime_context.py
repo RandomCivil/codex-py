@@ -236,6 +236,7 @@ class RuntimeContextPolicy:
         results: Sequence[Any],
         errors: Sequence[str | None] | None = None,
         decision_context: Mapping[str, Any] | None = None,
+        suppress_observations: bool = False,
     ) -> RawToolResult:
         """Store a settled batch and observe only successful observation-class calls."""
         if len(calls) != len(results) or (errors is not None and len(calls) != len(errors)):
@@ -270,7 +271,9 @@ class RuntimeContextPolicy:
         for call in (
             call
             for call in raw.calls
-            if call.lifecycle == "observation" and call.error is None
+            if not suppress_observations
+            and call.lifecycle == "observation"
+            and call.error is None
         ):
             observation_raw = RawToolResult(raw.round, (call,))
             self._set_observation_outcome(raw.round, call.tool_call_id, "pending")

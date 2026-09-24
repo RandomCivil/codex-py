@@ -116,6 +116,11 @@ class ExecutorModel:
                     content="",
                     tool_calls=[{"name": "write_file", "args": {"path": "note"}, "id": "write-1"}],
                 ),
+                AIMessage(content=(
+                    "BEGIN STEP_COMPLETION_PROGRESS\nALL_COMPLETED=true\n"
+                    "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"note written\"\n"
+                    "END COMPLETED_CRITERION\nEND STEP_COMPLETION_PROGRESS"
+                )),
                 AIMessage(content="Done"),
             )
         )
@@ -251,8 +256,8 @@ def test_executor_uses_pending_raw_write_evidence_without_waiting_for_observatio
 
         assert outcome.execution.status == "completed"
         assert observation_model.started.is_set()
-        assert "tool_call_id=write-1" in model.requests[1][-1].content
-        assert '- result: "wrote note"' in model.requests[1][-1].content
+        assert '"tool_call_id": "write-1"' in model.requests[1][-1].content
+        assert '"raw_result": "wrote note"' in model.requests[1][-1].content
 
         observation_model.release.set()
         await asyncio.sleep(0)
@@ -288,6 +293,12 @@ def test_executor_retries_with_failed_tool_message_at_the_end_of_context(monkeyp
                     content="",
                     tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
                 ),
+                AIMessage(content="Recovered"),
+                AIMessage(content=(
+                    "BEGIN STEP_COMPLETION_PROGRESS\nALL_COMPLETED=true\n"
+                    "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"recovered\"\n"
+                    "END COMPLETED_CRITERION\nEND STEP_COMPLETION_PROGRESS"
+                )),
                 AIMessage(content="Recovered"),
             )
         )
@@ -333,6 +344,12 @@ def test_executor_retries_with_mcp_text_error_message_at_the_end_of_context(monk
                     content="",
                     tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
                 ),
+                AIMessage(content="Recovered"),
+                AIMessage(content=(
+                    "BEGIN STEP_COMPLETION_PROGRESS\nALL_COMPLETED=true\n"
+                    "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"recovered\"\n"
+                    "END COMPLETED_CRITERION\nEND STEP_COMPLETION_PROGRESS"
+                )),
                 AIMessage(content="Recovered"),
             )
         )

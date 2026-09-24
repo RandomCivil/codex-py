@@ -9,8 +9,8 @@ A strict UTF-8, line-oriented model-response representation in which a response 
 _Avoid_: JSON mode, JSON Schema, JSON object
 
 **No-tool response**:
-A legacy empty `NO_TOOL` Line Protocol block that formerly indicated a tool-capable model declined native tool calls. ReAct and the Plan-step Executor now treat a no-tool response's content as their terminal result.
-_Avoid_: required no-tool marker, separate completion request
+A legacy empty `NO_TOOL` Line Protocol block that formerly indicated a tool-capable model declined native tool calls. ReAct treats a no-tool response's content as its terminal result; the Plan-step Executor sends its pending no-tool response to a separate Completion judge before requesting a final handoff.
+_Avoid_: required no-tool marker, self-declared Plan-step completion
 
 **OpenAI-compatible provider**:
 A service exposing the OpenAI Responses API through a caller-supplied base URL, API key, and model name.
@@ -81,7 +81,7 @@ One sequentially executed unit of a Plan, with its intended outcome and completi
 _Avoid_: task, instruction, tool invocation
 
 **Step execution**:
-The latest attempt to complete one Plan step in a Plan revision, recorded in Agent state by revision and step ID without changing the Plan. Its status is pending, running, completed, failed, skipped, or interrupted; an interrupted execution may be restarted as a fresh attempt that reconciles the intended outcome without treating unconfirmed prior tool output as fact.
+The latest attempt to complete one Plan step in a Plan revision, recorded in Agent state by revision and step ID without changing the Plan. Its status is pending, running, completed, failed, skipped, or interrupted; a completed execution retains Completion evidence, while an interrupted execution may restart without trusting unconfirmed prior Tool output.
 _Avoid_: plan mutation, replanning, continued transcript
 
 **Execution attempt**:
@@ -165,7 +165,7 @@ The component that derives a complete Plan from the goal and Agent state without
 _Avoid_: executor, tool caller
 
 **Executor**:
-The component that makes one bounded Tool execution attempt for a Plan step, selecting from tools exposed by its host without changing the Plan or requesting a new Plan. When the model stops requesting tools, its nonempty content is the Plan-step handoff.
+The component that makes one bounded Tool execution attempt for a Plan step, selecting from tools exposed by its host without changing the Plan or requesting a new Plan. A Completion judge confirms the selected criterion before the Tool-calling model supplies the nonempty Plan-step handoff.
 _Avoid_: agent, planner, automatic tool loop
 
 **MCP tool set**:
@@ -184,6 +184,10 @@ _Avoid_: tool-result summary, model synthesis
 The concise final explanation returned by an Executor after a completed Step execution, specifically stating how the Plan step's completion criterion was met.
 _Avoid_: transcript, tool trace
 
+**Completion evidence**:
+The concise, directly checkable support accepted by a Completion judge for a completion criterion. A completed Plan step retains it separately from its Execution result.
+_Avoid_: handoff, Tool trace, model reasoning
+
 **Step context**:
 The durable, cumulative handoff from successful Step executions to the next Executor invocation: the files read, files modified, and observations gathered during the Agent run. Its file paths are normalized, relative POSIX paths within the Agent working directory.
 _Avoid_: message transcript, tool trace
@@ -199,6 +203,10 @@ _Avoid_: checkpoint internals, message transcript, tool trace
 **Tool-calling model**:
 A LangChain chat model configured for an OpenAI-compatible provider that can request tools from an MCP tool set during Step execution.
 _Avoid_: text stream, planner model
+
+**Completion judge**:
+A tool-free Model role that evaluates available execution evidence against completion criteria and returns a locally validated judgment. The host alone records criterion progress from that judgment.
+_Avoid_: Tool-calling model, Runtime-context Observation
 
 **Tool-call batch**:
 All function calls emitted in one response by a Tool-calling model. An Executor starts every call in the batch concurrently, waits until every call has settled, and returns their results in request order before continuing the Step execution.
@@ -217,7 +225,7 @@ The Runtime-context presentation of permanent-raw native `grep` and `read_file` 
 _Avoid_: raw-result compaction, observation
 
 **Observation**:
-A schema-validated, concise historical record generated asynchronously for one successful observation-class Tool call. It records the call's Tool round, tool-call ID, evidence, and decision impact; an impact-positive Observation replaces its Raw tool result, while an impact-negative call retains Raw evidence through its existing window and then leaves Runtime context. A failed Tool call never starts an Observation request and remains Raw evidence.
+A schema-validated, concise historical record generated asynchronously for a successful observation-class Tool call. It records the call's Tool round, tool-call ID, evidence, and decision impact; an impact-positive Observation replaces its Raw tool result, while an impact-negative call retains Raw evidence through its existing window and then leaves Runtime context. ReAct observes successful calls individually; Plan-step execution suppresses every Observation request for a batch if any call in that batch failed. Failed calls remain Raw evidence.
 _Avoid_: raw tool output, durable fact
 
 **Observation decision impact**:
@@ -229,7 +237,7 @@ A transient diagnostic record for one asynchronous Observation attempt. It ident
 _Avoid_: Observation, durable task record
 
 **Tool-call evidence policy**:
-The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest Tool round; `grep` and `read_file` retain raw evidence for the whole invocation; successful observation-class calls use asynchronous decision-impact Observations with Raw tool-result fallback, while failed calls remain Raw and never invoke the Runtime-context component.
+The per-call rule that selects raw evidence, an Observation, or no retained evidence for a Runtime context window. `list_dir` and `glob` retain raw evidence only for the newest Tool round; `grep` and `read_file` retain raw evidence for the whole invocation; successful observation-class calls use asynchronous decision-impact Observations with Raw tool-result fallback. Failed calls remain Raw and never invoke the Runtime-context component; in Plan-step execution, any failed call also suppresses judge and Observation requests for the full batch.
 _Avoid_: round-level context policy, universal observation policy
 
 **Exec command class**:

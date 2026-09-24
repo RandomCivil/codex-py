@@ -56,6 +56,11 @@ class _ExecutorModel:
                         }
                     ],
                 ),
+                AIMessage(content=(
+                    "BEGIN STEP_COMPLETION_PROGRESS\nALL_COMPLETED=true\n"
+                    "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"the note was written\"\n"
+                    "END COMPLETED_CRITERION\nEND STEP_COMPLETION_PROGRESS"
+                )),
                 AIMessage(content="Written"),
             )
         )
@@ -127,8 +132,7 @@ def test_executor_observation_receives_the_current_plan_step_decision_summary(mo
         "completion_criterion": "Released",
         "tool": {"name": "write_file", "arguments": {"path": "note.md"}},
     }
-    assert "the note was written" in executor_model.requests[1][-1].content
-    assert '"wrote note.md"' not in executor_model.requests[1][-1].content
+    assert '"raw_result": "wrote note.md"' in executor_model.requests[1][-1].content
     assert outcome.context_update == ContextUpdate()
     assert state.goal == "Prepare release"
 

@@ -105,6 +105,7 @@ def test_react_round_five_uses_raw_fallback_for_pending_round_one():
 class _ExecutorRoundModel:
     def __init__(self):
         self.calls = []
+        self.operational_calls = []
 
     def bind_tools(self, tools, **kwargs):
         return self
@@ -114,8 +115,24 @@ class _ExecutorRoundModel:
 
     async def ainvoke(self, messages):
         self.calls.append(list(messages))
-        if len(self.calls) <= 5:
-            round_number = len(self.calls)
+        system = messages[0].content if messages and hasattr(messages[0], "content") else ""
+        if "tool-free completion judge" in system:
+            completed = len(self.operational_calls) >= 5
+            return AIMessage(content=(
+                "BEGIN STEP_COMPLETION_PROGRESS\n"
+                f"ALL_COMPLETED={'true' if completed else 'false'}\n"
+                + (
+                    "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"five results checked\"\n"
+                    "END COMPLETED_CRITERION\n"
+                    if completed else ""
+                )
+                + "END STEP_COMPLETION_PROGRESS"
+            ))
+        if "completed by host-validated evidence" in system:
+            return AIMessage(content="The five tool rounds completed.")
+        self.operational_calls.append(list(messages))
+        if len(self.operational_calls) <= 5:
+            round_number = len(self.operational_calls)
             return AIMessage(
                 content="",
                 tool_calls=[
@@ -173,7 +190,7 @@ def test_plan_step_executor_round_five_uses_the_same_raw_fallback_window(monkeyp
 
     assert outcome.execution.status == "completed", outcome.execution.error
     assert context_model.started.is_set()
-    fifth_context = model.calls[4][1].content
+    fifth_context = model.operational_calls[4][1].content
     assert [f"#### Round {round_number}" in fifth_context for round_number in range(1, 5)] == [
         True,
         True,

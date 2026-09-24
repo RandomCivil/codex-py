@@ -10,6 +10,7 @@ from llm.line_protocol import (
     decode_no_tool,
     decode_plan,
     decode_completion_progress,
+    decode_step_completion_progress,
     decode_step_completion,
     normalize_no_tool,
     parse_line_protocol,
@@ -33,6 +34,28 @@ END PLAN'''
     assert plan.goal == "Prepare release"
     assert plan.steps[0].id == "inspect"
     assert plan.steps[0].intent == "Inspect the release"
+
+
+def test_plan_protocol_accepts_lowercase_and_underscore_boundaries():
+    document = (
+        'begin_plan\nrevision=1\ngoal="将功能,特性更新到readme.md"\n'
+        'BEGIN_STEP\nid="check_readme_exists"\nintent="Check README"\n'
+        'completion_criterion="README content is known"\nEND_STEP\nend_plan'
+    )
+
+    plan = decode_plan(document, goal="将功能,特性更新到readme.md", expected_revision=1)
+
+    assert plan.steps[0].id == "check_readme_exists"
+
+
+def test_line_protocol_still_rejects_mismatched_case_normalized_boundaries():
+    with pytest.raises(LineProtocolError, match="mismatched block boundary"):
+        parse_line_protocol("begin_plan\nend_step")
+
+
+def test_line_protocol_rejects_duplicate_fields_across_letter_case():
+    with pytest.raises(LineProtocolError, match="repeated non-array field"):
+        parse_line_protocol('begin_answer\ntext="first"\nTEXT="second"\nend_answer')
 
 
 def test_line_protocol_normalizes_crlf_and_rejects_unexpected_fields():
@@ -154,3 +177,30 @@ def test_planner_rejects_malformed_protocol():
 
     with pytest.raises(PlanningValidationError):
         asyncio.run(Planner(Completion()).plan(AgentState("Prepare release")))
+
+
+def test_step_completion_progress_accepts_pending_without_an_answer():
+    document = "BEGIN STEP_COMPLETION_PROGRESS\nALL_COMPLETED=false\nEND STEP_COMPLETION_PROGRESS"
+
+    assert decode_step_completion_progress(document) == ((), False)
+
+
+def test_step_completion_progress_accepts_only_criterion_one_with_evidence():
+    document = (
+        "BEGIN STEP_COMPLETION_PROGRESS\nALL_COMPLETED=true\n"
+        "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"artifact exists\"\n"
+        "END COMPLETED_CRITERION\nEND STEP_COMPLETION_PROGRESS"
+    )
+
+    assert decode_step_completion_progress(document) == (((1, "artifact exists"),), True)
+
+
+def test_step_completion_progress_rejects_final_answer():
+    document = (
+        "BEGIN STEP_COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER=\"done\"\n"
+        "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"artifact exists\"\n"
+        "END COMPLETED_CRITERION\nEND STEP_COMPLETION_PROGRESS"
+    )
+
+    with pytest.raises(LineProtocolError):
+        decode_step_completion_progress(document)

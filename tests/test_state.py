@@ -126,3 +126,20 @@ def test_agent_state_round_trips_through_the_graph_state_adapter():
         ],
     }
     assert deserialize_agent_state(encoded) == state
+
+
+def test_completed_step_round_trips_its_host_validated_completion_evidence():
+    plan = Plan(1, "Publish", (PlanStep("publish", "Publish", "Artifact is available"),))
+    execution = StepExecution(
+        1,
+        "publish",
+        "completed",
+        result="Published.",
+        completion_evidence="The artifact URL responds successfully.",
+    )
+
+    restored = deserialize_agent_state(
+        serialize_agent_state(AgentState("Publish", plan_history=(plan,), step_executions=(execution,)))
+    )
+
+    assert restored.step_executions == (execution,)

@@ -8,9 +8,15 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
+from llm.line_protocol import LineProtocolError, decode_step_completion_progress
 
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
-from agent.runtime_context import RuntimeContextPolicy, observation_decision_context
+from agent.runtime_context import (
+    RawToolResult,
+    RuntimeContext,
+    RuntimeContextPolicy,
+    observation_decision_context,
+)
 from agent.model_request import tool_request_shape, trace_llm_request
 from agent.tool_binding import canonical_mcp_tool_set
 from agent.tool_results import tool_result_failed
@@ -22,6 +28,10 @@ class ExecutorGraphState(MessagesState, total=False):
 
 class PersistenceError(RuntimeError):
     """A checkpointed execution cannot safely continue after an unhandled failure."""
+
+
+class CompletionJudgeProviderError(RuntimeError):
+    """The completion judge provider failed, so this Step must fail closed."""
 
 
 class Executor:
@@ -105,7 +115,8 @@ class Executor:
         self._session = None
         self._tools = None
         self._bound_model = None
-        self._graph = None
+        self._tool_node = None
+        self._tool_graph = None
         self._active = False
 
     async def __aenter__(self) -> "Executor":
@@ -123,7 +134,8 @@ class Executor:
             self._session = None
             self._tools = None
             self._bound_model = None
-            self._graph = None
+            self._tool_node = None
+            self._tool_graph = None
             self._active = False
 
     # one plan step execution
@@ -163,6 +175,8 @@ class Executor:
             graph_result = await self._execute_with_tools(
                 state, revision, step, step_context, recovery=recovery, attempt=attempt
             )
+        except CompletionJudgeProviderError as error:
+            return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"completion judge failed: {error}"))
         except Exception as error:
             if self._checkpointer is not None:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
@@ -177,6 +191,8 @@ class Executor:
         step_id: str,
     ) -> ExecutionOutcome:
         try:
+            if graph_result.get("error"):
+                return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=graph_result["error"]))
             operational_final = graph_result["messages"][-1]
             if isinstance(operational_final, AIMessage) and operational_final.tool_calls:
                 return ExecutionOutcome(StepExecution(revision, step_id, "failed", error="tool round budget exhausted"))
@@ -199,7 +215,13 @@ class Executor:
                     },
                 )
             return ExecutionOutcome(
-                StepExecution(revision, step_id, "completed", result=handoff),
+                StepExecution(
+                    revision,
+                    step_id,
+                    "completed",
+                    result=handoff,
+                    completion_evidence=graph_result.get("completion_evidence"),
+                ),
                 ContextUpdate(),
             )
         except Exception as error:
@@ -217,6 +239,7 @@ class Executor:
         recovery: bool = False,
         attempt: int | None = None,
     ) -> dict[str, Any]:
+        """Run operational rounds, judging each settled batch at the host boundary."""
         if self._tools is None:
             self._client = MultiServerMCPClient({"atom": self._connection})
             self._session = self._client.session("atom")
@@ -225,33 +248,102 @@ class Executor:
             if self._tool_allowlist is not None:
                 tools = [tool for tool in tools if tool.name in self._tool_allowlist]
             self._tools = canonical_mcp_tool_set(tools)
-            # MCP hosts do not promise OpenAI's strict function-tool schema, so
-            # operational tool use remains non-strict.
             self._bound_model = self._model.bind_tools(self._tools)
-            # Tool errors are part of the model/tool conversation: a bad argument or
-            # an MCP error must be returned to the model so it can correct its next
-            # call, rather than aborting this Step and causing top-level replanning.
-            tool_node = ToolNode(self._tools, handle_tool_errors=True)
-        else:
-            tool_node = ToolNode(self._tools, handle_tool_errors=True)
-
-        async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
-            request = state["messages"]
+            # Preserve the accepted model → ToolNode → model boundary. ToolNode
+            # owns MCP invocation and returns recoverable failures as ToolMessages.
+            self._tool_node = ToolNode(self._tools, handle_tool_errors=True)
+            tool_graph = StateGraph(ExecutorGraphState)
+            tool_graph.add_node("tools", self._tool_node)
+            tool_graph.add_edge(START, "tools")
+            tool_graph.add_edge("tools", END)
+            self._tool_graph = tool_graph.compile()
+        messages: list[BaseMessage] = [
+            SystemMessage(content=self._INSTRUCTIONS),
+            HumanMessage(content=json.dumps(_request_payload(state, revision, step), sort_keys=True)),
+            HumanMessage(content=_format_step_context(step_context or StepContext())),
+        ]
+        if recovery:
+            messages.insert(
+                1,
+                HumanMessage(content=(
+                    "## Recovery attempt\n\n"
+                    "This is a fresh execution attempt after an earlier attempt was interrupted. "
+                    "The earlier attempt's messages and tool output are unconfirmed and are not facts. "
+                    "Inspect and reconcile the current external state before taking action, then pursue "
+                    "the original Plan step completion criterion."
+                )),
+            )
+        if self._checkpointer is not None:
+            thread_id = self._thread_id
+            if thread_id is None and self._run_id is not None:
+                selected_attempt = attempt if attempt is not None else self._attempt
+                suffix = f":a{selected_attempt}" if selected_attempt is not None else ""
+                thread_id = f"{self._run_id}:r{revision}:s{step.id}{suffix}"
+            if thread_id is not None:
+                await self._checkpoint_running({"configurable": {"thread_id": thread_id}})
+        self._rounds = 0
+        criterion_completed = False
+        completion_evidence: str | None = None
+        failed_tool_results: list[dict[str, Any]] = []
+        pending_messages: list[BaseMessage] = []
+        while True:
+            if criterion_completed:
+                handoff_request = [
+                    SystemMessage(content=(
+                        "The selected Plan step completion criterion is completed by host-validated "
+                        "evidence. Return a concise, nonempty final Step handoff. Do not call tools."
+                    )),
+                    HumanMessage(content=_step_criterion_status(step, True)),
+                ]
+                handoff_model = self._model.bind_tools(())
+                for handoff_attempt in range(2):
+                    trace_llm_request(
+                        self._trace,
+                        "executor",
+                        handoff_request,
+                        static_shape={
+                            "instructions": handoff_request[0].content,
+                            "tools": None,
+                            "request_kind": "step_handoff" if handoff_attempt == 0 else "step_handoff_repair",
+                        },
+                    )
+                    handoff = await handoff_model.ainvoke(handoff_request)
+                    _trace_llm_response(self._trace, handoff)
+                    valid_handoff = (
+                        not getattr(handoff, "tool_calls", None)
+                        and isinstance(getattr(handoff, "content", None), str)
+                        and handoff.content.strip()
+                    )
+                    if valid_handoff:
+                        return {"messages": [handoff], "completion_evidence": completion_evidence}
+                    if handoff_attempt == 0:
+                        handoff_request = [
+                            *handoff_request,
+                            HumanMessage(content=(
+                                "The previous handoff was invalid: return nonempty text only, "
+                                "without native tool calls. Re-state the completed Plan-step handoff. "
+                                f"Rejected response: {json.dumps(_message_reference(handoff), ensure_ascii=False, default=str)}"
+                            )),
+                        ]
+                return {
+                    "messages": [AIMessage(content="")],
+                    "error": "model did not return a final text response",
+                    "completion_evidence": completion_evidence,
+                }
+            status = _step_criterion_status(step, criterion_completed)
+            request = list(messages)
             if self._active_context_policy is not None:
                 self._active_context_policy.record_model_use()
                 context = await self._active_context_policy.maintain(self._active_durable_state)
-                trailing_tool_messages: list[ToolMessage] = []
-                for previous in reversed(state["messages"]):
-                    if not isinstance(previous, ToolMessage):
-                        break
-                    if getattr(previous, "status", None) == "error":
-                        trailing_tool_messages.append(previous)
-                trailing_tool_messages.reverse()
                 request = [
                     SystemMessage(content=self._INSTRUCTIONS),
-                    *context.as_messages(),
-                    *trailing_tool_messages,
+                    *context.as_messages(completion_criteria_status=status),
+                    *pending_messages,
                 ]
+            else:
+                request.append(HumanMessage(content="Completion criterion status:\n" + status))
+                request.extend(pending_messages)
+            pending_messages = []
             trace_llm_request(
                 self._trace,
                 "executor",
@@ -262,129 +354,205 @@ class Executor:
                     "request_kind": "tool_round",
                 },
             )
-            message = await self._bound_model.ainvoke(request)
-            message = self._with_tool_cwd(message)
-            if self._trace is not None and isinstance(message, AIMessage):
-                self._trace.llm_response(message)
-                if message.content:
-                    self._trace.llm_text("output", message.content)
-            calls = list(getattr(message, "tool_calls", []) or [])
-            # LangGraph's ToolNode requires an AI tool-call message without
-            # content. Preserve the provider response in tracing above, then
-            # normalize the graph-facing message so accompanying prose never
-            # prevents a valid native tool call from running.
-            if calls and isinstance(message, AIMessage):
-                message = message.model_copy(update={"content": ""})
-            # Native tool calls are authoritative. When no native call exists,
-            # the model's text is the completed Plan-step handoff.
-            if isinstance(message, AIMessage) and message.tool_calls:
+            response = await self._bound_model.ainvoke(request)
+            response = self._with_tool_cwd(response)
+            _trace_llm_response(self._trace, response)
+            calls = list(getattr(response, "tool_calls", []) or [])
+            if calls:
+                if criterion_completed:
+                    return {"messages": [AIMessage(content="")], "completion_evidence": completion_evidence, "error": "tool call after completion"}
                 self._rounds += 1
                 if self._trace is not None:
-                    for call in message.tool_calls:
+                    for call in calls:
                         self._trace.tool_call(call.get("name", "unknown"), call.get("args", {}), call.get("id"))
-            return {"messages": [message]}
-
-        def route(state: MessagesState) -> str:
-            last = state["messages"][-1]
-            if not isinstance(last, AIMessage) or not last.tool_calls:
-                return END
-            return "tools" if self._rounds <= self._max_rounds else END
-
-        def route_after_tools(state: MessagesState) -> str:
-            return "model"
-
-        graph = StateGraph(ExecutorGraphState)
-        async def mark_running(state: ExecutorGraphState) -> ExecutorGraphState:
-            step = self._active_step
-            revision = self._active_revision
-            return {
-                "execution": StepExecution(revision, step.id, "running")
-            }
-
-        graph.add_node("model", call_model)
-        graph.add_node("mark_running", mark_running)
-        async def call_tools(state: MessagesState) -> dict[str, list[BaseMessage]]:
-            try:
-                result = await tool_node.ainvoke(state)
-            except Exception as error:
-                last = state["messages"][-1]
-                messages = [
-                    ToolMessage(
-                        content=f"MCP tool failed: {error}",
-                        tool_call_id=str(call.get("id") or "unknown"),
-                        name=str(call.get("name") or "unknown"),
-                        status="error",
-                    )
-                    for call in getattr(last, "tool_calls", [])
+                operational_response = response
+                graph_response = response.model_copy(update={"content": ""}) if isinstance(response, AIMessage) else response
+                results = await self._settle_tool_batch(graph_response)
+                for message in results:
+                    if isinstance(message, ToolMessage) and self._trace is not None:
+                        self._trace.tool_result(getattr(message, "name", "unknown"), message.content, error=_tool_error(message) is not None)
+                pending_messages = [
+                    message for message in results
+                    if isinstance(message, ToolMessage) and _tool_error(message) is not None
                 ]
-                if self._trace is not None:
-                    for call in getattr(last, "tool_calls", []):
-                        self._trace.tool_result(
-                            call.get("name", "unknown"),
-                            str(error),
-                            error=True,
-                        )
-                # A tool failure is actionable model context, not a reason for
-                # the Executor to end this step and make the Agent replan.
+                failed_tool_results.extend(_failed_tool_evidence(calls, results))
+                completion_context: list[BaseMessage] = []
                 if self._active_context_policy is not None:
-                    await self._record_executor_round(state["messages"][-1], messages)
-                return {"messages": messages}
-            messages = [
-                _as_error_tool_message(message)
-                for message in result.get("messages", [])
-            ]
-            for message in messages:
-                if isinstance(message, ToolMessage) and self._trace is not None:
-                    self._trace.tool_result(
-                        getattr(message, "name", "unknown"),
-                        message.content,
-                        error=_tool_error(message) is not None,
+                    await self._record_executor_round(operational_response, results)
+                    # The settled batch is part of the Runtime context before
+                    # its evidence can be trusted by the completion judge.
+                    # Refuse to judge when that required context cannot fit;
+                    # silently dropping evidence could produce false completion.
+                    settled_context = await self._active_context_policy.maintain(self._active_durable_state)
+                    completion_context = _completion_context_messages(settled_context)
+                successful = [message for message in results if _tool_error(message) is None]
+                if successful and not any(_tool_error(message) is not None for message in results):
+                    judged = await self._judge_step_completion(
+                        step, request, completion_context, operational_response, calls, results,
+                        criterion_completed,
+                        failed_tool_results,
                     )
+                    if judged is not None:
+                        criterion_completed, completion_evidence = True, judged
+                        continue
+                if self._rounds >= self._max_rounds:
+                    return {"messages": [AIMessage(content="")], "error": "tool round budget exhausted"}
+                if self._active_context_policy is None:
+                    messages.extend([graph_response, *results])
+                continue
+
+            completion_context = []
             if self._active_context_policy is not None:
-                await self._record_executor_round(state["messages"][-1], messages)
-            return {**result, "messages": messages}
-
-        graph.add_node("tools", call_tools)
-        graph.add_edge(START, "mark_running")
-        graph.add_edge("mark_running", "model")
-        graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
-        graph.add_conditional_edges("tools", route_after_tools, {"model": "model", END: END})
-        if self._graph is None:
-            # Tool messages are transient Runtime context.  The checkpointed
-            # graph therefore deliberately has no saver; only the tiny
-            # pre-work marker below is persisted for recovery diagnostics.
-            self._graph = graph.compile(checkpointer=None)
-
-        messages: list[BaseMessage] = [
-            SystemMessage(content=self._INSTRUCTIONS),
-            HumanMessage(content=json.dumps(_request_payload(state, revision, step), sort_keys=True)),
-            HumanMessage(content=_format_step_context(step_context or StepContext())),
-        ]
-        if recovery:
-            messages.insert(
-                1,
-                HumanMessage(
-                    content=(
-                        "## Recovery attempt\n\n"
-                        "This is a fresh execution attempt after an earlier attempt was interrupted. "
-                        "The earlier attempt's messages and tool output are unconfirmed and are not facts. "
-                        "Inspect and reconcile the current external state before taking action, then pursue "
-                        "the original Plan step completion criterion."
-                    )
-                ),
+                completion_context = _completion_context_messages(
+                    await self._active_context_policy.maintain(self._active_durable_state)
+                )
+            judged = await self._judge_step_completion(
+                step, request, completion_context, response, (), (), criterion_completed,
+                failed_tool_results,
             )
-        self._rounds = 0
-        config = None
-        thread_id = self._thread_id
-        if thread_id is None and self._run_id is not None:
-            selected_attempt = attempt if attempt is not None else self._attempt
-            suffix = f":a{selected_attempt}" if selected_attempt is not None else ""
-            thread_id = f"{self._run_id}:r{revision}:s{step.id}{suffix}"
-        if thread_id is not None:
-            config = {"configurable": {"thread_id": thread_id}}
-        if self._checkpointer is not None and config is not None:
-            await self._checkpoint_running(config)
-        return await self._graph.ainvoke({"messages": messages}, config=config)
+            if judged is not None:
+                criterion_completed, completion_evidence = True, judged
+                continue
+            self._rounds += 1
+            if self._rounds >= self._max_rounds:
+                return {"messages": [AIMessage(content="")], "error": "tool round budget exhausted"}
+            pending_messages = [HumanMessage(content=(
+                "The selected completion criterion is still pending. Continue with the available tools "
+                "and address the remaining gap."
+            ))]
+
+    async def _judge_step_completion(
+        self,
+        step: PlanStep,
+        request: list[BaseMessage],
+        runtime_context: list[BaseMessage],
+        response: BaseMessage,
+        calls: list[dict[str, Any]],
+        results: list[BaseMessage],
+        completed: bool,
+        prior_failed_tool_results: list[dict[str, Any]],
+    ) -> str | None:
+        evidence = {
+            "selected_step": {
+                "id": step.id,
+                "intent": step.intent,
+                "completion_criterion": step.completion_criterion,
+            },
+            "criterion_status": "completed" if completed else "pending",
+            "operational_request": [_message_reference(item) for item in request],
+            "runtime_context_snapshot": [_message_reference(item) for item in runtime_context],
+            "operational_response": _message_reference(response),
+            "successful_tool_results": [
+                {
+                    "tool_call_id": str(call.get("id") or "unknown"),
+                    "name": str(call.get("name") or "unknown"),
+                    "arguments": call.get("args", {}),
+                    "raw_result": message.content,
+                }
+                for call, message in zip(calls, results)
+                if _tool_error(message) is None
+            ],
+            "failed_tool_results": prior_failed_tool_results,
+        }
+        instructions = (
+            "You are a tool-free completion judge for one Plan step. Evaluate only the selected "
+            "completion criterion against the supplied execution evidence. Only "
+            "runtime_context_snapshot and successful_tool_results are evidentiary; "
+            "operational_request and failed_tool_results are provenance or correction context and "
+            "must never establish completion. Return exactly one "
+            "STEP_COMPLETION_PROGRESS block. Report ALL_COMPLETED=false with no child when the "
+            "criterion is not directly proven. Report ALL_COMPLETED=true only with one "
+            "COMPLETED_CRITERION numbered 1 and concise directly checkable EVIDENCE. Do not "
+            "return ANSWER or prose. Use Line Protocol boundary lines and FIELD=JSON_LITERAL "
+            "scalar lines exactly as shown below; do not use XML tags, JSON objects, Markdown "
+            "fences, or a colon in place of an equals sign.\n\n"
+            "Example when the criterion is not proven:\n"
+            "BEGIN STEP_COMPLETION_PROGRESS\n"
+            "ALL_COMPLETED=false\n"
+            "END STEP_COMPLETION_PROGRESS\n\n"
+            "Example when successful evidence directly proves the criterion:\n"
+            "BEGIN STEP_COMPLETION_PROGRESS\n"
+            "ALL_COMPLETED=true\n"
+            "BEGIN COMPLETED_CRITERION\n"
+            "NUMBER=1\n"
+            'EVIDENCE="The successful tool result confirms the artifact exists."\n'
+            "END COMPLETED_CRITERION\n"
+            "END STEP_COMPLETION_PROGRESS\n\n"
+            "Replace the example evidence with a concise fact from this request. "
+            "Return only the applicable block."
+        )
+        context = [
+            SystemMessage(content=instructions),
+            HumanMessage(content=json.dumps(evidence, ensure_ascii=False, sort_keys=True, default=str)),
+        ]
+        judge_model = self._model.bind_tools(())
+        trace_llm_request(
+            self._trace,
+            "completion_judge",
+            context,
+            static_shape={"instructions": instructions, "tools": None, "request_kind": "completion_judge"},
+        )
+        try:
+            judged = await judge_model.ainvoke(context)
+        except Exception as error:
+            raise CompletionJudgeProviderError(str(error) or "provider request failed") from error
+        _trace_llm_response(self._trace, judged, component="completion_judge")
+        try:
+            progress, all_completed = decode_step_completion_progress(
+                _message_text(judged), completed=completed
+            )
+            if all_completed:
+                return progress[0][1]
+            return None
+        except LineProtocolError as error:
+            if self._trace is not None:
+                self._trace.llm_validation_retry("completion_judge", error)
+            repair = [
+                *context,
+                HumanMessage(content=(
+                    f"Validation error: {error}\nRejected output (JSON-encoded): "
+                    f"{json.dumps(_message_text(judged), ensure_ascii=False)}\n"
+                    "Return the corrected STEP_COMPLETION_PROGRESS block only."
+                )),
+            ]
+            trace_llm_request(
+                self._trace,
+                "completion_judge",
+                repair,
+                static_shape={"instructions": instructions, "tools": None, "request_kind": "completion_judge_repair"},
+            )
+            try:
+                repaired = await judge_model.ainvoke(repair)
+            except Exception as error:
+                raise CompletionJudgeProviderError(str(error) or "provider repair request failed") from error
+            _trace_llm_response(self._trace, repaired, component="completion_judge")
+            try:
+                progress, all_completed = decode_step_completion_progress(
+                    _message_text(repaired), completed=completed
+                )
+                return progress[0][1] if all_completed else None
+            except LineProtocolError:
+                return None
+    async def _settle_tool_batch(self, response: BaseMessage) -> list[BaseMessage]:
+        """Run one model-selected batch through the Executor's ToolNode boundary."""
+        try:
+            result = await self._tool_graph.ainvoke({"messages": [response]})
+        except Exception as error:
+            calls = getattr(response, "tool_calls", []) or []
+            return [
+                ToolMessage(
+                    content=f"MCP tool failed: {error}",
+                    tool_call_id=str(call.get("id") or "unknown"),
+                    name=str(call.get("name") or "unknown"),
+                    status="error",
+                )
+                for call in calls
+            ]
+        return [
+            _as_error_tool_message(message)
+            for message in result.get("messages", [])
+            if isinstance(message, ToolMessage)
+        ]
 
     async def _checkpoint_running(self, config: dict[str, Any]) -> None:
         graph = StateGraph(ExecutorGraphState)
@@ -423,6 +591,7 @@ class Executor:
                 },
                 completion_criterion=step.completion_criterion,
             ),
+            suppress_observations=any(_tool_error(message) is not None for message in results),
         )
 
     def _require_active(self) -> None:
@@ -485,6 +654,7 @@ def _request_payload(state: AgentState, revision: int, step: PlanStep) -> dict[s
                 "status": execution.status,
                 "result": execution.result,
                 "error": execution.error,
+                "completion_evidence": execution.completion_evidence,
             }
             for execution in state.step_executions
         ],
@@ -529,6 +699,70 @@ def _format_step_context(context: StepContext) -> str:
             section("Observations", context.observations),
         )
     )
+
+
+def _step_criterion_status(step: PlanStep, completed: bool) -> str:
+    return f"1. [{'completed' if completed else 'pending'}] {step.completion_criterion}"
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _message_reference(message: Any) -> dict[str, Any]:
+    reference = {
+        "message_type": getattr(message, "type", type(message).__name__),
+        "content": _message_text(message),
+    }
+    for attribute in ("tool_calls", "tool_call_id", "name", "status"):
+        value = getattr(message, attribute, None)
+        if value is not None:
+            reference[attribute] = value
+    return reference
+
+
+def _completion_context_messages(context: RuntimeContext) -> list[BaseMessage]:
+    """Render a settled Runtime snapshot without failed calls as evidence."""
+    evidence_only = RuntimeContext(
+        context.durable_state,
+        context.observations,
+        tuple(
+            RawToolResult(item.round, tuple(call for call in item.calls if call.error is None))
+            for item in context.raw_tool_results
+            if any(call.error is None for call in item.calls)
+        ),
+    )
+    return evidence_only.as_messages()
+
+
+def _failed_tool_evidence(calls: list[dict[str, Any]], results: list[BaseMessage]) -> list[dict[str, Any]]:
+    return [
+        {
+            "tool_call_id": str(call.get("id") or "unknown"),
+            "name": str(call.get("name") or "unknown"),
+            "error": _tool_error(message),
+        }
+        for call, message in zip(calls, results)
+        if _tool_error(message) is not None
+    ]
+
+
+def _trace_llm_response(trace: Any | None, response: Any, *, component: str | None = None) -> None:
+    if trace is None:
+        return
+    callback = getattr(trace, "llm_response", None)
+    if callback is None:
+        return
+    if component is None:
+        callback(response)
+    else:
+        try:
+            callback(response, component=component)
+        except TypeError:
+            callback(response)
 
 
 def _tool_error(message: BaseMessage) -> str | None:

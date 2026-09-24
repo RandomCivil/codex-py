@@ -62,6 +62,7 @@ class StepExecution:
     status: ExecutionStatus
     result: str | None = None
     error: str | None = None
+    completion_evidence: str | None = None
 
     def __post_init__(self) -> None:
         _require_revision(self.revision, "step execution revision")
@@ -72,6 +73,10 @@ class StepExecution:
             raise TypeError("step execution result must be a string or None")
         if self.error is not None and not isinstance(self.error, str):
             raise TypeError("step execution error must be a string or None")
+        if self.completion_evidence is not None and not isinstance(self.completion_evidence, str):
+            raise TypeError("step completion evidence must be a string or None")
+        if self.status == "completed" and self.completion_evidence is not None and not self.completion_evidence.strip():
+            raise ValueError("completed step evidence must be non-empty")
 
 
 def _context_paths(values: tuple[str, ...] | list[str], field: str) -> tuple[str, ...]:
@@ -216,6 +221,11 @@ def serialize_agent_state(state: AgentState) -> dict[str, Any]:
                 "status": execution.status,
                 "result": execution.result,
                 "error": execution.error,
+                **(
+                    {"completion_evidence": execution.completion_evidence}
+                    if execution.status == "completed" and execution.completion_evidence is not None
+                    else {}
+                ),
             }
             for execution in state.step_executions
         ],
@@ -242,6 +252,7 @@ def deserialize_agent_state(payload: dict[str, Any]) -> AgentState:
             item["status"],
             result=item.get("result"),
             error=item.get("error"),
+            completion_evidence=(item.get("completion_evidence") if item["status"] == "completed" else None),
         )
         for item in payload.get("step_executions", [])
     )

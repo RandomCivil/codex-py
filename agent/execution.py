@@ -17,7 +17,7 @@ from agent.model_request import tool_request_shape, trace_llm_context, trace_llm
 from agent.planner import PlanningValidationError
 from llm.llm import LLM
 from llm.text_stream import validated_text, validation_feedback_instructions
-from agent.runtime_context import RuntimeContextPolicy, observation_decision_context
+from agent.runtime_context import RuntimeContext, RuntimeContextPolicy, observation_decision_context
 from agent.tool_binding import canonical_mcp_tool_set
 from agent.tool_results import tool_result_failed
 from llm.line_protocol import CompletionJudgment, LineProtocolError, decode_answer, decode_completion_judgment
@@ -419,6 +419,11 @@ class ReactMode:
                     # the next ReAct tool round.
                     model = self._model.bind_tools(tools)
                     request_messages = list(messages)
+                    completion_status = (
+                        _completion_criteria_status(self._completion_criteria, completed_criteria)
+                        if self._completion_criteria else None
+                    )
+                    criteria_in_runtime_context = False
                     if policy is not None:
                         phase = "runtime context maintenance"
                         policy.record_model_use()
@@ -426,17 +431,22 @@ class ReactMode:
                         # The policy-owned window is the sole historical source
                         # once it is active; old AI/Tool messages must not become
                         # an undocumented second memory channel.
+                        if isinstance(context, RuntimeContext):
+                            context_messages = context.as_messages(
+                                completion_criteria_status=completion_status
+                            )
+                            criteria_in_runtime_context = completion_status is not None
+                        else:
+                            context_messages = context.as_messages()
                         request_messages = [
-                            messages[0], messages[1], *context.as_messages(),
+                            messages[0], messages[1], *context_messages,
                             *pending_messages,
                         ]
-                    if self._completion_criteria:
+                    if completion_status is not None and not criteria_in_runtime_context:
                         request_messages.append(
                             HumanMessage(
                                 content="Completion criteria status:\n"
-                                + _completion_criteria_status(
-                                    self._completion_criteria, completed_criteria
-                                )
+                                + completion_status
                             )
                         )
                     trace_llm_request(

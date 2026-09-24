@@ -409,7 +409,7 @@ def test_runtime_context_renders_as_prompt_sections():
     prompt = context.as_messages()[0].content
 
     assert "### Durable state\n{}" in prompt
-    assert "### Observations\n- (none)" in prompt
+    assert "### Observations\n- Confirmed facts:\n  - (none)\n- Reported errors:\n  - (none)\n- Model inferences:\n  - (none)" in prompt
     assert "### Raw tool results\n- (none)" in prompt
     assert prompt.endswith('### Goal\n"inspect"')
 
@@ -437,13 +437,13 @@ def test_native_read_results_are_grouped_by_file_across_rounds_in_request_order(
 
     assert "#### File: src/app.py" in prompt
     assert prompt.index("#### File: src/app.py") < prompt.index("#### File: README.md")
-    assert prompt.index("app round 1") < prompt.index("app round 2")
-    assert "tool_call_id=call-1" in prompt
-    assert "tool_call_id=call-2b" in prompt
-    assert "#### Round 1\n- Native read evidence is grouped below by file." in prompt
+    assert "```text\napp round 1\n```\n```text\napp round 2\n```" in prompt
+    assert "tool_call_id=call-1" not in prompt
+    assert "tool_call_id=call-2b" not in prompt
+    assert "#### Round 1" not in prompt
 
 
-def test_non_native_results_keep_their_round_order_before_grouped_native_reads():
+def test_non_native_results_keep_their_round_order_after_grouped_native_reads():
     policy = RuntimeContextPolicy(ObservationModel({}))
 
     async def run():
@@ -465,10 +465,10 @@ def test_non_native_results_keep_their_round_order_before_grouped_native_reads()
     prompt = policy.assemble({}).as_messages()[0].content
 
     assert '- result: "directory contents"' not in prompt
-    assert "#### Round 1\n- Native read evidence is grouped below by file." in prompt
+    assert "#### Round 1\n- Native read evidence is grouped below by file." not in prompt
     assert "#### Round 2" in prompt
-    assert prompt.index("#### Round 2") < prompt.index("#### File: src/app.py")
-    assert prompt.index("app contents") > prompt.index("#### File: src/app.py")
+    assert prompt.index("#### File: src/app.py") < prompt.index("#### Round 2")
+    assert prompt.index("app contents") < prompt.index("#### Round 2")
 
 
 def test_native_grep_results_split_path_prefixed_matches_into_file_groups():
@@ -478,7 +478,7 @@ def test_native_grep_results_split_path_prefixed_matches_into_file_groups():
         await policy.record_tool_round(
             1,
             [{"id": "grep-1", "name": "grep", "args": {"pattern": "TODO"}}],
-            ["src/app.py:TODO: fix this\nREADME.md:TODO: document this"],
+            ["src/app.py:TODO: fix this\nsrc/app.py:TODO: add coverage\nREADME.md:TODO: document this"],
         )
 
     asyncio.run(run())
@@ -486,8 +486,12 @@ def test_native_grep_results_split_path_prefixed_matches_into_file_groups():
 
     assert "#### File: src/app.py" in prompt
     assert "#### File: README.md" in prompt
-    assert "src/app.py:TODO: fix this" in prompt
-    assert "README.md:TODO: document this" in prompt
+    assert "TODO: fix this" in prompt
+    assert "TODO: add coverage" in prompt
+    assert "TODO: document this" in prompt
+    assert "src/app.py:TODO: fix this" not in prompt
+    assert "README.md:TODO: document this" not in prompt
+    assert "```text\nTODO: fix this\nTODO: add coverage\n```" in prompt
 
 
 def test_native_read_failures_and_unresolvable_results_are_lossless_in_unfiled_group():
@@ -531,8 +535,32 @@ def test_native_grep_with_an_explicit_path_keeps_the_complete_result_in_that_gro
     prompt = policy.assemble({}).as_messages()[0].content
 
     assert "#### File: src/app.py" in prompt
-    assert 'TODO: fix this\\nTODO: add a test' in prompt
+    assert "```text\nTODO: fix this\nTODO: add a test\n```" in prompt
     assert "#### File: (unfiled)" not in prompt
+
+
+def test_observations_render_as_flattened_categories_without_provenance_labels():
+    model = ObservationModel({
+        "round": 1,
+        "confirmed_facts": [
+            {"text": "fact one", "tool_call_ids": ["call-1"]},
+            {"text": "fact two", "tool_call_ids": ["call-1"]},
+        ],
+        "reported_errors": [{"text": "reported issue", "tool_call_ids": ["call-1"]}],
+        "model_inferences": [],
+    })
+    policy = RuntimeContextPolicy(model)
+
+    async def run():
+        await policy.record_tool_round(1, [{"id": "call-1", "name": "search", "args": {}}], ["evidence"])
+        await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert "### Observations\n- Confirmed facts:\n  - fact one\n  - fact two\n- Reported errors:\n  - reported issue\n- Model inferences:\n  - (none)" in prompt
+    assert "#### Round" not in prompt
+    assert "tool_call_id=" not in prompt
 
 
 def test_runtime_context_renders_direct_goal_as_final_section_without_durable_goal():

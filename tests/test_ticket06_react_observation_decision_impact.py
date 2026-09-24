@@ -131,7 +131,7 @@ def test_react_observation_uses_decision_summary_and_replaces_raw_with_positive_
     assert "AFFECTS_CURRENT_DECISION" in context_model.requests[0][0].content
     rendered = model.requests[1][-1].content
     assert "the note was written" in rendered
-    assert "write-1" in rendered
+    assert "write-1" not in rendered
     assert '"written": "note.md"' not in rendered
 
 

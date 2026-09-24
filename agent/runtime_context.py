@@ -161,9 +161,9 @@ class RuntimeContext:
     observations: tuple[Observation, ...]
     raw_tool_results: tuple[RawToolResult, ...]
 
-    def as_messages(self) -> list[HumanMessage]:
+    def as_messages(self, *, completion_criteria_status: str | None = None) -> list[HumanMessage]:
         """Render the policy-owned layers for a model request."""
-        return [HumanMessage(content=_runtime_context_prompt(self))]
+        return [HumanMessage(content=_runtime_context_prompt(self, completion_criteria_status))]
 
 
 class RuntimeContextPolicy:
@@ -681,7 +681,9 @@ def _raw_payload(item: RawToolResult) -> dict[str, Any]:
     return {"round": item.round, "calls": [{"id": call.tool_call_id, "name": call.name, "args": call.arguments, "result": call.result, "error": call.error} for call in item.calls]}
 
 
-def _runtime_context_prompt(context: RuntimeContext) -> str:
+def _runtime_context_prompt(
+    context: RuntimeContext, completion_criteria_status: str | None = None
+) -> str:
     """Render Runtime context as explicit prompt sections instead of one JSON blob."""
     durable_state, goal, steps = _runtime_durable_state_goal_and_steps(context.durable_state)
     sections = [
@@ -692,35 +694,53 @@ def _runtime_context_prompt(context: RuntimeContext) -> str:
         "",
         "### Observations",
     ]
-    if context.observations:
-        for observation in context.observations:
-            source = _observation_source(observation)
-            sections.extend((f"#### Round {observation.round}{source}",))
-            sections.extend(_evidence_section("Confirmed facts", observation.confirmed_facts))
-            sections.extend(_evidence_section("Reported errors", observation.reported_errors))
-            sections.extend(_evidence_section("Model inferences", observation.model_inferences))
-    else:
-        sections.append("- (none)")
+    for title, attribute in (
+        ("Confirmed facts", "confirmed_facts"),
+        ("Reported errors", "reported_errors"),
+        ("Model inferences", "model_inferences"),
+    ):
+        sections.append(f"- {title}:")
+        evidence = [
+            entry
+            for observation in context.observations
+            for entry in getattr(observation, attribute)
+        ]
+        sections.extend(
+            [f"  - {entry.text}" for entry in evidence] or ["  - (none)"]
+        )
 
     sections.extend(("", "### Raw tool results"))
     native_groups, round_results = _group_native_read_results(context.raw_tool_results)
-    for result in round_results:
-        sections.append(f"#### Round {result.round}")
-        if not result.calls:
-            sections.append("- Native read evidence is grouped below by file.")
-        for call in result.calls:
-            sections.extend(_render_raw_call(call, call.result))
     for path, entries in native_groups:
         sections.append(f"#### File: {path}")
-        for round_number, call, result in entries:
-            sections.extend(_render_raw_call(call, result, prefix=f"Round {round_number} "))
-    if not round_results and not native_groups:
+        for _, call, result in entries:
+            if path == "(unfiled)":
+                sections.extend(_render_raw_call(call, result))
+            else:
+                sections.extend(_render_code_block(result))
+    for result in round_results:
+        if not result.calls:
+            continue
+        sections.append(f"#### Round {result.round}")
+        for call in result.calls:
+            sections.extend(_render_raw_call(call, call.result))
+    if not native_groups and not any(result.calls for result in round_results):
         sections.append("- (none)")
 
     sections.extend(("", "### Goal", _prompt_value(goal)))
     if steps is not None:
         sections.extend(("", "### Steps", _prompt_value(steps)))
+    if completion_criteria_status is not None:
+        sections.extend(("", "### Completion criteria", completion_criteria_status))
     return "\n".join(sections)
+
+
+def _render_code_block(value: Any) -> list[str]:
+    text = value if isinstance(value, str) else _prompt_value(value)
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return [f"{fence}text", text, fence]
 
 
 def _render_raw_call(call: RawToolCall, result: Any, *, prefix: str = "") -> list[str]:
@@ -764,13 +784,16 @@ def _native_read_entries(call: RawToolCall) -> list[tuple[str, Any]] | None:
     if call.name == "grep" and isinstance(call.result, str):
         lines = [line for line in call.result.splitlines() if line]
         parsed = [
-            (line.split(":", 1)[0].strip(), line)
+            (line.split(":", 1)[0].strip(), line.split(":", 1)[1])
             for line in lines
             if ":" in line
         ]
         paths = [path for path, _ in parsed]
         if lines and len(paths) == len(lines) and all(paths):
-            return parsed
+            by_path: dict[str, list[str]] = {}
+            for path, content in parsed:
+                by_path.setdefault(path, []).append(content)
+            return [(path, "\n".join(contents)) for path, contents in by_path.items()]
     return None
 
 

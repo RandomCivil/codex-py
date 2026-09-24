@@ -213,7 +213,7 @@ The complete request parameters and result, including an error where present, fo
 _Avoid_: durable tool trace, observation
 
 **File-grouped native-read rendering**:
-The Runtime-context presentation of permanent-raw native `grep` and `read_file` evidence, grouped by resolved file path across Tool rounds with each result kept in round and request order. A call whose path cannot be resolved, or which reports an error, is retained in the `(unfiled)` group with its native request and complete result.
+The Runtime-context presentation of permanent-raw native `grep` and `read_file` evidence, grouped by resolved file path across Tool rounds with each result kept in round and request order. Resolved groups show result content directly; a call whose path cannot be resolved, or which reports an error, is retained in the `(unfiled)` group with its native request and complete result.
 _Avoid_: raw-result compaction, observation
 
 **Observation**:
@@ -237,5 +237,5 @@ The conservative static classification of an `exec` command under the Tool-call 
 _Avoid_: command intent, heuristic safety classification
 
 **Runtime context window**:
-The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. Its rendered Goal is a distinct final section, while the durable goal remains part of Agent state. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
+The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. Its rendered Goal is a distinct section near the end; ReAct Completion criteria status follows it when criteria are available. The durable goal remains part of Agent state. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
 _Avoid_: Durable State, message transcript

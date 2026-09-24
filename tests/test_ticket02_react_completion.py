@@ -3,6 +3,7 @@ import asyncio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent.execution import ExecutionAnswer, ReactMode
+from agent.runtime_context import RuntimeContextPolicy
 from llm.line_protocol import LineProtocolError, decode_completion_progress
 import pytest
 from tests.helpers import Runtime, ToolModel as Model
@@ -145,6 +146,26 @@ def test_premature_answer_with_runtime_context_receives_generic_continuation_fee
     assert "not yet complete" in feedback
     assert "README exists" not in feedback
     assert model.requests[1][-1].content.endswith("[pending] README exists")
+
+
+def test_react_completion_criteria_end_the_runtime_context_prompt():
+    model = Model(AIMessage(content='BEGIN ANSWER\nTEXT="Not yet."\nEND ANSWER'))
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            Runtime(REACT_RESULT),
+            max_rounds=1,
+            context_policy=RuntimeContextPolicy(None),
+            completion_criteria=("README exists",),
+        ).run("Inspect README")
+    )
+
+    assert answer == ExecutionAnswer(None, "failed", error="react round budget exhausted")
+    assert len(model.requests[0]) == 3
+    runtime_prompt = model.requests[0][-1].content
+    assert runtime_prompt.index("### Goal") < runtime_prompt.index("### Completion criteria")
+    assert runtime_prompt.endswith("### Completion criteria\n1. [pending] README exists")
 
 
 def test_completion_progress_accepts_empty_progress_and_new_evidence():

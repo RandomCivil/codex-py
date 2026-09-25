@@ -115,6 +115,8 @@ def test_react_returns_freeform_content_when_no_tool_call_is_present():
     assert answer == ExecutionAnswer("Done\n\n- inspected the components", "completed")
     assert len(model.requests) == 1
     assert "BEGIN NO_TOOL" not in model.requests[0][0].content
+    assert "BEGIN ANSWER" not in model.requests[0][0].content
+    assert "Line Protocol" not in model.requests[0][0].content
     assert "GOAL_COMPLETION" not in model.requests[0][0].content
     assert "requested outcome as the fixed" in model.requests[0][0].content
     assert "completion standard" in model.requests[0][0].content
@@ -183,12 +185,9 @@ def test_react_executes_empty_text_tool_call_with_completion_criteria():
     assert "Inspect the evidence." not in model.requests[0][0].content
 
 
-def test_react_repairs_a_prefixed_final_answer_with_completion_criteria():
+def test_react_accepts_plain_content_without_protocol_repair_with_pending_criteria():
     model = ToolModel(
-        AIMessage(content=(
-            '这是意外输出的正文。\n\nBEGIN ANSWER\nTEXT="已完成。"\nEND ANSWER'
-        )),
-        AIMessage(content='BEGIN ANSWER\nTEXT="已完成。"\nEND ANSWER'),
+        AIMessage(content="已完成。"),
     )
 
     answer = asyncio.run(
@@ -201,9 +200,8 @@ def test_react_repairs_a_prefixed_final_answer_with_completion_criteria():
     )
 
     assert answer == ExecutionAnswer(None, "failed", "react round budget exhausted")
-    assert len(model.requests) == 2
-    assert model.request_tools == [[], ()]
-    assert "Validation error: invalid line or text outside a block" in model.requests[1][0].content
+    assert len(model.requests) == 1
+    assert model.request_tools == [[]]
 
 
 def test_react_ignores_unparseable_tool_call_reasoning_with_completion_criteria():

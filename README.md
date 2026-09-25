@@ -251,7 +251,7 @@ task_analyzer:
   model_name: task-analysis-model
 ```
 
-所有非工具模型响应都使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，预计一步的工具目标使用 tool-agent，长周期工具目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
+需要结构化输出的非工具模型响应使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；ReAct 和 Plan-step Executor 的执行模型返回空 `tool_calls` 时，直接将 `content` 作为当前任务或 Plan step 的答案，不要求 Line Protocol。完成标准的独立 judge 仍使用 Line Protocol；native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，预计一步的工具目标使用 tool-agent，长周期工具目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
 
 每个 provider 配置的 `stream` 必须是 YAML 布尔值，表示该组件是否使用 LLM 流式返回；省略时为 `false`。`stream` 也会参与 run 恢复时的配置兼容性检查。
 

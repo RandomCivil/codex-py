@@ -186,13 +186,12 @@ class RunTrace:
         )
 
     def llm_context(self, context: Any) -> None:
-        """Print the exact request context submitted to a model at info level."""
+        """Print a readable, bounded-depth view of the submitted model context."""
         if self._level != "info":
             return
-        # Keep this as the context's native text representation.  The request
-        # context is a diagnostic transcript, not a data payload: converting it
-        # to sorted JSON obscures the order and formatting that the model saw.
-        self._line(f"[llm context] {context}")
+        for index, line in enumerate(_format_llm_context(context).splitlines() or [""]):
+            label = "[llm context] " if index == 0 else "[llm context]   "
+            self._line(label + line)
 
     def runtime_context_observation(self, outcome: Any) -> None:
         """Report the transient outcome of an asynchronous Observation attempt."""
@@ -283,12 +282,10 @@ class RunTrace:
 
     def tool_result(self, name: str, result: Any, *, error: bool = False) -> None:
         label = "tool result error" if error else "tool result"
-        # Error results contain the information needed to diagnose or correct
-        # the MCP call, so keep their complete payload at every log level.
         if self._level == "error" and not error:
             self._line(f"[{label}] {name}")
             return
-        self._line(f"[{label}] {name} result={_compact(result)}")
+        self._line(f"[{label}] {name} result={_truncate_log_text(_compact(result))}")
 
     def execution_error(
         self,
@@ -335,6 +332,10 @@ def _compact(value: Any) -> str:
     return str(value)
 
 
+def _truncate_log_text(value: str) -> str:
+    return value if len(value) <= 100 else value[:100] + "..."
+
+
 def _as_serializable(value: Any) -> Any:
     """Convert SDK model objects to their complete response payload."""
     model_dump = getattr(value, "model_dump", None)
@@ -352,6 +353,60 @@ def _as_serializable(value: Any) -> Any:
     if hasattr(value, "__dict__"):
         return _as_serializable(vars(value))
     return value
+
+
+def _format_llm_context(value: Any) -> str:
+    """Render nested request messages as indented lines, bounding text leaves."""
+    value = _context_value(value)
+    return "\n".join(_format_context_node(value, 0))
+
+
+def _context_value(value: Any) -> Any:
+    # LangChain messages are objects rather than mappings. Expose their useful
+    # prompt fields directly and retain message order at the outer list.
+    if hasattr(value, "content") and hasattr(value, "type"):
+        message = {"role": value.type, "content": value.content}
+        for name in ("name", "tool_calls", "additional_kwargs"):
+            field = getattr(value, name, None)
+            if field:
+                message[name] = field
+        return message
+    if isinstance(value, Mapping):
+        return {str(key): _context_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_context_value(item) for item in value]
+    if isinstance(value, str) and len(value) > 100:
+        return value[:100] + "..."
+    return value
+
+
+def _format_context_node(value: Any, depth: int) -> list[str]:
+    indent = "  " * depth
+    if isinstance(value, Mapping):
+        lines: list[str] = []
+        for key, item in value.items():
+            if isinstance(item, (Mapping, list)):
+                lines.append(f"{indent}{key}:")
+                lines.extend(_format_context_node(item, depth + 1))
+            else:
+                lines.extend(_format_context_scalar(f"{indent}{key}: ", item, depth))
+        return lines or [f"{indent}{{}}"]
+    if isinstance(value, list):
+        lines = []
+        for item in value:
+            if isinstance(item, (Mapping, list)):
+                lines.append(f"{indent}-")
+                lines.extend(_format_context_node(item, depth + 1))
+            else:
+                lines.extend(_format_context_scalar(f"{indent}- ", item, depth))
+        return lines or [f"{indent}[]"]
+    return _format_context_scalar(indent, value, depth)
+
+
+def _format_context_scalar(prefix: str, value: Any, depth: int) -> list[str]:
+    text = str(value)
+    rows = text.splitlines() or [""]
+    return [prefix + rows[0], *("  " * (depth + 1) + row for row in rows[1:])]
 
 
 def _get_field(value: Any, name: str) -> Any:

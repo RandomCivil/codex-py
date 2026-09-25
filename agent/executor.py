@@ -47,7 +47,8 @@ class Executor:
         "call only a tool that closes a specific remaining gap. Do not repeat an equivalent "
         "inspection or gather extra corroboration after the criterion is met. "
         "If a native tool call is emitted, the host executes it even when the response also has text. "
-        "A final response does not need a Line Protocol format."
+        "When no native tool call is emitted, put the current Step answer directly in "
+        "response content; do not use Line Protocol for that answer."
     )
 
     def __init__(

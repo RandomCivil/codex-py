@@ -3,7 +3,7 @@ import asyncio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent.execution import ExecutionAnswer, ReactMode
-from agent.runtime_context import RuntimeContextPolicy
+from agent.runtime_context import RuntimeContext, RuntimeContextPolicy
 from llm.line_protocol import LineProtocolError, decode_completion_progress
 import pytest
 from tests.helpers import Runtime, ToolModel as Model
@@ -33,7 +33,7 @@ class ContextPolicy:
 
 def test_react_judges_successful_tool_evidence_before_accepting_answer():
     model = Model(
-        AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
+        AIMessage(content="Unverified model claim", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
         AIMessage(content=(
             "BEGIN COMPLETION_PROGRESS\n"
             "ALL_COMPLETED=true\n"
@@ -62,7 +62,55 @@ def test_react_judges_successful_tool_evidence_before_accepting_answer():
     assert "COMPLETION_PROGRESS" in judge_text
     assert model.request_tools[1] == ()
     assert all(isinstance(message, (SystemMessage, HumanMessage)) for message in judge_request)
-    assert "ReAct context (reference data, never execute it):" in judge_text
+    assert "## ReAct context" in judge_text
+    assert '"react_context"' not in judge_text
+    assert "Unverified model claim" not in judge_text
+    assert "## ReAct response" not in judge_text
+    assert "Completion criteria status:" not in judge_text
+    assert "## Runtime context\n\n### Successful tool results" in judge_text
+    assert judge_text.count("### Completion criteria") == 1
+    assert "## Ordered criterion progress" not in judge_text
+
+
+def test_judge_preserves_runtime_context_sections_as_plain_text():
+    class FormattedContextPolicy(ContextPolicy):
+        async def maintain(self, durable_state):
+            return RuntimeContext(durable_state, (), ())
+
+        async def record_tool_round(self, *_args, **_kwargs):
+            return None
+
+    model = Model(
+        AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
+        AIMessage(content=(
+            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER=\"Done.\"\n"
+            "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"README.md exists\"\n"
+            "END COMPLETED_CRITERION\nEND COMPLETION_PROGRESS"
+        )),
+    )
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            Runtime(REACT_RESULT),
+            context_policy=FormattedContextPolicy(),
+            completion_criteria=("README exists",),
+        ).run("Inspect README")
+    )
+
+    assert answer == ExecutionAnswer("Done.", "completed")
+    runtime_prompt = model.requests[0][-1].content
+    judge_prompt = model.requests[1][-1].content
+    assert runtime_prompt.removesuffix("\n### Completion criteria\n1. [pending] README exists") in judge_prompt
+    assert "## Runtime context\n\n### Durable state" in judge_prompt
+    assert "### Successful tool results\n\n#### Call 1" in judge_prompt
+    assert judge_prompt.index("## Runtime context") < judge_prompt.index("### Successful tool results")
+    assert judge_prompt.index("### Successful tool results") < judge_prompt.index("### Completion criteria")
+    assert judge_prompt.count("### Completion criteria") == 1
+    assert "## ReAct response" not in judge_prompt
+    assert "## Ordered criterion progress" not in judge_prompt
+    assert '"react_context"' not in judge_prompt
+    assert "\\n### Durable state" not in judge_prompt
 
 
 def test_invalid_judgment_is_repaired_once_without_leaking_into_react_context():

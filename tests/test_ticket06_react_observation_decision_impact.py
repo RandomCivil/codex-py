@@ -77,15 +77,18 @@ class _ReactModel:
                         }
                     ],
                 ),
-                AIMessage(content="Done"),
+                AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done"\nEND REACT_DECISION'),
             )
         )
 
     def bind_tools(self, _tools):
+        self.tools = _tools
         return self
 
     async def ainvoke(self, messages):
         self.requests.append(list(messages))
+        if self.tools == ():
+            return AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="The supplied context supports the answer"\nEND GOAL_JUDGMENT')
         return next(self.responses)
 
 

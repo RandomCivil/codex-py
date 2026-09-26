@@ -539,6 +539,45 @@ def test_native_grep_with_an_explicit_path_keeps_the_complete_result_in_that_gro
     assert "#### File: (unfiled)" not in prompt
 
 
+def test_grouped_native_read_structured_results_are_rendered_as_markdown_not_json():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [{"id": "read-1", "name": "read_file", "args": {"path": "report.md"}}],
+            [{"title": "Summary", "items": ["first", "second"]}],
+        )
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert "#### File: report.md" in prompt
+    assert "- title: Summary" in prompt
+    assert "- items:\n  - first\n  - second" in prompt
+    assert '"title": "Summary"' not in prompt
+    assert "```json" not in prompt
+
+
+def test_grouped_native_read_unwraps_mcp_content_as_markdown():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [{"id": "read-1", "name": "read_file", "args": {"path": "report.md"}}],
+            [{"content": [{"type": "text", "text": "# Report\n\n- complete"}]}],
+        )
+
+    asyncio.run(run())
+    prompt = policy.assemble({}).as_messages()[0].content
+
+    assert "#### File: report.md\n```text\n# Report\n\n- complete\n```" in prompt
+    assert "- content:" not in prompt
+    assert "- type: text" not in prompt
+    assert "- text: # Report" not in prompt
+
+
 def test_observations_render_as_flattened_categories_without_provenance_labels():
     model = ObservationModel({
         "round": 1,

@@ -4,7 +4,7 @@ Status: ready-for-agent
 
 ## Problem Statement
 
-The Plan-step Executor currently treats a nonempty model response without native Tool calls as completion of the selected Plan step. Its prompt includes the step's completion criterion, but the host does not independently assess execution evidence against that criterion. This lets the Tool-calling model both select actions and declare its own work complete. The ReAct completion-criterion judgment design establishes a separate, locally validated judge over completed Tool work; the Plan-step Executor needs an analogous boundary while retaining serial Plan execution and durable recovery.
+The Plan-step Executor currently treats a nonempty model response without native Tool calls as completion of the selected Plan step. Its prompt includes the step's completion criterion, but the host does not independently assess execution evidence against that criterion. This lets the Tool-calling model both select actions and declare its own work complete. The Executor needs a separate, locally validated judge while retaining serial Plan execution and durable recovery.
 
 ## Proposed Solution
 
@@ -12,7 +12,7 @@ For each Step execution attempt, the Executor owns one pending/completed state f
 
 The next operational Executor request receives the selected criterion and current `pending` or `completed` state. Once the judge records completion, the Executor asks the Tool-calling model for a final, nonempty Step handoff in a tool-free request. The completed Step execution durably records both the handoff and the judge's concise evidence. The Agent still completes the whole Plan only after every Plan step in its current revision has a completed Step execution.
 
-This deliberately differs from ReAct's operational context: ReAct hides criterion state from its Tool-calling model, while the Plan-step Executor exposes its one selected criterion's status. It also differs from ReAct's terminal judgment: the Plan-step judge does not write the final handoff.
+This deliberately differs from ReAct's operational context: ReAct hides criterion text from its Tool-calling model, while the Plan-step Executor exposes its one selected criterion's status. It also differs in timing: the Plan-step Executor judges eligible Tool batches and pending no-tool responses, whereas ReAct judges only a no-tool completed proposal.
 
 ## Behavioral Contract
 
@@ -20,7 +20,7 @@ This deliberately differs from ReAct's operational context: ReAct hides criterio
 2. After a settled batch, the Executor makes one judge request only when every Tool call succeeded. If any call failed, the batch skips judgment and returns failures as correction messages to the operational model; successful results from that batch do not establish completion.
 3. The judge receives the selected Plan step and criterion, current Agent state and Step context, the current Runtime-context snapshot of accumulated evidence, the operational request and response that produced the batch, and all successful calls with their complete rendered Raw results in request order. A no-tool judgment uses the available Agent state, Step context, and accumulated Step evidence. Failed Tool results are identified as failures and excluded from the evidentiary set.
 4. The existing Runtime-context budget applies. Required evidence is never silently truncated; an inability to fit it fails the Step. Runtime-context Observations support interpretation but cannot update criterion status themselves.
-5. The Plan-step judge returns a `STEP_COMPLETION_PROGRESS` Line Protocol block. It uses ReAct's numbered `COMPLETED_CRITERION` evidence and `ALL_COMPLETED` validation semantics with a single criterion numbered `1`, but omits ReAct's `ANSWER`. Pending judgment reports no newly completed criterion and `ALL_COMPLETED=false`. Completion reports criterion `1`, nonempty directly checkable `EVIDENCE`, and `ALL_COMPLETED=true`. Duplicate, out-of-range, already completed, missing-evidence, malformed, and inconsistent verdicts are locally rejected.
+5. The Plan-step judge returns its own `STEP_COMPLETION_PROGRESS` Line Protocol block with one criterion numbered `1`, using numbered `COMPLETED_CRITERION` evidence and `ALL_COMPLETED`. Pending judgment reports no newly completed criterion and `ALL_COMPLETED=false`. Completion reports criterion `1`, nonempty directly checkable `EVIDENCE`, and `ALL_COMPLETED=true`. It has no final `ANSWER` and does not adopt ReAct's current-state verdict schema. Duplicate, out-of-range, already completed, missing-evidence, malformed, and inconsistent verdicts are locally rejected.
 6. An invalid judgment receives exactly one tool-free repair request containing the original judge context, rejected output, and validation error. A second invalid response records no progress and returns to the budgeted operational loop. A judge provider failure fails the Step.
 7. If a no-tool operational response arrives while the criterion is pending, the Executor asks the judge. A pending verdict rejects that response and sends the selected criterion's pending state plus a continuation instruction to the operational model. This consumes a Tool-round budget unit. If the verdict completes the criterion, the earlier no-tool text is discarded and a new final handoff request is made.
 8. Once the judge records completion, no later Tool call may execute for this Step. The Executor makes a tool-free handoff request with the completed criterion state. A nonempty text response without native Tool calls completes the Step; it does not require a second semantic judgment. An empty handoff or attempted Tool call gets one tool-free repair request. If repair is still invalid, the Step fails.
@@ -42,7 +42,7 @@ This deliberately differs from ReAct's operational context: ReAct hides criterio
 
 ## Scope and Document Impact
 
-- This proposal extends the design in [ReAct completion-criterion judgment](../react-completion-criteria/spec.md) but does not change ReAct's behavior or Task Analyzer's ReAct-only completion-criteria contract.
+- This proposal keeps a separate Plan-step judgment contract. [ReAct completion judgment](../react-completion-criteria/spec.md) has since moved to a no-tool completed trigger; this does not change Plan-step behavior or Task Analyzer's ReAct-only completion-criteria contract.
 - In Plan-step execution, any failed call suppresses the batch's completion-judge request and all Observation requests for that batch, including requests for successful observation-class calls. ReAct retains its per-call policy.
 - It amends ADR-0002's rule that a nonempty no-tool response alone completes a Plan step, and requires updates to the Executor and recovery boundary descriptions in `CONTEXT.md`.
 - It does not change Plan-step cardinality, serial Agent orchestration, Planner ownership of the Plan, or the Agent's replanning budget.

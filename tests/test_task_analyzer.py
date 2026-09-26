@@ -59,6 +59,8 @@ def test_task_analyzer_prompts_for_task_analysis_without_provider_formatting_opt
     assert text_stream.request["input"] == "Investigate the report"
     assert text_stream.request["tools"] is None
     assert "BEGIN TASK_ANALYSIS" in text_stream.request["instructions"]
+    assert "Do not wrap the block in Markdown code fences" in text_stream.request["instructions"]
+    assert "first output characters must be BEGIN TASK_ANALYSIS" in text_stream.request["instructions"]
 
 
 def test_task_analyzer_includes_prior_conversation_history_in_model_input():

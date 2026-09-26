@@ -21,8 +21,9 @@ diagnostics, and lifecycle management.
 Keep Goal as a dedicated Runtime-context section after the evidence. It remains omitted
 only from the rendered Durable State payload and remains unchanged in Agent
 state, Checkpoints, planning, recovery, and all other Durable State uses.
-When ReAct Completion criteria are available, show their current status as the
-last section of the same Runtime-context prompt.
+ReAct Completion criteria and their status remain in the Completion judge's
+context. After a rejected terminal proposal, the latest validated judge
+verdict, evidence, and gaps enter ReAct context without the criteria text.
 
 Within Raw tool results, render only native permanent-raw `grep` and
 `read_file` calls as file groups spanning the active invocation's Tool rounds.
@@ -90,13 +91,13 @@ def login(): pass
 19. As a tool-calling model, I want resolved read results shown directly beneath each file heading, with one block per result and no call metadata, so that file contents are the first thing I see.
 20. As a tool-calling model, I want Observations combined under three category headings with no displayed Round or tool-call ID, so that the evidence reads as one concise section.
 21. As a tool-calling model, I want non-native Raw tool results after all file groups, retaining their own Round headings and call details, so that they remain diagnosable without interrupting file evidence.
-22. As a ReAct caller, I want Completion criteria status at the end of the Runtime-context prompt when criteria are available, so that the current completion standard follows the evidence and Goal.
+22. As a ReAct caller, I want the latest validated Completion judge verdict, evidence, and gaps after a rejected terminal proposal, so that I can correct the shortfall without receiving criteria text.
 
 ## Implementation Decisions
 
 - Amend the Runtime-context renderer while leaving the RuntimeContext data model and Tool-call evidence policy intact.
 - Derive the displayed goal from applicable Durable State and omit that same goal field from the Durable State presentation. Support both ReAct's direct goal payload and the Agent-state goal nested in the Plan-step Executor's durable payload.
-- Render `### Goal` after `### Raw tool results`; retain the other top-level Runtime-context sections. When ReAct Completion criteria are available, render their current status as the final Runtime-context section after Goal and Steps.
+- Render `### Goal` after `### Raw tool results`; retain the other top-level Runtime-context sections. Keep ReAct Completion criteria and their status out of operational Runtime context. After judge rejection, append only the latest validated structured verdict with evidence and gaps, without criteria text.
 - Treat only native tools named exactly `grep` and `read_file` as file-grouped native reads. Do not extend file grouping to `exec`, including shell commands classified as permanent raw.
 - Resolve a `read_file` group from its explicit path argument. Resolve a `grep` group from an explicit single-file path argument when available; otherwise parse path-prefixed grep result lines and split their matched content by path.
 - Collect file groups across all selected Raw tool results. Preserve each group's entries in ascending Tool-round order and original request order within a batch. Append each result as a separate first-level code block directly under `#### File: <path>`; use a fence that cannot collide with the result text. Show complete multi-line content without an extra `result:` label. For path-prefixed grep output, split the matched lines by file, remove each line's path prefix in the displayed block, and append each block to its corresponding file group. Retain round, tool name, arguments, tool-call ID, and complete original result internally and in diagnostics, but omit them from resolved file groups in the model-facing text.
@@ -120,7 +121,7 @@ def login(): pass
 - Test positive and negative decision-impact Observations for each existing observation-class tool, including `exec`; verify negative calls retain Raw evidence through their normal window before omission, invalid or failed judgments retain Raw fallback, and merged Observations union their affected targets without mutating Durable State.
 - Test that Observations flatten into three always-present categories with no displayed Round or tool-call IDs, preserving evidence order and duplicates while keeping their internal provenance.
 - Test that non-native-read calls appear after the file groups with their existing round-grouped rendering, and that no existing context-budget, Raw-evidence, or diagnostic provenance behavior regresses.
-- Test that a ReAct request with Completion criteria renders their current status as the last Runtime-context section.
+- Test that a ReAct request does not render Completion criteria text or status; after a rejected completion proposal, it receives only the latest validated structured verdict with evidence and gaps.
 - Retain high-level ReAct and Plan-step Executor tests as confirmation that both modes pass the resulting Runtime context to later model requests.
 
 ## Out of Scope

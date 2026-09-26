@@ -107,16 +107,19 @@ def test_tool_agent_executes_a_tool_call_with_accompanying_text():
     ]
 
 
-def test_react_returns_freeform_content_when_no_tool_call_is_present():
-    model = ToolModel(AIMessage(content="Done\n\n- inspected the components"))
+def test_react_judges_no_tool_completion_proposal():
+    model = ToolModel(
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done; inspected the components"\nEND REACT_DECISION'),
+        AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="The explanation covers the goal"\nEND GOAL_JUDGMENT'),
+    )
 
     answer = asyncio.run(ReactMode(model, Runtime()).run("Complete"))
 
-    assert answer == ExecutionAnswer("Done\n\n- inspected the components", "completed")
-    assert len(model.requests) == 1
+    assert answer == ExecutionAnswer("Done; inspected the components", "completed")
+    assert len(model.requests) == 2
     assert "BEGIN NO_TOOL" not in model.requests[0][0].content
     assert "BEGIN ANSWER" not in model.requests[0][0].content
-    assert "Line Protocol" not in model.requests[0][0].content
+    assert "REACT_DECISION Line Protocol" in model.requests[0][0].content
     assert "GOAL_COMPLETION" not in model.requests[0][0].content
     assert "requested outcome as the fixed" in model.requests[0][0].content
     assert "completion standard" in model.requests[0][0].content
@@ -128,30 +131,45 @@ def test_react_returns_freeform_content_when_no_tool_call_is_present():
     assert "Do not make further read-only" in model.requests[0][0].content
 
 
+def test_react_judges_a_plain_no_tool_answer_when_the_provider_omits_the_envelope():
+    plain_answer = "### LLM 调用\n\n- `llm/llm.py`"
+    model = ToolModel(
+        AIMessage(content=plain_answer),
+        AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="The answer addresses the goal"\nEND GOAL_JUDGMENT'),
+    )
+
+    answer = asyncio.run(ReactMode(model, Runtime()).run("Describe LLM calls"))
+
+    assert answer == ExecutionAnswer(plain_answer, "completed")
+    assert len(model.requests) == 2
+    assert "Candidate answer: ### LLM 调用" in model.requests[1][1].content
+
+
 def test_react_rejects_an_empty_final_response_without_tool_calls():
     model = ToolModel(AIMessage(content=""))
 
-    answer = asyncio.run(ReactMode(model, Runtime()).run("Complete"))
+    answer = asyncio.run(ReactMode(model, Runtime(), max_rounds=1).run("Complete"))
 
     assert answer == ExecutionAnswer(
         None,
         "failed",
-        error="react model returned an empty final response",
+        error="react round budget exhausted",
     )
 
 
 def test_react_executes_tool_calls_with_accompanying_text():
     model = ToolModel(
         AIMessage(content="I'll inspect the source tree.", tool_calls=[{"name": "list_dir", "args": {}, "id": "1"}]),
-        AIMessage(content="The source tree is inspected."),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="The source tree is inspected."\nEND REACT_DECISION'),
+        AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="The tool output shows the tree"\nEND GOAL_JUDGMENT'),
     )
     runtime = Runtime()
     answer = asyncio.run(ReactMode(model, runtime).run("Inspect"))
     assert answer == ExecutionAnswer("The source tree is inspected.", "completed")
-    assert len(model.requests) == 2
+    assert len(model.requests) == 3
     assert all(
         "Before every tool call, check all three conditions" in request[0].content
-        for request in model.requests
+        for request in model.requests[:2]
     )
     assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
         {"name": "list_dir", "args": {}, "id": "1"}
@@ -161,12 +179,12 @@ def test_react_executes_tool_calls_with_accompanying_text():
 def test_react_executes_empty_text_tool_call_with_completion_criteria():
     model = ToolModel(
         AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "1"}]),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="The evidence is inspected."\nEND REACT_DECISION'),
         AIMessage(content=(
-            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER="The evidence is inspected."\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n'
-            'EVIDENCE="The evidence is inspected."\nEND COMPLETED_CRITERION\n'
-            'END COMPLETION_PROGRESS'
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\n'
+            'BEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\nEVIDENCE="The evidence is inspected."\n'
+            'END CRITERION_VERDICT\nEND COMPLETION_PROGRESS'
         )),
-        AIMessage(content='BEGIN ANSWER\nTEXT="The evidence is inspected."\nEND ANSWER'),
     )
     runtime = Runtime()
 
@@ -182,26 +200,35 @@ def test_react_executes_empty_text_tool_call_with_completion_criteria():
     assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
         {"name": "inspect", "args": {}, "id": "1"}
     ]
-    assert "Inspect the evidence." not in model.requests[0][0].content
+    assert model.requests[0][-1].content == (
+        "## Completion criteria\n\n"
+        "1. [pending] Inspect the evidence."
+    )
+    assert len(model.requests) == 3
 
 
 def test_react_accepts_plain_content_without_protocol_repair_with_pending_criteria():
     model = ToolModel(
         AIMessage(content="已完成。"),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\n'
+            'BEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\nEVIDENCE="Result provided"\n'
+            'END CRITERION_VERDICT\nEND COMPLETION_PROGRESS'
+        )),
     )
 
     answer = asyncio.run(
         ReactMode(
             model,
             Runtime(),
-            max_rounds=1,
+            max_rounds=2,
             completion_criteria=("提供结果。",),
         ).run("提供结果")
     )
 
-    assert answer == ExecutionAnswer(None, "failed", "react round budget exhausted")
-    assert len(model.requests) == 1
-    assert model.request_tools == [[]]
+    assert answer == ExecutionAnswer("已完成。", "completed")
+    assert len(model.requests) == 2
+    assert model.request_tools == [[], ()]
 
 
 def test_react_ignores_unparseable_tool_call_reasoning_with_completion_criteria():
@@ -210,12 +237,12 @@ def test_react_ignores_unparseable_tool_call_reasoning_with_completion_criteria(
             content="Let me inspect the README before making the update.",
             tool_calls=[{"name": "inspect", "args": {}, "id": "1"}],
         ),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="The README was inspected."\nEND REACT_DECISION'),
         AIMessage(content=(
-            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER="The README was inspected."\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n'
-            'EVIDENCE="The README was inspected."\nEND COMPLETED_CRITERION\n'
-            'END COMPLETION_PROGRESS'
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\n'
+            'BEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\nEVIDENCE="The README was inspected."\n'
+            'END CRITERION_VERDICT\nEND COMPLETION_PROGRESS'
         )),
-        AIMessage(content='BEGIN ANSWER\nTEXT="The README was inspected."\nEND ANSWER'),
     )
     runtime = Runtime()
 
@@ -231,7 +258,11 @@ def test_react_ignores_unparseable_tool_call_reasoning_with_completion_criteria(
     assert [{key: call[key] for key in ("name", "args", "id")} for call in runtime.calls] == [
         {"name": "inspect", "args": {}, "id": "1"}
     ]
-    assert "Inspect the README." not in model.requests[0][0].content
+    assert model.requests[0][-1].content == (
+        "## Completion criteria\n\n"
+        "1. [pending] Inspect the README."
+    )
+    assert len(model.requests) == 3
 
 
 def test_react_accumulates_tool_round_progress_and_requires_all_criteria_at_final():
@@ -242,16 +273,15 @@ def test_react_accumulates_tool_round_progress_and_requires_all_criteria_at_fina
             ),
             tool_calls=[{"name": "inspect", "args": {}, "id": "1"}],
         ),
-        AIMessage(content=(
-            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n'
-            'EVIDENCE="Evidence inspected"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS'
-        )),
-        AIMessage(content=[{"type": "text", "text": "intermediate"}], tool_calls=[{"name": "report", "args": {}, "id": "2"}]),
-        AIMessage(content=(
-            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER="Both outcomes are verified."\nBEGIN COMPLETED_CRITERION\nNUMBER=2\n'
-            'EVIDENCE="Cause reported"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS'
-        )),
-        AIMessage(content='BEGIN ANSWER\nTEXT="Both outcomes are verified."\nEND ANSWER'),
+            AIMessage(content=[{"type": "text", "text": "intermediate"}], tool_calls=[{"name": "report", "args": {}, "id": "2"}]),
+            AIMessage(content=(
+                'BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Both outcomes are verified."\nEND REACT_DECISION'
+            )),
+            AIMessage(content=(
+                'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\n'
+                'BEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\nEVIDENCE="Evidence inspected"\nEND CRITERION_VERDICT\n'
+                'BEGIN CRITERION_VERDICT\nNUMBER=2\nVERIFIED=true\nEVIDENCE="Cause reported"\nEND CRITERION_VERDICT\nEND COMPLETION_PROGRESS'
+            )),
     )
 
     answer = asyncio.run(
@@ -264,13 +294,42 @@ def test_react_accumulates_tool_round_progress_and_requires_all_criteria_at_fina
     )
 
     assert answer == ExecutionAnswer("Both outcomes are verified.", "completed")
-    assert model.requests[0][-1].content == (
-        "Completion criteria status:\n"
-        "1. [pending] Inspect the evidence.\n2. [pending] Report the cause."
+    assert len(model.requests) == 4
+    expected_criteria = (
+        "## Completion criteria\n\n"
+        "1. [pending] Inspect the evidence.\n"
+        "2. [pending] Report the cause."
     )
+    assert all(request[-1].content == expected_criteria for request in model.requests[:3])
+
+
+def test_react_updates_the_visible_criteria_status_after_a_rejected_terminal_proposal():
+    model = ToolModel(
+        AIMessage(content=(
+            'BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Partially done."\nEND REACT_DECISION'
+        )),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\n'
+            'BEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\nEVIDENCE="Evidence inspected"\nEND CRITERION_VERDICT\n'
+            'BEGIN CRITERION_VERDICT\nNUMBER=2\nVERIFIED=false\nGAP="Cause is not reported"\nEND CRITERION_VERDICT\n'
+            'END COMPLETION_PROGRESS'
+        )),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="failed"\nERROR="Stopped for test."\nEND REACT_DECISION'),
+    )
+
+    answer = asyncio.run(
+        ReactMode(
+            model,
+            Runtime(),
+            completion_criteria=("Inspect the evidence.", "Report the cause."),
+        ).run("Investigate")
+    )
+
+    assert answer == ExecutionAnswer(None, "failed", "Stopped for test.")
     assert model.requests[2][-1].content == (
-        "Completion criteria status:\n"
-        "1. [completed] Inspect the evidence.\n2. [pending] Report the cause."
+        "## Completion criteria\n\n"
+        "1. [completed] Inspect the evidence.\n"
+        "2. [pending] Report the cause."
     )
 
 
@@ -344,10 +403,13 @@ def test_react_factory_owns_and_closes_a_fresh_http_client_per_asyncio_run(monke
             clients.append(kwargs["http_async_client"])
 
         def bind_tools(self, tools):
+            self.tools = tools
             return self
 
         async def ainvoke(self, messages):
-            return AIMessage(content="Done")
+            if self.tools == ():
+                return AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="Done"\nEND GOAL_JUDGMENT')
+            return AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done"\nEND REACT_DECISION')
 
     monkeypatch.setattr("agent.execution.ChatOpenAI", ChatModel)
     provider = ProviderConfiguration("https://provider.test/v1", "key", "model")

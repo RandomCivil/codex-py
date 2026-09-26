@@ -739,11 +739,76 @@ def _runtime_context_prompt(
 
 
 def _render_code_block(value: Any) -> list[str]:
-    text = value if isinstance(value, str) else _prompt_value(value)
+    text = _file_group_markdown(value)
     fence = "```"
     while fence in text:
         fence += "`"
     return [f"{fence}text", text, fence]
+
+
+def _file_group_markdown(value: Any) -> str:
+    """Render a file-group result, unwrapping MCP text content when present."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping) and "content" in value:
+        return _mcp_content_markdown(value["content"])
+    return _render_markdown_value(value)
+
+
+def _mcp_content_markdown(value: Any) -> str:
+    """Turn MCP content blocks into their model-facing Markdown text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        text = value.get("text")
+        if isinstance(text, str):
+            return text
+        nested_content = value.get("content")
+        if nested_content is not None:
+            return _mcp_content_markdown(nested_content)
+        return _render_markdown_value(value)
+    if isinstance(value, (list, tuple)):
+        rendered = [_mcp_content_markdown(item) for item in value]
+        return "\n\n".join(item for item in rendered if item) or "(empty)"
+    return _markdown_scalar(value)
+
+
+def _render_markdown_value(value: Any, *, indent: str = "") -> str:
+    """Render a structured native-read result as Markdown, never as JSON."""
+    if isinstance(value, Mapping):
+        if not value:
+            return "(empty)"
+        lines: list[str] = []
+        for key, item in value.items():
+            label = str(key)
+            if isinstance(item, (Mapping, list, tuple)):
+                lines.append(f"{indent}- {label}:")
+                lines.append(_render_markdown_value(item, indent=f"{indent}  "))
+            else:
+                lines.append(f"{indent}- {label}: {_markdown_scalar(item)}")
+        return "\n".join(lines)
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "(empty)"
+        lines = []
+        for item in value:
+            if isinstance(item, (Mapping, list, tuple)):
+                lines.append(f"{indent}-")
+                lines.append(_render_markdown_value(item, indent=f"{indent}  "))
+            else:
+                lines.append(f"{indent}- {_markdown_scalar(item)}")
+        return "\n".join(lines)
+    return _markdown_scalar(value)
+
+
+def _markdown_scalar(value: Any) -> str:
+    if value is None:
+        return "(none)"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
 
 
 def _render_raw_call(call: RawToolCall, result: Any, *, prefix: str = "") -> list[str]:

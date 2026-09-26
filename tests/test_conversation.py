@@ -147,14 +147,14 @@ def test_routed_react_conversation_uses_criteria_for_the_terminal_answer():
             self.requests = []
             self.responses = iter([
                 AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
+                AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Investigated."\nEND REACT_DECISION'),
                 AIMessage(content=(
                     "BEGIN COMPLETION_PROGRESS\n"
-                    "ALL_COMPLETED=true\nANSWER=\"Investigated.\"\n"
-                    "BEGIN COMPLETED_CRITERION\n"
-                    "NUMBER=1\nEVIDENCE=\"evidence inspected\"\n"
-                    "END COMPLETED_CRITERION\nEND COMPLETION_PROGRESS"
+                    "ALL_COMPLETED=true\n"
+                    "BEGIN CRITERION_VERDICT\n"
+                    "NUMBER=1\nVERIFIED=true\nEVIDENCE=\"evidence inspected\"\n"
+                    "END CRITERION_VERDICT\nEND COMPLETION_PROGRESS"
                 )),
-                AIMessage(content='BEGIN ANSWER\nTEXT="Investigated."\nEND ANSWER'),
             ])
 
         def bind_tools(self, _tools):
@@ -195,7 +195,12 @@ def test_routed_react_conversation_uses_criteria_for_the_terminal_answer():
     assert result.status == "completed"
     assert result.answer == "Investigated."
     assert store.get(result.conv_id).turns[0].status == "completed"
-    assert model.requests[0][-1].content == "Completion criteria status:\n1. [pending] Inspect the evidence."
+    assert len(model.requests) == 3
+    assert model.requests[1][-1].content == (
+        "## Completion criteria\n\n"
+        "1. [pending] Inspect the evidence."
+    )
+    assert "Inspect the evidence." in model.requests[2][-1].content
 
 
 def test_one_argument_conversation_runner_factory_still_receives_run_id():

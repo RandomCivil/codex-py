@@ -154,7 +154,12 @@ specific, and in stable order. For other tasks, omit completion criteria.
 _TASK_ANALYSIS_INSTRUCTIONS = _TASK_ANALYZER_INSTRUCTIONS + """
 ## Output requirements
 
-Return exactly one Line Protocol block:
+Return exactly one Line Protocol block as plain text.
+
+Do not wrap the block in Markdown code fences such as ``` or ```text. Do not
+add any explanation, commentary, reasoning, labels, or other text before or
+after the block. The first output characters must be BEGIN TASK_ANALYSIS and
+the last output characters must be END TASK_ANALYSIS.
 
 BEGIN TASK_ANALYSIS
 TASK_TYPE="research"

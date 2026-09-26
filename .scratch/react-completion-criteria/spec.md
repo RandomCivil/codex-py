@@ -1,86 +1,99 @@
-# ReAct completion-criterion judgment
+# ReAct completion judgment at a proposed terminal response
 
 Status: ready-for-agent
 
 ## Problem Statement
 
-ReAct completion criteria currently become instructions in the main ReAct Model request, and the ReAct model self-reports progress in its response. This mixes tool selection with verification, causes criteria and their status to dominate the tool-loop context, and lets the tool-calling model claim completion without a dedicated evaluation of the resulting evidence.
+The current ReAct loop calls a Completion judge after each successful Tool-call batch. Judgment therefore depends on batch count rather than on ReAct's decision that its work is ready for final review. The judge can also supply the final answer, obscuring ownership of the candidate answer. ReAct invocations without completion criteria bypass this judgment entirely.
 
 ## Solution
 
-Task Analyzer will continue to supply an ordered collection of independently verifiable completion criteria when deterministic routing selects ReAct. ReAct will keep the criteria as invocation-local state but remove them, their status, and `REACT_PROGRESS` entirely from its own Model requests and responses.
+Every ReAct invocation uses a strict `REACT_DECISION` Line Protocol block when its operational model requests no native Tool calls. Its `STATUS` is `completed`, `failed`, or `need_tool`. Only a no-tool `completed` response invokes a separate, tool-free Completion judge. ReAct supplies the candidate `ANSWER`; a valid positive judgment returns that answer. A negative judgment sends its validated structured verdict, evidence, and remaining gaps into the next ReAct context within the existing round budget.
 
-After every Tool-call batch settles, ReAct will make one separate, tool-free `completion_judge` Model request using the ReAct model's configured provider. The judge receives the complete current ReAct reasoning context, the successful calls and their Raw tool results, and an explicit criterion-progress context containing every ordered criterion and current status. It returns a locally validated `COMPLETION_PROGRESS` Line Protocol document, with concise evidence for every newly completed criterion. The host validates and monotonically updates the invocation-local progress only from this judgment. Failed tool results never constitute judge evidence; they remain immediate correction messages for the next ReAct request.
+Native Tool-call responses execute their batches without an immediate Completion judge. Accompanying ordinary text is reasoning description. A response that both requests Tool calls and declares a `REACT_DECISION` status is contradictory: the host executes none of those calls, reports the protocol error to ReAct, and uses the next budgeted round.
+
+With criteria, the judge evaluates every ordered criterion against the current evidence window. The host retains historical confirmed evidence for the invocation, but a final answer is accepted only when the latest judgment verifies every criterion **now**. Without criteria, the judge evaluates the whole Goal. Runtime-context Observations are evidence, never Completion judgments.
 
 ## User Stories
 
-1. As an application integrator, I want ReAct work to retain explicit ordered completion criteria, so that multi-step tool work has a visible and testable completion standard.
-2. As an application integrator, I want Task Analyzer to supply criteria only for ReAct-routed work, so that direct, tool-agent, and Plan–execute retain their existing contracts.
-3. As an application integrator, I want deterministic routing to remain responsible for execution-mode selection, so that Task Analyzer stays descriptive.
-4. As a ReAct model, I want a context free of completion criteria and progress instructions, so that I can focus on selecting and correcting tool actions.
-5. As an application integrator, I want the ReAct model's accompanying tool-call text ignored for criterion progress, so that free-form reasoning cannot mutate authoritative state.
-6. As an application integrator, I want successful tool evidence assessed by a separate completion judge, so that criterion completion is based on executed results rather than self-reporting.
-7. As a completion judge, I want the complete current ReAct reasoning context, so that I can interpret a tool result in the goal's actual execution context.
-8. As a completion judge, I want the complete ordered criterion list and current completion state in my own context, so that I can decide only which remaining outcomes this batch proves.
-9. As a completion judge, I want every successful tool call and its Raw tool result from one settled Tool-call batch together, so that related concurrent results can establish an outcome jointly.
-10. As an application integrator, I want failed tool results excluded from completion evidence, so that an error cannot be mistaken for proof of completion.
-11. As a ReAct model, I want failed tool results immediately returned in my next context, so that I can correct the failed action in the next tool round.
-12. As an application integrator, I want mixed-result batches to judge their successful results while returning their failed results to ReAct, so that valid evidence is not discarded because an unrelated concurrent call failed.
-13. As an application integrator, I want one judge request per settled batch rather than one per individual call, so that progress does not depend on concurrent completion order.
-14. As an application integrator, I want the completion judge to identify criteria by their stable one-based numbers, so that criterion order remains the authoritative reference.
-15. As an application integrator, I want each newly completed criterion to include concise, directly checkable evidence, so that progress is auditable without retaining hidden reasoning.
-16. As an application integrator, I want a judge to report no progress explicitly when a batch proves nothing, so that no evidence is not confused with an invalid response.
-17. As an application integrator, I want duplicate, already-completed, out-of-range, malformed, and evidence-free judgments rejected locally, so that a model cannot skip, repeat, or fabricate progress.
-18. As an application integrator, I want one repair attempt after invalid judge output, so that transient format mistakes do not immediately fail execution.
-19. As an application integrator, I want the rejected judge output and validation error included only in the judge's repair context, so that the retry can correct itself without contaminating ReAct context.
-20. As an application integrator, I want execution to continue with the next ReAct round when the repair attempt is still invalid, so that a judge formatting failure is recoverable.
-21. As an application integrator, I want completion-judge requests traced and metered as a distinct `completion_judge` component, so that their cost and behavior are observable separately from ReAct and Runtime-context requests.
-22. As an application integrator, I want judge requests excluded from the tool-round budget, so that the budget continues to represent ReAct progress through tools.
-23. As an application integrator, I want a criterion-enabled no-tool ReAct response to use the normal `ANSWER` protocol without declaring criterion numbers, so that only the judge owns completion state.
-24. As an application integrator, I want ReAct to reject a terminal answer while criteria remain pending, so that incomplete work is never returned as completed.
-25. As a ReAct model, I want generic continuation feedback after a rejected terminal answer, so that I can keep working without being shown completion criteria.
-26. As an application integrator, I want rejected no-tool responses to consume the existing ReAct round budget, so that repeated premature answers terminate safely.
-27. As an application integrator, I want a successful final answer accepted only after every criterion has been recorded by the completion judge, so that completion is authoritative and monotonic.
-28. As a maintainer, I want criterion state and evidence to remain invocation-local and ephemeral, so that ReAct retains its established non-resumable Execution-mode contract.
-29. As an interactive Conversation user, I want routed ReAct turns to use the same criteria and completion-judge behavior as routed CLI runs, so that entry point does not affect completion.
-30. As a maintainer, I want Runtime-context Observation generation to remain separate from completion judgment, so that Observation fallback and its provider configuration retain their existing semantics.
+1. As an application integrator, I want an explicit decision on every no-tool ReAct response, so an idle or malformed response cannot silently complete work.
+2. As a ReAct model, I want to propose a candidate answer only when I believe the Goal is complete, so Judge calls occur at the completion boundary.
+3. As an application owner, I want every ReAct invocation judged, including one without Task Analyzer criteria or Tool calls.
+4. As a Tool host, I want contradictory status-and-Tool responses rejected before execution, so a completion claim cannot race with side effects.
+5. As a ReAct model, I want ordinary text accompanying Tool calls to remain usable as reasoning description.
+6. As a Completion judge, I want the candidate answer, Goal, current reasoning context, and policy-selected cumulative Tool evidence.
+7. As a ReAct model, I want the judge's validated structured verdict, evidence, and remaining gaps after a rejection.
+8. As an application integrator, I want historical criterion evidence retained while requiring a fresh current-state check, so later actions cannot rely on stale success.
+9. As a maintainer, I want ReAct to receive ordered criteria with host-owned status, plus numbered verdicts and gaps after a rejected terminal proposal.
+10. As an operator, I want judge requests traced and metered separately without consuming the ReAct round budget.
+11. As a Conversation user, I want routed ReAct turns to follow the same judgment contract as CLI invocations.
 
-## Implementation Decisions
+## Behavioral Contract
 
-- Preserve the Task Analysis contract: ReAct analyses have ordered, nonempty, distinct, independently verifiable completion criteria; analyses for other modes omit them. The deterministic router passes the analysis through the existing Execution-mode factory seam, and only ReAct consumes its criteria.
-- Remove the completion-criterion status section and all `REACT_PROGRESS` instructions, parsing, and state updates from main ReAct Model requests and native tool-call responses. ReAct without criteria retains its existing free-form terminal behavior.
-- For criterion-enabled ReAct, a no-tool response must use the existing strict `ANSWER` Line Protocol block. It is accepted only if the locally held criterion set is already complete; otherwise the host supplies generic continuation feedback and proceeds to the next budgeted ReAct request.
-- After each Tool-call batch settles, create one separate, tool-free `completion_judge` request. Reuse the ReAct component provider/model configuration but issue and trace it as a distinct component; do not add a provider configuration field and do not use the Runtime-context component.
-- The judge context is a new request containing its judgment instructions, the complete current ReAct reasoning context, the ReAct response that produced the batch, all successful calls and rendered Raw tool results in request order, and a final criterion-progress section. That section lists every criterion by stable one-based number and whether it is completed or pending.
-- The judge receives successful entries only. In a mixed batch, failed results are omitted from judge evidence and are added as error ToolMessages to the next ReAct context. A batch with no successful results makes no judge request.
-- Define registered `COMPLETION_PROGRESS` and nested `COMPLETED_CRITERION` Line Protocol blocks. The outer block may be empty to report no newly completed criteria. Each nested item has exactly `NUMBER` and a concise nonempty `EVIDENCE`; numbers must be distinct, in range, and not already recorded.
-- The host holds an invocation-local monotonic mapping from criterion number to evidence. Only a locally valid judge result can add entries. Neither ReAct prose, failed tool results, Runtime-context Observations, nor final-answer prose can update it.
-- A malformed or invalid judge result triggers exactly one tool-free repair request. The repair request retains the original judge context and adds the rejected output plus local validation error. If the repair is still invalid, retain no new progress and continue the next ReAct round rather than failing the execution.
-- Completion-judge requests do not increment the ReAct tool-round budget, but they are included in model-use, trace, and cost accounting under `completion_judge`.
-- Preserve concurrent Tool-call batch execution, Runtime-context evidence selection, asynchronous Observation generation, routing, Conversation persistence, Plan–execute, recovery, and MCP authority boundaries. The judge is synchronous with post-batch completion-state update but does not replace or alter Observation work.
-- Amend the affected ReAct, Line Protocol, layered-context, Observation, routing, and execution-mode documentation to remove the superseded self-reporting decision and distinguish completion judgment from Runtime-context processing.
+1. A no-tool ReAct response must be one `REACT_DECISION` block. `STATUS="completed"` requires a nonempty `ANSWER` and no `ERROR`; `STATUS="failed"` requires a nonempty `ERROR` and no `ANSWER`; `STATUS="need_tool"` permits neither. Unknown status, missing or extra fields, empty required values, arbitrary prose, and incomplete blocks are invalid.
+2. No-tool `completed` makes exactly one initial Completion judge request. It is tool-free, uses ReAct's configured provider/model, and is traced as `completion_judge`. A valid positive judgment returns ReAct's candidate `ANSWER` unchanged. The judge never writes the user-facing answer.
+3. No-tool `failed` returns a failed Execution answer with the supplied safe error. No-tool `need_tool` adds feedback asking ReAct to choose a Tool or explicitly fail, then continues within the round budget. Neither calls the judge.
+4. A native Tool-call response with ordinary accompanying text executes its calls as one concurrent, request-ordered batch; the text is reasoning description, not a completion claim. A response containing Tool calls and a `REACT_DECISION` block, including a malformed attempted block, executes no calls and adds a protocol error to the next ReAct context. This consumes a round.
+5. An invalid no-tool decision adds the specific local validation error to ReAct context and consumes a round. Repeated `need_tool`, contradictory, invalid, and judge-rejected responses cannot exceed the configured round budget. Judge requests and judge repair do not consume it.
+6. The judge sees the current operational request and response, Goal, candidate answer, current Runtime-context evidence snapshot, and host-held prior validated judgment state. The snapshot follows existing Raw/Observation retention and token-budget policy; the judge does not resurrect omitted Raw results. Failed Tool results may explain a gap but cannot alone prove completion. A zero-Tool invocation is valid: an explanatory answer may be judged from Goal and answer, whereas an unverified external effect must be rejected.
+7. With criteria, the judge receives all ordered criteria and historical confirmed evidence. Its `COMPLETION_PROGRESS` verdict has `ALL_COMPLETED` and exactly one numbered `CRITERION_VERDICT` block per criterion. Each block contains `NUMBER` and either `VERIFIED=true` with nonempty `EVIDENCE`, or `VERIFIED=false` with nonempty `GAP`. Numbers are unique, ordered, one-based, and cover the criterion set. `ALL_COMPLETED` equals the conjunction of current `VERIFIED` values. Historical confirmed evidence is retained even if the current verdict finds that criterion false.
+8. Without criteria, the judge returns `GOAL_JUDGMENT` with `COMPLETED=true` and nonempty `EVIDENCE`, or `COMPLETED=false` and nonempty `GAP`. It judges the whole Goal and candidate answer, not an invented empty criterion list.
+9. Every ReAct tool-loop request contains the ordered criteria with host-owned `completed` or `pending` status. A negative judgment additionally sends the **validated, canonical structured verdict** into the next ReAct context: numbers, current states, evidence and gaps, or the whole-Goal verdict. ReAct does not receive hidden judge reasoning. Only the latest judge verdict remains in subsequent ReAct requests; the host retains historical confirmed evidence for later judge requests. Exhaustion after a rejected claim fails the invocation.
+10. An invalid judge output gets exactly one tool-free repair request with rejected output and local validation error. If repair is still invalid, no completion is accepted and ReAct gets validation-failure feedback within its remaining budget. A judge provider failure fails the invocation.
+11. Historical progress, verdicts, and feedback are invocation-local and ephemeral. Routing, Conversation persistence, concurrent Tool batches, Tool authority, and asynchronous Observation generation retain their existing boundaries. The Plan-step Executor's separate judgment and handoff contract is unchanged.
+
+## Protocol Examples
+
+ReAct proposes completion without Tool calls:
+
+```text
+BEGIN REACT_DECISION
+STATUS="completed"
+ANSWER="The requested file is ready."
+END REACT_DECISION
+```
+
+The criterion-enabled judge rejects because current evidence does not prove the file still exists:
+
+```text
+BEGIN COMPLETION_PROGRESS
+ALL_COMPLETED=false
+BEGIN CRITERION_VERDICT
+NUMBER=1
+VERIFIED=false
+GAP="Current file existence has not been verified."
+END CRITERION_VERDICT
+END COMPLETION_PROGRESS
+```
+
+Without criteria, the corresponding judge response uses `GOAL_JUDGMENT`:
+
+```text
+BEGIN GOAL_JUDGMENT
+COMPLETED=false
+GAP="No evidence shows that the requested file was created."
+END GOAL_JUDGMENT
+```
 
 ## Testing Decisions
 
-- The primary seam is a public Task Router invocation using controlled Task Analyzer output, a controlled ReAct model sequence, and a controlled Tool runtime. Assert externally observable request contexts, completion-judge evidence and protocol handling, terminal Execution answers, and routed criteria propagation without live providers or MCP servers.
-- Use the existing controlled ReAct model/runtime tests as focused behavior coverage. Test that main ReAct requests have no criteria, that one settled successful batch produces one judge request with the full ReAct context and criterion state, and that parsed evidence updates the next judge context rather than ReAct context.
-- Cover mixed successful/failed batches, all-failed batches, and failed-tool correction messages. Verify that failures do not enter judge evidence and remain visible to the next ReAct request.
-- Add Line Protocol tests for empty progress, valid number/evidence pairs, duplicate numbers, already-completed numbers, out-of-range values, missing or blank evidence, undeclared fields, and invalid nested blocks.
-- Cover the one-retry judge policy: an invalid first response is reissued with validation feedback; a second invalid response preserves progress and resumes ReAct rather than failing the execution.
-- Cover terminal behavior: a completed judge state permits a strict `ANSWER`; pending state rejects a no-tool answer, emits no criterion data to ReAct, consumes budget, and eventually yields a failed Execution answer at exhaustion.
-- Keep the focused routed Conversation-turn test to prove criteria reach its ReAct runner. It should assert the same public criterion-enabled behavior without testing database persistence internals.
-- Tests assert requests, protocol-visible output, Execution answers, and routed outcomes, rather than private collections or incidental helper ordering. Existing Task Analyzer, Task Router, ReAct, Runtime-context, Conversation, trace, and Line Protocol tests are prior art.
+- Use controlled ReAct model, Tool runtime, and judge responses through public ReAct and routed Task Router seams. Assert Tool effects, request contexts, judge counts, and Execution answers without live providers.
+- Cover all three no-tool statuses, with and without criteria and with zero prior Tool calls. Assert only no-tool `completed` starts judgment and that a positive verdict returns the candidate answer.
+- Cover Tool calls with ordinary reasoning text, Tool calls mixed with every status, mixed successful/failed batches, malformed decisions, and repeated `need_tool`; prove rejected calls have no Tool effects and continuations consume budget.
+- Verify the judge receives the candidate answer and policy-selected cumulative evidence, without Raw history outside the Runtime-context window.
+- Validate full per-criterion current verdicts: missing, duplicated, out-of-range, unordered, missing or blank evidence/gaps, inconsistent `ALL_COMPLETED`, and revalidation after later Tool work invalidates earlier success.
+- Verify whole-Goal judgments without criteria, including a pure explanation and an unverified external side effect.
+- Verify negative canonical verdicts enter ReAct context without criteria text; a later verdict replaces the earlier ReAct-facing one while host-held history reaches the judge.
+- Cover judge repair, repeated invalid judgment, provider failure, final-round rejection, trace/model-use accounting, and routed Conversation parity.
 
 ## Out of Scope
 
-- Changing deterministic routing or allowing Task Analyzer to choose an Execution mode.
-- Adding completion criteria or completion judgment to direct, tool-agent, or Plan–execute mode.
-- Persisting, checkpointing, resuming, or exposing ReAct criterion progress or evidence as durable Agent or Conversation state.
-- Changing Plan, Plan revisions, Plan steps, Plan-step Executor receipts, replanning, recovery, or MCP tool authority.
-- Changing concurrent Tool-call batch execution or Runtime-context Observation policy.
-- Giving the completion judge an independently configurable provider or using the Runtime-context component as the judge.
-- Exposing full model reasoning as progress evidence; judge evidence is a concise, checkable summary only.
+- Changing Task Analyzer's criterion generation or deterministic routing.
+- Adding judgment to Direct, tool-agent, or Plan–execute mode, or changing Plan-step Executor judgment.
+- Persisting or resuming ReAct criterion progress, judge verdicts, or Tool transcripts.
+- Changing Tool-call batch concurrency, Runtime-context Observation selection, Tool authority, or provider configuration.
+- Giving the judge Tool access or authority to write the final answer.
 
 ## Further Notes
 
-This replaces the earlier self-reported `REACT_PROGRESS` design. Criterion progress is intentionally absent from the main ReAct context: ReAct selects and corrects actions, while the completion judge evaluates completed tool work. The judge's criterion-progress context is the only model context that contains criterion text or status.
+This supersedes the per-Tool-batch ReAct judge design. Historical criterion evidence records what was once verified; current completion is a fresh verdict that may be false after subsequent work. The validated verdict is correction context for ReAct, while criteria text remains confined to the judge.

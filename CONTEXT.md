@@ -9,7 +9,7 @@ A strict UTF-8, line-oriented model-response representation in which a response 
 _Avoid_: JSON mode, JSON Schema, JSON object
 
 **No-tool response**:
-A legacy empty `NO_TOOL` Line Protocol block that formerly indicated a tool-capable model declined native tool calls. ReAct treats a no-tool response's content as its terminal result; the Plan-step Executor sends its pending no-tool response to a separate Completion judge before requesting a final handoff.
+A model response containing no native Tool calls. In ReAct it carries a structured ReAct decision; in Plan-step execution a pending no-tool response goes to the separate Completion judge before a final handoff.
 _Avoid_: required no-tool marker, self-declared Plan-step completion
 
 **OpenAI-compatible provider**:
@@ -61,8 +61,12 @@ An Execution mode limited to one language-model request and at most one Tool exe
 _Avoid_: single-round ReAct, executor
 
 **ReAct mode**:
-An Ephemeral Execution mode that iterates language-model requests and Tool executions toward one answer, without a Planner or Plan. It ends when a model response has no native tool calls; that response's content is the final answer.
+An Ephemeral Execution mode that iterates language-model requests and Tool executions toward one answer, without a Planner or Plan. It returns a completed answer only when a no-tool ReAct decision proposes completion and a separate Completion judge confirms it.
 _Avoid_: Executor, plan execution
+
+**ReAct decision**:
+The locally validated no-tool response in which ReAct declares `completed`, `failed`, or `need_tool`. A completed decision carries ReAct's candidate answer and requests Completion judgment; the other statuses do not.
+_Avoid_: final answer, Completion judgment
 
 **Plan–execute mode**:
 An Execution mode in which an Agent obtains a Plan from a Planner and completes its Plan steps through the Plan-step Executor. Its Execution answer is the last completed Plan step's handoff.
@@ -205,7 +209,7 @@ A LangChain chat model configured for an OpenAI-compatible provider that can req
 _Avoid_: text stream, planner model
 
 **Completion judge**:
-A tool-free Model role that evaluates available execution evidence against completion criteria and returns a locally validated judgment. The host alone records criterion progress from that judgment.
+A tool-free Model role that evaluates available execution evidence against completion criteria or, for ReAct without criteria, the whole Goal. The host accepts ReAct's candidate answer only after a positive current-state judgment.
 _Avoid_: Tool-calling model, Runtime-context Observation
 
 **Tool-call batch**:
@@ -245,5 +249,5 @@ The conservative static classification of an `exec` command under the Tool-call 
 _Avoid_: command intent, heuristic safety classification
 
 **Runtime context window**:
-The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. Its rendered Goal is a distinct section near the end; ReAct Completion criteria status follows it when criteria are available. The durable goal remains part of Agent state. It has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
+The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. Its rendered Goal is a distinct section near the end. ReAct criteria text belongs to the Completion judge's context; the latest validated negative judgment may return to ReAct as correction context. The durable goal remains part of Agent state. The window has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
 _Avoid_: Durable State, message transcript

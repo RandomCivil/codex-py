@@ -1,4 +1,14 @@
-"""Small controlled doubles shared by execution-mode tests."""
+"""Small controlled doubles and protocol builders shared by execution-mode tests."""
+
+import json
+
+
+def react_decision(status, field=None, value=None):
+    """Build a valid ReAct decision response for a controlled model double."""
+    lines = ["BEGIN REACT_DECISION", f"STATUS={json.dumps(status)}"]
+    if field is not None:
+        lines.append(f"{field}={json.dumps(value)}")
+    return "\n".join([*lines, "END REACT_DECISION"])
 
 
 class ToolModel:

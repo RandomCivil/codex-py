@@ -51,15 +51,18 @@ class ReactModel:
                     content="",
                     tool_calls=[{"name": "write_file", "args": {"path": "note"}, "id": "write-1"}],
                 ),
-                AIMessage(content="Done"),
+                AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done"\nEND REACT_DECISION'),
             )
         )
 
     def bind_tools(self, _tools):
+        self.tools = _tools
         return self
 
     async def ainvoke(self, messages):
         self.requests.append(messages)
+        if self.tools == ():
+            return AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="The supplied context supports the answer"\nEND GOAL_JUDGMENT')
         return next(self.responses)
 
 
@@ -183,7 +186,7 @@ def test_react_retries_with_failed_tool_message_at_the_end_of_context():
                     content="",
                     tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
                 ),
-                AIMessage(content="Recovered"),
+                AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Recovered"\nEND REACT_DECISION'),
             )
         )
 
@@ -214,7 +217,7 @@ def test_react_retries_with_mcp_text_error_message_at_the_end_of_context():
                     content="",
                     tool_calls=[{"name": "apply_patch", "args": {}, "id": "write-1"}],
                 ),
-                AIMessage(content="Recovered"),
+                AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Recovered"\nEND REACT_DECISION'),
             )
         )
 

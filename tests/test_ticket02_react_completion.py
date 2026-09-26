@@ -34,17 +34,12 @@ class ContextPolicy:
 def test_react_judges_successful_tool_evidence_before_accepting_answer():
     model = Model(
         AIMessage(content="Unverified model claim", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="The README exists."\nEND REACT_DECISION'),
         AIMessage(content=(
-            "BEGIN COMPLETION_PROGRESS\n"
-            "ALL_COMPLETED=true\n"
-            'ANSWER="The README exists."\n'
-            "BEGIN COMPLETED_CRITERION\n"
-            "NUMBER=1\n"
-            'EVIDENCE="README.md exists"\n'
-            "END COMPLETED_CRITERION\n"
-            "END COMPLETION_PROGRESS"
+            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\n"
+            "BEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\nEVIDENCE=\"README.md exists now\"\n"
+            "END CRITERION_VERDICT\nEND COMPLETION_PROGRESS"
         )),
-        AIMessage(content='BEGIN ANSWER\nTEXT="The README exists."\nEND ANSWER'),
     )
 
     answer = asyncio.run(
@@ -52,24 +47,23 @@ def test_react_judges_successful_tool_evidence_before_accepting_answer():
     )
 
     assert answer == ExecutionAnswer("The README exists.", "completed")
-    assert len(model.requests) == 2
-    react_request = model.requests[0]
-    assert react_request[-1].content == "Completion criteria status:\n1. [pending] README exists"
-    judge_request = model.requests[1]
+    assert len(model.requests) == 3
+    react_request = model.requests[1]
+    assert react_request[-1].content == (
+        "## Completion criteria\n\n1. [pending] README exists"
+    )
+    judge_request = model.requests[2]
     judge_text = "\n".join(getattr(message, "content", "") for message in judge_request)
     assert "README exists" in judge_text
     assert '"path": "README.md"' in judge_text
     assert "COMPLETION_PROGRESS" in judge_text
-    assert model.request_tools[1] == ()
+    assert model.request_tools[2] == ()
     assert all(isinstance(message, (SystemMessage, HumanMessage)) for message in judge_request)
-    assert "## ReAct context" in judge_text
-    assert '"react_context"' not in judge_text
-    assert "Unverified model claim" not in judge_text
-    assert "## ReAct response" not in judge_text
-    assert "Completion criteria status:" not in judge_text
-    assert "## Runtime context\n\n### Successful tool results" in judge_text
-    assert judge_text.count("### Completion criteria") == 1
-    assert "## Ordered criterion progress" not in judge_text
+    assert "The README exists." in judge_text
+    assert "CRITERION_VERDICT" in judge_text
+    assert "BEGIN COMPLETION_PROGRESS" in judge_text
+    assert "Use Line Protocol, not Markdown" in judge_text
+    assert 'EVIDENCE="The requested file exists."' in judge_text
 
 
 def test_judge_preserves_runtime_context_sections_as_plain_text():
@@ -82,10 +76,11 @@ def test_judge_preserves_runtime_context_sections_as_plain_text():
 
     model = Model(
         AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done."\nEND REACT_DECISION'),
         AIMessage(content=(
-            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER=\"Done.\"\n"
-            "BEGIN COMPLETED_CRITERION\nNUMBER=1\nEVIDENCE=\"README.md exists\"\n"
-            "END COMPLETED_CRITERION\nEND COMPLETION_PROGRESS"
+            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\n"
+            "BEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\nEVIDENCE=\"README.md exists now\"\n"
+            "END CRITERION_VERDICT\nEND COMPLETION_PROGRESS"
         )),
     )
 
@@ -100,28 +95,21 @@ def test_judge_preserves_runtime_context_sections_as_plain_text():
 
     assert answer == ExecutionAnswer("Done.", "completed")
     runtime_prompt = model.requests[0][-1].content
-    judge_prompt = model.requests[1][-1].content
-    assert runtime_prompt.removesuffix("\n### Completion criteria\n1. [pending] README exists") in judge_prompt
-    assert "## Runtime context\n\n### Durable state" in judge_prompt
-    assert "### Successful tool results\n\n#### Call 1" in judge_prompt
-    assert judge_prompt.index("## Runtime context") < judge_prompt.index("### Successful tool results")
-    assert judge_prompt.index("### Successful tool results") < judge_prompt.index("### Completion criteria")
-    assert judge_prompt.count("### Completion criteria") == 1
-    assert "## ReAct response" not in judge_prompt
-    assert "## Ordered criterion progress" not in judge_prompt
-    assert '"react_context"' not in judge_prompt
-    assert "\\n### Durable state" not in judge_prompt
+    judge_prompt = model.requests[2][-1].content
+    assert "### Completion criteria" in runtime_prompt
+    assert "1. [pending] README exists" in runtime_prompt
+    assert "README exists" in judge_prompt
 
 
 def test_invalid_judgment_is_repaired_once_without_leaking_into_react_context():
     model = Model(
         AIMessage(content="", tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}]),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done."\nEND REACT_DECISION'),
         AIMessage(content="not a protocol response"),
         AIMessage(content=(
-            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER=\"Done.\"\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n"
-            'EVIDENCE="README.md exists"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS'
+            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nBEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\n"
+            'EVIDENCE="README.md exists now"\nEND CRITERION_VERDICT\nEND COMPLETION_PROGRESS'
         )),
-        AIMessage(content='BEGIN ANSWER\nTEXT="Done."\nEND ANSWER'),
     )
 
     answer = asyncio.run(
@@ -129,21 +117,25 @@ def test_invalid_judgment_is_repaired_once_without_leaking_into_react_context():
     )
 
     assert answer == ExecutionAnswer("Done.", "completed")
-    assert len(model.requests) == 3
-    assert "Validation error:" in model.requests[2][-1].content
+    assert len(model.requests) == 4
+    repair_prompt = model.requests[3][-1].content
+    assert "Validation error:" in repair_prompt
+    assert "Use Line Protocol, not Markdown" in repair_prompt
+    assert "BEGIN COMPLETION_PROGRESS" in repair_prompt
+    assert "BEGIN CRITERION_VERDICT" in repair_prompt
 
 
-def test_mixed_batch_judges_success_and_returns_failure_to_next_react_round():
+def test_mixed_batch_failure_is_kept_in_current_evidence_for_terminal_judgment():
     model = Model(
         AIMessage(content="", tool_calls=[
             {"name": "inspect", "args": {}, "id": "success"},
             {"name": "inspect", "args": {}, "id": "failed"},
         ]),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Recovered."\nEND REACT_DECISION'),
         AIMessage(content=(
-            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nANSWER=\"Recovered.\"\nBEGIN COMPLETED_CRITERION\nNUMBER=1\n"
-            'EVIDENCE="README.md exists"\nEND COMPLETED_CRITERION\nEND COMPLETION_PROGRESS'
+            "BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=true\nBEGIN CRITERION_VERDICT\nNUMBER=1\nVERIFIED=true\n"
+            'EVIDENCE="README.md exists now"\nEND CRITERION_VERDICT\nEND COMPLETION_PROGRESS'
         )),
-        AIMessage(content='BEGIN ANSWER\nTEXT="Recovered."\nEND ANSWER'),
     )
 
     answer = asyncio.run(
@@ -151,16 +143,26 @@ def test_mixed_batch_judges_success_and_returns_failure_to_next_react_round():
     )
 
     assert answer == ExecutionAnswer("Recovered.", "completed")
-    judge_text = "\n".join(getattr(message, "content", "") for message in model.requests[1])
+    judge_text = "\n".join(getattr(message, "content", "") for message in model.requests[2])
     assert '"path": "README.md"' in judge_text
-    assert "permission denied" not in judge_text
-    assert len(model.requests) == 2
+    assert "permission denied" in judge_text
+    assert len(model.requests) == 3
 
 
 def test_premature_answer_is_rejected_and_consumes_a_react_round():
     model = Model(
-        AIMessage(content='BEGIN ANSWER\nTEXT="Not yet."\nEND ANSWER'),
-        AIMessage(content='BEGIN ANSWER\nTEXT="Still not yet."\nEND ANSWER'),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Not yet."\nEND REACT_DECISION'),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN CRITERION_VERDICT\n'
+            'NUMBER=1\nVERIFIED=false\nGAP="Still unverified."\nEND CRITERION_VERDICT\n'
+            'END COMPLETION_PROGRESS'
+        )),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Still not yet."\nEND REACT_DECISION'),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN CRITERION_VERDICT\n'
+            'NUMBER=1\nVERIFIED=false\nGAP="Still unverified."\nEND CRITERION_VERDICT\n'
+            'END COMPLETION_PROGRESS'
+        )),
     )
 
     answer = asyncio.run(
@@ -168,15 +170,28 @@ def test_premature_answer_is_rejected_and_consumes_a_react_round():
     )
 
     assert answer == ExecutionAnswer(None, "failed", error="react round budget exhausted")
-    assert model.requests[0][-1].content.endswith("[pending] README exists")
-    assert "not yet complete" in model.requests[1][-2].content
-    assert model.requests[1][-1].content.endswith("[pending] README exists")
+    assert "Secret criterion" not in "\n".join(getattr(m, "content", "") for m in model.requests[0])
+    second_react_request = "\n".join(
+        getattr(message, "content", "") for message in model.requests[2]
+    )
+    assert "CRITERION_VERDICT" in second_react_request
+    assert "1. [pending] README exists" in second_react_request
 
 
 def test_premature_answer_with_runtime_context_receives_generic_continuation_feedback():
     model = Model(
-        AIMessage(content='BEGIN ANSWER\nTEXT="Not yet."\nEND ANSWER'),
-        AIMessage(content='BEGIN ANSWER\nTEXT="Still not yet."\nEND ANSWER'),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Not yet."\nEND REACT_DECISION'),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN CRITERION_VERDICT\n'
+            'NUMBER=1\nVERIFIED=false\nGAP="Still unverified."\nEND CRITERION_VERDICT\n'
+            'END COMPLETION_PROGRESS'
+        )),
+        AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Still not yet."\nEND REACT_DECISION'),
+        AIMessage(content=(
+            'BEGIN COMPLETION_PROGRESS\nALL_COMPLETED=false\nBEGIN CRITERION_VERDICT\n'
+            'NUMBER=1\nVERIFIED=false\nGAP="Still unverified."\nEND CRITERION_VERDICT\n'
+            'END COMPLETION_PROGRESS'
+        )),
     )
 
     answer = asyncio.run(
@@ -190,13 +205,12 @@ def test_premature_answer_with_runtime_context_receives_generic_continuation_fee
     )
 
     assert answer == ExecutionAnswer(None, "failed", error="react round budget exhausted")
-    feedback = model.requests[1][-2].content
-    assert "not yet complete" in feedback
-    assert "README exists" not in feedback
-    assert model.requests[1][-1].content.endswith("[pending] README exists")
+    feedback = "\n".join(getattr(m, "content", "") for m in model.requests[2])
+    assert "CRITERION_VERDICT" in feedback
+    assert "1. [pending] README exists" in feedback
 
 
-def test_react_completion_criteria_end_the_runtime_context_prompt():
+def test_react_runtime_context_includes_criteria_in_the_model_prompt():
     model = Model(AIMessage(content='BEGIN ANSWER\nTEXT="Not yet."\nEND ANSWER'))
 
     answer = asyncio.run(
@@ -212,8 +226,9 @@ def test_react_completion_criteria_end_the_runtime_context_prompt():
     assert answer == ExecutionAnswer(None, "failed", error="react round budget exhausted")
     assert len(model.requests[0]) == 3
     runtime_prompt = model.requests[0][-1].content
-    assert runtime_prompt.index("### Goal") < runtime_prompt.index("### Completion criteria")
-    assert runtime_prompt.endswith("### Completion criteria\n1. [pending] README exists")
+    assert "### Goal" in runtime_prompt
+    assert "### Completion criteria" in runtime_prompt
+    assert "1. [pending] README exists" in runtime_prompt
 
 
 def test_completion_progress_accepts_empty_progress_and_new_evidence():

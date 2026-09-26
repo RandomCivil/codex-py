@@ -2,8 +2,10 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any, Literal, Mapping, Protocol
 
 import httpx
@@ -20,7 +22,7 @@ from llm.text_stream import validated_text, validation_feedback_instructions
 from agent.runtime_context import RuntimeContext, RuntimeContextPolicy, observation_decision_context
 from agent.tool_binding import canonical_mcp_tool_set
 from agent.tool_results import tool_result_failed
-from llm.line_protocol import CompletionJudgment, LineProtocolError, decode_answer, decode_completion_judgment
+from llm.line_protocol import CompletionJudgment, LineProtocolError, ReactDecision, decode_answer, decode_completion_judgment, decode_goal_judgment, decode_react_decision
 
 
 ExecutionStatus = Literal["completed", "failed", "blocked"]
@@ -73,57 +75,100 @@ your next tool call must use an available bound write tool. Do not make further 
 tool calls. If no bound write tool is available, return a final answer that explicitly
 reports the outcome as blocked because no write tool is available.
 Native function calls take precedence over accompanying text. When no tool call is needed,
-return the final answer as plain text in the response content. Accompanying text on a
-tool-call response is intermediate reasoning and is not a completion report.
+return exactly one REACT_DECISION Line Protocol block with no surrounding prose:
+completed requires STATUS="completed" and a nonempty ANSWER; failed requires
+STATUS="failed" and a nonempty ERROR; need_tool requires STATUS="need_tool" only.
+ANSWER and ERROR values must each be one JSON string literal on one physical protocol
+line. Serialize a multiline or quoted answer before emitting it: use `\\n` for newlines
+and `\\"` for embedded double quotes; never put literal newlines inside either field.
+Use need_tool when you need another round to select a tool. Example:
+BEGIN REACT_DECISION
+STATUS="completed"
+ANSWER="The requested result is ready."
+END REACT_DECISION
+Accompanying text on a tool-call response is intermediate reasoning.
 """
 
 
-_COMPLETION_JUDGE_INSTRUCTIONS = """You are a completion judge for a ReAct execution.
-Evaluate only the successful tool calls and their raw results in the supplied Runtime context against
-the ordered criteria. Return exactly one COMPLETION_PROGRESS Line Protocol block and no prose.
-Report only newly proven criteria, and include ALL_COMPLETED as a JSON boolean. If and
-only if every criterion is complete, include a concise final ANSWER. The block may have
-no COMPLETED_CRITERION children when this batch proves nothing.
-Each completed criterion must contain its one-based NUMBER and concise, directly checkable
-EVIDENCE. Do not infer completion from model claims in the prior context.
-ANSWER is a JSON-string field inside COMPLETION_PROGRESS; never emit BEGIN ANSWER or
-END ANSWER.
-The host records progress only from COMPLETED_CRITERION blocks. A complete-looking
-ANSWER, a summary of the implementation, or a model claim does not
-change the locally recorded criterion state. Set ALL_COMPLETED=true only when every
-criterion is already recorded as complete or is proven in this batch and reported in a
-COMPLETED_CRITERION block. If this batch proves no new criteria and some criteria remain
-pending, return ALL_COMPLETED=false with no ANSWER.
+_REACT_DECISION_REPAIR_INSTRUCTIONS = """Return one valid REACT_DECISION block.
+ANSWER must be one JSON string literal on one physical line; ERROR uses the same rule.
+Encode literal newlines as `\\n` and embedded double quotes as `\\"`. For example:
+BEGIN REACT_DECISION
+STATUS="completed"
+ANSWER="First line\\n\\nA quoted value: \\"example\\""
+END REACT_DECISION"""
 
-Example with progress:
-BEGIN COMPLETION_PROGRESS
-ALL_COMPLETED=false
-BEGIN COMPLETED_CRITERION
-NUMBER=1
-EVIDENCE="The requested file exists"
-END COMPLETED_CRITERION
-END COMPLETION_PROGRESS
 
-Example with no progress, even when the answer sounds complete:
-BEGIN COMPLETION_PROGRESS
-ALL_COMPLETED=false
-END COMPLETION_PROGRESS
+_GOAL_JUDGE_INSTRUCTIONS = """You are a tool-free Completion judge. Judge whether the whole Goal is
+currently satisfied by the available evidence and ReAct's candidate answer. Return exactly
+one GOAL_JUDGMENT Line Protocol block without prose. Use COMPLETED=true and nonempty
+EVIDENCE when the Goal is met; otherwise use COMPLETED=false and nonempty GAP.
+An explanatory answer may satisfy a Goal without Tool calls. Do not treat a claimed
+external effect as verified solely because ReAct says it happened.
+"""
 
-Example when all criteria are complete:
+
+_COMPLETION_JUDGE_FORMAT = """Use Line Protocol, not Markdown, JSON, prose, or a table. Your entire
+response must start with `BEGIN COMPLETION_PROGRESS` and end with `END COMPLETION_PROGRESS`.
+Write one `NAME=JSON_LITERAL` field per line: use `=` (never `:`), JSON booleans (`true` or
+`false`), and JSON-quoted strings for EVIDENCE and GAP. Put every verdict in its own
+`BEGIN CRITERION_VERDICT` / `END CRITERION_VERDICT` block.
+
+Example when two criteria are verified:
 BEGIN COMPLETION_PROGRESS
 ALL_COMPLETED=true
-ANSWER="The requested result is complete."
-BEGIN COMPLETED_CRITERION
+BEGIN CRITERION_VERDICT
 NUMBER=1
-EVIDENCE="The requested file exists"
-END COMPLETED_CRITERION
+VERIFIED=true
+EVIDENCE="The requested file exists."
+END CRITERION_VERDICT
+BEGIN CRITERION_VERDICT
+NUMBER=2
+VERIFIED=true
+EVIDENCE="Its required contents were inspected."
+END CRITERION_VERDICT
 END COMPLETION_PROGRESS
+
+Example when the second criterion remains unverified:
+BEGIN COMPLETION_PROGRESS
+ALL_COMPLETED=false
+BEGIN CRITERION_VERDICT
+NUMBER=1
+VERIFIED=true
+EVIDENCE="The requested file exists."
+END CRITERION_VERDICT
+BEGIN CRITERION_VERDICT
+NUMBER=2
+VERIFIED=false
+GAP="Its required contents are not available in the evidence."
+END CRITERION_VERDICT
+END COMPLETION_PROGRESS"""
+
+
+_COMPLETION_JUDGE_INSTRUCTIONS = f"""You are a tool-free Completion judge for a terminal ReAct proposal.
+Evaluate every ordered criterion against the current evidence and return exactly one
+COMPLETION_PROGRESS block with one CRITERION_VERDICT for each criterion. Each verdict
+must contain NUMBER, VERIFIED, and exactly one nonempty EVIDENCE when VERIFIED=true or
+GAP when VERIFIED=false. Numbers must be one-based and ordered. ALL_COMPLETED must equal
+the conjunction of the current VERIFIED values. Never write the user-facing answer.
+
+{_COMPLETION_JUDGE_FORMAT}
 """
 
 
 def _bind_tools(model: Any, tools: Any) -> Any:
     """Bind native tools; final non-tool answers use the local ANSWER codec."""
     return model.bind_tools(tools)
+
+
+def _contains_react_decision_block(content: str) -> bool:
+    """Recognize a ReAct decision attempt before decoding its validity."""
+    return bool(re.search(r"(?im)^BEGIN[ _]REACT_DECISION(?:[ \t]*)$", content))
+
+
+def _begins_line_protocol_block(content: str) -> bool:
+    """Keep malformed or wrong protocol blocks on the protocol-repair path."""
+    return bool(re.match(r"(?i)^BEGIN[ _][A-Z][A-Z0-9_]*[ \t]*(?:\r?\n|$)", content))
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,7 +398,7 @@ class ToolAgentMode:
 
 
 class ReactMode:
-    """Iterate model/tool rounds until a structured completion proof is returned."""
+    """Iterate model/tool rounds until a proposed answer passes Completion judgment."""
 
     def __init__(
         self,
@@ -389,7 +434,9 @@ class ReactMode:
 
     async def run(self, goal: Any) -> ExecutionAnswer:
         goal = conversation_model_input(goal)
-        completed_criteria: set[int] = set()
+        latest_goal_judgment: HumanMessage | None = None
+        latest_criterion_judgment: HumanMessage | None = None
+        historical_criterion_evidence: dict[int, list[str]] = {}
         try:
             async with self._runtime as runtime:
                 tools = canonical_mcp_tool_set(runtime.tools)
@@ -419,11 +466,15 @@ class ReactMode:
                     # the next ReAct tool round.
                     model = self._model.bind_tools(tools)
                     request_messages = list(messages)
-                    completion_status = (
-                        _completion_criteria_status(self._completion_criteria, completed_criteria)
-                        if self._completion_criteria else None
-                    )
                     criteria_in_runtime_context = False
+                    criteria_status = (
+                        _completion_criteria_status(
+                            self._completion_criteria,
+                            set(historical_criterion_evidence),
+                        )
+                        if self._completion_criteria
+                        else None
+                    )
                     if policy is not None:
                         phase = "runtime context maintenance"
                         policy.record_model_use()
@@ -433,22 +484,19 @@ class ReactMode:
                         # an undocumented second memory channel.
                         if isinstance(context, RuntimeContext):
                             context_messages = context.as_messages(
-                                completion_criteria_status=completion_status
+                                completion_criteria_status=criteria_status
                             )
-                            criteria_in_runtime_context = completion_status is not None
+                            criteria_in_runtime_context = criteria_status is not None
                         else:
                             context_messages = context.as_messages()
                         request_messages = [
                             messages[0], messages[1], *context_messages,
                             *pending_messages,
                         ]
-                    if completion_status is not None and not criteria_in_runtime_context:
-                        request_messages.append(
-                            HumanMessage(
-                                content="Completion criteria status:\n"
-                                + completion_status
-                            )
-                        )
+                    if criteria_status is not None and not criteria_in_runtime_context:
+                        request_messages.append(HumanMessage(content=(
+                            "## Completion criteria\n\n" + criteria_status
+                        )))
                     trace_llm_request(
                         self._trace,
                         "react",
@@ -465,18 +513,82 @@ class ReactMode:
                     phase = "model response processing"
                     calls = list(getattr(response, "tool_calls", []) or [])
                     content = _message_text(response) if getattr(response, "content", None) not in (None, "") else ""
-                    if not calls:
-                        if self._completion_criteria:
-                            if len(completed_criteria) == len(self._completion_criteria):
-                                if not content.strip():
-                                    return ExecutionAnswer(None, "failed", error="react model returned an empty final response")
-                                return ExecutionAnswer(content, "completed")
-                            continuation = HumanMessage(
-                                content="The requested outcome is not yet complete. Continue working with the available tools."
+                    if calls and _contains_react_decision_block(content):
+                        continuation = HumanMessage(
+                            content=(
+                                "Protocol error: a response with Tool calls cannot declare a "
+                                "REACT_DECISION status. Return ordinary reasoning with Tool calls "
+                                "or one valid REACT_DECISION block without Tool calls."
                             )
+                        )
+                        if policy is None:
+                            messages.extend((response, continuation))
+                        else:
+                            pending_messages = [continuation]
+                        if round_number == self._max_rounds:
+                            return ExecutionAnswer(None, "failed", error="react round budget exhausted")
+                        continue
+                    if not calls:
+                        try:
+                            decision = decode_react_decision(content)
+                        except LineProtocolError as error:
+                            if content.strip() and not _begins_line_protocol_block(content):
+                                # Some OpenAI-compatible providers emit a complete
+                                # no-tool answer but ignore the requested envelope.
+                                # It remains only a candidate: the existing
+                                # Completion judge decides whether to accept it.
+                                decision = ReactDecision("completed", answer=content)
+                            else:
+                                continuation = HumanMessage(
+                                    content=(
+                                        f"Protocol error: {error}. "
+                                        + _REACT_DECISION_REPAIR_INSTRUCTIONS
+                                    )
+                                )
+                                if policy is None:
+                                    messages.extend((response, continuation))
+                                else:
+                                    pending_messages = [continuation]
+                                if round_number == self._max_rounds:
+                                    return ExecutionAnswer(None, "failed", error="react round budget exhausted")
+                                continue
+                        if decision.status == "failed":
+                            return ExecutionAnswer(None, "failed", error=decision.error)
+                        if decision.status == "need_tool":
+                            continuation = HumanMessage(content="Select a Tool in the next round or explicitly fail.")
                             if policy is None:
-                                messages.append(response)
-                                messages.append(continuation)
+                                messages.extend((response, continuation))
+                            else:
+                                pending_messages = [continuation]
+                            if round_number == self._max_rounds:
+                                return ExecutionAnswer(None, "failed", error="react round budget exhausted")
+                            continue
+                        if self._completion_criteria:
+                            phase = "completion judgment"
+                            judged = await self._judge_completion(
+                                request_messages,
+                                response,
+                                historical_criterion_evidence,
+                                policy,
+                            )
+                            if judged is not None and judged.all_completed:
+                                return ExecutionAnswer(decision.answer, "completed")
+                            if judged is not None:
+                                for number, verified, detail in judged.verdicts:
+                                    if verified:
+                                        historical_criterion_evidence.setdefault(number, []).append(detail)
+                            if judged is None:
+                                continuation = HumanMessage(content=(
+                                    "Completion judge validation failed after one repair request. "
+                                    "Continue ReAct without treating the rejected candidate as complete."
+                                ))
+                            else:
+                                continuation = HumanMessage(content=_criterion_judgment_feedback(judged))
+                            if policy is None:
+                                if latest_criterion_judgment is not None:
+                                    messages.remove(latest_criterion_judgment)
+                                messages.extend((continuation,))
+                                latest_criterion_judgment = continuation
                             else:
                                 # The policy rebuilds each request from its own
                                 # context, so retain this host feedback as a
@@ -485,13 +597,54 @@ class ReactMode:
                             if round_number == self._max_rounds:
                                 return ExecutionAnswer(None, "failed", error="react round budget exhausted")
                             continue
-                        if not content.strip():
-                            return ExecutionAnswer(
-                                None,
-                                "failed",
-                                error="react model returned an empty final response",
+                        phase = "completion judgment"
+                        current_exchange = [*request_messages, response]
+                        rendered_exchange = "\n".join(
+                            _render_judge_message(
+                                message,
+                                f"Message {number}",
+                                content=_message_reference(message)["content"],
                             )
-                        return ExecutionAnswer(content, "completed")
+                            for number, message in enumerate(current_exchange, 1)
+                        )
+                        judge_context = [
+                            SystemMessage(content=_GOAL_JUDGE_INSTRUCTIONS),
+                            HumanMessage(content=(
+                                f"Goal: {goal}\nCandidate answer: {decision.answer}\n"
+                                f"Current ReAct request and response:\n{rendered_exchange}"
+                            )),
+                        ]
+                        accepted, evidence_or_gap, judgment_valid = await self._judge_goal(
+                            judge_context,
+                            policy,
+                        )
+                        if accepted:
+                            return ExecutionAnswer(decision.answer, "completed")
+                        if not judgment_valid:
+                            continuation = HumanMessage(content=(
+                                "Completion judge validation failed after one repair request: "
+                                f"{evidence_or_gap}. Continue ReAct without treating the rejected candidate as complete."
+                            ))
+                        else:
+                            continuation = HumanMessage(content=(
+                                "BEGIN GOAL_JUDGMENT\n"
+                                "COMPLETED=false\n"
+                                f"GAP={json.dumps(evidence_or_gap, ensure_ascii=False)}\n"
+                                "END GOAL_JUDGMENT"
+                            ))
+                        if policy is None:
+                            # Keep only the latest validated verdict. The rejected
+                            # candidate is neither useful correction context nor
+                            # evidence for the next ReAct decision.
+                            if latest_goal_judgment is not None:
+                                messages.remove(latest_goal_judgment)
+                            messages.append(continuation)
+                            latest_goal_judgment = continuation
+                        else:
+                            pending_messages = [continuation]
+                        if round_number == self._max_rounds:
+                            return ExecutionAnswer(None, "failed", error="react round budget exhausted")
+                        continue
                     # Once Runtime context is active, its instantaneous
                     # snapshot is the only historical source for subsequent
                     # requests.  Keep the legacy transcript only for the
@@ -540,18 +693,6 @@ class ReactMode:
                             for call, (content, is_error, _) in zip(calls, results)
                             if is_error
                         ]
-                    if self._completion_criteria and any(not is_error for _, is_error, _ in results):
-                        phase = "completion judgment"
-                        judged = await self._judge_completion(
-                            request_messages,
-                            calls,
-                            results,
-                            completed_criteria,
-                            policy,
-                        )
-                        completed_criteria.update(number for number, _ in judged.completed)
-                        if judged.all_completed:
-                            return ExecutionAnswer(judged.answer, "completed")
                     if round_number == self._max_rounds:
                         return ExecutionAnswer(None, "failed", error="react round budget exhausted")
         except LineProtocolError as error:
@@ -579,54 +720,84 @@ class ReactMode:
     async def _judge_completion(
         self,
         request_messages: list[Any],
-        calls: list[Mapping[str, Any]],
-        results: list[tuple[str, bool, Any]],
-        completed_criteria: set[int],
+        response: Any,
+        historical_evidence: Mapping[int, list[str]],
         policy: RuntimeContextPolicy | Any | None,
-    ) -> CompletionJudgment:
-        """Judge one settled batch, repairing one malformed judgment at most once."""
+    ) -> CompletionJudgment | None:
+        """Judge a terminal proposal, repairing one malformed judgment at most once."""
         progress = "\n".join(
-            f"{number}. [{'completed' if number in completed_criteria else 'pending'}] {criterion}"
+            f"{number}. {criterion}"
             for number, criterion in enumerate(self._completion_criteria, 1)
         )
         context = [
             SystemMessage(content=_COMPLETION_JUDGE_INSTRUCTIONS),
             HumanMessage(
-                content=_completion_judge_evidence(
-                    request_messages, calls, results, progress
+                content=_criterion_judge_evidence(
+                    request_messages, response, historical_evidence, progress
                 )
             ),
         ]
-        judge = await self._invoke_completion_judge(context, policy, request_kind="completion_judge")
+        judgment, _ = await self._judge_with_single_repair(
+            context,
+            policy,
+            decode=lambda content: decode_completion_judgment(
+                content, criterion_count=len(self._completion_criteria)
+            ),
+            block_name="COMPLETION_PROGRESS",
+        )
+        return judgment
+
+    async def _judge_goal(
+        self,
+        context: list[Any],
+        policy: RuntimeContextPolicy | Any | None,
+    ) -> tuple[bool, str, bool]:
+        """Judge a terminal whole-Goal proposal and repair one invalid response."""
+        judgment, error = await self._judge_with_single_repair(
+            context,
+            policy,
+            decode=decode_goal_judgment,
+            block_name="GOAL_JUDGMENT",
+        )
+        if error is not None:
+            return False, str(error), False
+        completed, detail = judgment
+        return completed, detail, True
+
+    async def _judge_with_single_repair(
+        self,
+        context: list[Any],
+        policy: RuntimeContextPolicy | Any | None,
+        *,
+        decode: Callable[[str], Any],
+        block_name: str,
+    ) -> tuple[Any | None, LineProtocolError | None]:
+        """Decode a judge verdict, issuing at most one protocol repair request."""
+        judged = await self._invoke_completion_judge(
+            context, policy, request_kind="completion_judge"
+        )
         try:
-            return decode_completion_judgment(
-                _message_text(judge),
-                criterion_count=len(self._completion_criteria),
-                completed_criteria=frozenset(completed_criteria),
-            )
+            return decode(_message_text(judged)), None
         except LineProtocolError as error:
             trace_llm_validation_retry(self._trace, "completion_judge", error)
             repair = [
                 *context,
-                HumanMessage(
-                    content=(
-                        f"Validation error: {error}\nRejected output (JSON-encoded): "
-                        + json.dumps(_message_text(judge), ensure_ascii=False)
-                        + "\nReturn the corrected COMPLETION_PROGRESS block only."
-                    )
-                ),
+                HumanMessage(content=(
+                    f"Validation error: {error}\nRejected output (JSON-encoded): "
+                    + json.dumps(_message_text(judged), ensure_ascii=False)
+                    + f"\nReturn the corrected {block_name} block only.\n\n"
+                    + _COMPLETION_JUDGE_FORMAT
+                )),
             ]
             repaired = await self._invoke_completion_judge(
-                repair, policy, request_kind="completion_judge_repair"
+                repair,
+                policy,
+                request_kind="completion_judge_repair",
             )
             try:
-                return decode_completion_judgment(
-                    _message_text(repaired),
-                    criterion_count=len(self._completion_criteria),
-                    completed_criteria=frozenset(completed_criteria),
-                )
-            except LineProtocolError:
-                return CompletionJudgment((), False)
+                return decode(_message_text(repaired)), None
+            except LineProtocolError as repair_error:
+                return None, repair_error
 
     async def _invoke_completion_judge(
         self,
@@ -643,7 +814,7 @@ class ReactMode:
             "completion_judge",
             messages,
             static_shape={
-                "instructions": _COMPLETION_JUDGE_INSTRUCTIONS,
+                "instructions": messages[0].content,
                 "tools": None,
                 "request_kind": request_kind,
             },
@@ -687,6 +858,46 @@ def render_tool_result(value: Any) -> str:
     if content is not None:
         return render_tool_result(content)
     raise ValueError("tool result cannot be rendered")
+
+
+def _criterion_judge_evidence(
+    request_messages: list[Any],
+    response: Any,
+    historical_evidence: Mapping[int, list[str]],
+    progress: str,
+) -> str:
+    """Render terminal ReAct evidence while keeping criteria judge-only."""
+    sections = [
+        "## ReAct completion review",
+        f"### Goal\n{_message_reference(request_messages[1])['content']}",
+        f"### Candidate answer\n{_message_text(response)}",
+        "### Ordered completion criteria\n" + progress,
+    ]
+    evidence_sections = ["### Historically confirmed criterion evidence"]
+    evidence_sections.extend(
+        f"{number}.{index}. {evidence}"
+        for number, values in sorted(historical_evidence.items())
+        for index, evidence in enumerate(values, 1)
+    )
+    sections.append("\n\n".join(evidence_sections))
+    sections.append("### Current ReAct request and response\n" + "\n".join(
+        _render_judge_message(message, f"Message {number}", content=_message_reference(message)["content"])
+        for number, message in enumerate([*request_messages, response], 1)
+    ))
+    return "\n\n".join(sections)
+
+
+def _criterion_judgment_feedback(judged: CompletionJudgment) -> str:
+    """Serialize only the latest validated verdict for ReAct correction."""
+    lines = ["BEGIN COMPLETION_PROGRESS", f"ALL_COMPLETED={str(judged.all_completed).lower()}"]
+    for number, verified, detail in judged.verdicts:
+        field = "EVIDENCE" if verified else "GAP"
+        lines.extend(("BEGIN CRITERION_VERDICT", f"NUMBER={number}",
+                      f"VERIFIED={str(verified).lower()}",
+                      f"{field}={json.dumps(detail, ensure_ascii=False)}",
+                      "END CRITERION_VERDICT"))
+    lines.append("END COMPLETION_PROGRESS")
+    return "\n".join(lines)
 
 
 def _completion_judge_evidence(

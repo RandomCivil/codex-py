@@ -387,7 +387,7 @@ class Executor:
                     settled_context = await self._active_context_policy.maintain(self._active_durable_state)
                     completion_context = _completion_context_messages(settled_context)
                 successful = [message for message in results if _tool_error(message) is None]
-                if successful and not any(_tool_error(message) is not None for message in results):
+                if successful:
                     judged = await self._judge_step_completion(
                         step, request, completion_context, operational_response, calls, results,
                         criterion_completed,

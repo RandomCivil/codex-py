@@ -31,10 +31,13 @@ class _RoundModel:
         self.calls = []
 
     def bind_tools(self, tools):
+        self.tools = tools
         return self
 
     async def ainvoke(self, messages):
         self.calls.append(list(messages))
+        if self.tools == ():
+            return AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="Five tool results were observed"\nEND GOAL_JUDGMENT')
         if len(self.calls) <= 5:
             round_number = len(self.calls)
             return AIMessage(
@@ -47,7 +50,7 @@ class _RoundModel:
                     }
                 ],
             )
-        return AIMessage(content="The five tool rounds are complete.")
+        return AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="The five tool rounds are complete."\nEND REACT_DECISION')
 
 
 class _FirstObservationBlocked:

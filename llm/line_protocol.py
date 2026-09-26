@@ -28,9 +28,21 @@ class ParsedBlock:
 
 @dataclass(frozen=True, slots=True)
 class CompletionJudgment:
-    completed: tuple[tuple[int, str], ...]
+    verdicts: tuple[tuple[int, bool, str], ...]
     all_completed: bool
     answer: str | None = None
+
+    @property
+    def completed(self) -> tuple[tuple[int, str], ...]:
+        """Compatibility view of currently verified criteria."""
+        return tuple((number, detail) for number, verified, detail in self.verdicts if verified)
+
+
+@dataclass(frozen=True, slots=True)
+class ReactDecision:
+    status: str
+    answer: str | None = None
+    error: str | None = None
 
 
 def parse_line_protocol(document: str) -> ParsedBlock:
@@ -162,6 +174,44 @@ def decode_answer(document: str) -> str:
     return value
 
 
+def decode_react_decision(document: str) -> ReactDecision:
+    block = parse_line_protocol(document)
+    if block.type != "REACT_DECISION" or block.children or "STATUS" not in block.fields:
+        raise LineProtocolError("expected one REACT_DECISION block with STATUS")
+    status = _single(block, "STATUS")
+    expected = {
+        "completed": {"STATUS", "ANSWER"},
+        "failed": {"STATUS", "ERROR"},
+        "need_tool": {"STATUS"},
+    }
+    if not isinstance(status, str) or status not in expected or set(block.fields) != expected[status]:
+        raise LineProtocolError("REACT_DECISION fields do not match STATUS")
+    if status == "need_tool":
+        return ReactDecision(status)
+    field_name = "ANSWER" if status == "completed" else "ERROR"
+    value = _single(block, field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise LineProtocolError(f"REACT_DECISION {field_name} must be non-empty text")
+    return ReactDecision(status, answer=value if status == "completed" else None,
+                         error=value if status == "failed" else None)
+
+
+def decode_goal_judgment(document: str) -> tuple[bool, str]:
+    block = parse_line_protocol(document)
+    if block.type != "GOAL_JUDGMENT" or block.children or "COMPLETED" not in block.fields:
+        raise LineProtocolError("expected one GOAL_JUDGMENT block")
+    completed = _single(block, "COMPLETED")
+    if type(completed) is not bool:
+        raise LineProtocolError("GOAL_JUDGMENT COMPLETED must be a boolean")
+    name = "EVIDENCE" if completed else "GAP"
+    if set(block.fields) != {"COMPLETED", name}:
+        raise LineProtocolError("GOAL_JUDGMENT fields do not match COMPLETED")
+    value = _single(block, name)
+    if not isinstance(value, str) or not value.strip():
+        raise LineProtocolError(f"GOAL_JUDGMENT {name} must be non-empty text")
+    return completed, value
+
+
 def decode_no_tool(document: str) -> None:
     """Validate the empty tool-selection response."""
     block = parse_line_protocol(document)
@@ -199,10 +249,37 @@ def decode_goal_completion(document: str) -> str:
 def decode_completion_progress(
     document: str, *, criterion_count: int, completed_criteria: frozenset[int] = frozenset()
 ) -> tuple[tuple[int, str], ...]:
-    """Decode newly completed ReAct criteria and their concise supporting evidence."""
-    return decode_completion_judgment(
-        document, criterion_count=criterion_count, completed_criteria=completed_criteria
-    ).completed
+    """Decode the legacy incremental progress contract used by older callers."""
+    block = parse_line_protocol(document)
+    if block.type != "COMPLETION_PROGRESS" or set(block.fields) - {"ALL_COMPLETED", "ANSWER"} or any(
+        child.type != "COMPLETED_CRITERION" for child in block.children
+    ):
+        raise LineProtocolError("COMPLETION_PROGRESS fields are invalid")
+    all_completed = _single(block, "ALL_COMPLETED")
+    if type(all_completed) is not bool:
+        raise LineProtocolError("ALL_COMPLETED must be a boolean")
+    judgments: list[tuple[int, str]] = []
+    for child in block.children:
+        if child.children or set(child.fields) != {"NUMBER", "EVIDENCE"}:
+            raise LineProtocolError("COMPLETED_CRITERION fields are invalid")
+        number, evidence = _single(child, "NUMBER"), _single(child, "EVIDENCE")
+        if type(number) is not int or not 1 <= number <= criterion_count:
+            raise LineProtocolError("completed criterion number is out of range")
+        if number in completed_criteria or not isinstance(evidence, str) or not evidence.strip():
+            raise LineProtocolError("completed criterion is invalid or already recorded")
+        judgments.append((number, evidence.strip()))
+    numbers = [number for number, _ in judgments]
+    if len(numbers) != len(set(numbers)):
+        raise LineProtocolError("completed criterion numbers must be distinct")
+    if all_completed != (len(completed_criteria | frozenset(numbers)) == criterion_count):
+        raise LineProtocolError("ALL_COMPLETED must match locally recorded criterion state")
+    if "ANSWER" in block.fields and not all_completed:
+        raise LineProtocolError("incomplete judgment cannot include ANSWER")
+    if all_completed:
+        answer = _single(block, "ANSWER") if "ANSWER" in block.fields else None
+        if answer is not None and (not isinstance(answer, str) or not answer.strip()):
+            raise LineProtocolError("completed judgment ANSWER must be non-empty")
+    return tuple(judgments)
 
 
 def decode_step_completion_progress(
@@ -242,42 +319,42 @@ def decode_step_completion_progress(
 def decode_completion_judgment(
     document: str, *, criterion_count: int, completed_criteria: frozenset[int] = frozenset()
 ) -> CompletionJudgment:
-    """Decode a judge verdict and its all-criteria completion decision."""
+    """Decode a complete, current-state verdict for every ordered criterion."""
+    if type(criterion_count) is not int or criterion_count <= 0:
+        raise LineProtocolError("criterion_count must be a positive integer")
     block = parse_line_protocol(document)
-    if block.type != "COMPLETION_PROGRESS" or set(block.fields) - {"ALL_COMPLETED", "ANSWER"} or any(
-        child.type != "COMPLETED_CRITERION" for child in block.children
+    if block.type != "COMPLETION_PROGRESS" or set(block.fields) != {"ALL_COMPLETED"} or any(
+        child.type != "CRITERION_VERDICT" for child in block.children
     ):
         raise LineProtocolError("COMPLETION_PROGRESS fields are invalid")
     all_completed = _single(block, "ALL_COMPLETED")
     if type(all_completed) is not bool:
         raise LineProtocolError("ALL_COMPLETED must be a boolean")
-    judgments: list[tuple[int, str]] = []
+    judgments: list[tuple[int, bool, str]] = []
     for child in block.children:
-        if child.children or set(child.fields) != {"NUMBER", "EVIDENCE"}:
-            raise LineProtocolError("COMPLETED_CRITERION fields are invalid")
+        if child.children or set(child.fields) - {"NUMBER", "VERIFIED", "EVIDENCE", "GAP"}:
+            raise LineProtocolError("CRITERION_VERDICT fields are invalid")
         number = _single(child, "NUMBER")
-        evidence = _single(child, "EVIDENCE")
+        verified = _single(child, "VERIFIED")
         if type(number) is not int or not 1 <= number <= criterion_count:
-            raise LineProtocolError("completed criterion number is out of range")
-        if number in completed_criteria:
-            raise LineProtocolError("completed criterion was already recorded")
-        if not isinstance(evidence, str) or not evidence.strip():
-            raise LineProtocolError("completed criterion requires non-empty evidence")
-        judgments.append((number, evidence.strip()))
-    numbers = [number for number, _ in judgments]
-    if len(numbers) != len(set(numbers)):
-        raise LineProtocolError("completed criterion numbers must be distinct")
-    recorded = completed_criteria | frozenset(numbers)
-    if all_completed != (len(recorded) == criterion_count):
+            raise LineProtocolError("criterion number is out of range")
+        if type(verified) is not bool:
+            raise LineProtocolError("criterion VERIFIED must be a boolean")
+        expected_detail = "EVIDENCE" if verified else "GAP"
+        if set(child.fields) != {"NUMBER", "VERIFIED", expected_detail}:
+            raise LineProtocolError("criterion verdict must contain exactly one evidence or gap")
+        detail = _single(child, expected_detail)
+        if not isinstance(detail, str) or not detail.strip():
+            raise LineProtocolError("criterion verdict requires non-empty evidence or gap")
+        judgments.append((number, verified, detail.strip()))
+    numbers = [number for number, _, _ in judgments]
+    if len(judgments) != criterion_count:
+        raise LineProtocolError("criterion verdict must cover every criterion exactly once")
+    if numbers != list(range(1, criterion_count + 1)):
+        raise LineProtocolError("criterion verdict numbers must be ordered and unique")
+    if all_completed != all(verified for _, verified, _ in judgments):
         raise LineProtocolError("ALL_COMPLETED must match locally recorded criterion state")
-    answer = _single(block, "ANSWER") if "ANSWER" in block.fields else None
-    if all_completed:
-        if not isinstance(answer, str) or not answer.strip():
-            raise LineProtocolError("completed judgment requires a non-empty ANSWER")
-        return CompletionJudgment(tuple(judgments), True, answer.strip())
-    if answer is not None:
-        raise LineProtocolError("incomplete judgment cannot include ANSWER")
-    return CompletionJudgment(tuple(judgments), False)
+    return CompletionJudgment(tuple(judgments), all_completed)
 
 
 def decode_step_completion(document: str) -> dict[str, Any]:
@@ -346,6 +423,8 @@ __all__ = [
     "PLAN_INSTRUCTIONS",
     "decode_plan",
     "decode_answer",
+    "decode_react_decision",
+    "decode_goal_judgment",
     "decode_goal_completion",
     "decode_no_tool",
     "decode_completion_progress",
@@ -371,6 +450,26 @@ CODEC_REGISTRY = {
     },
     "NO_TOOL": {"fields": frozenset(), "scalar_arrays": frozenset(), "children": frozenset()},
     "ANSWER": {"fields": frozenset({"TEXT"}), "scalar_arrays": frozenset(), "children": frozenset()},
+    "REACT_DECISION": {
+        "fields": frozenset({"STATUS", "ANSWER", "ERROR"}),
+        "scalar_arrays": frozenset(),
+        "children": frozenset(),
+    },
+    "GOAL_JUDGMENT": {
+        "fields": frozenset({"COMPLETED", "EVIDENCE", "GAP"}),
+        "scalar_arrays": frozenset(),
+        "children": frozenset(),
+    },
+    "COMPLETION_PROGRESS": {
+        "fields": frozenset({"ALL_COMPLETED", "ANSWER"}),
+        "scalar_arrays": frozenset(),
+        "children": frozenset({"CRITERION_VERDICT"}),
+    },
+    "CRITERION_VERDICT": {
+        "fields": frozenset({"NUMBER", "VERIFIED", "EVIDENCE", "GAP"}),
+        "scalar_arrays": frozenset(),
+        "children": frozenset(),
+    },
     "GOAL_COMPLETION": {
         "fields": frozenset({"ANSWER", "GOAL_SATISFIED"}),
         "scalar_arrays": frozenset(),
@@ -379,7 +478,7 @@ CODEC_REGISTRY = {
     "COMPLETION_PROGRESS": {
         "fields": frozenset({"ALL_COMPLETED", "ANSWER"}),
         "scalar_arrays": frozenset(),
-        "children": frozenset({"COMPLETED_CRITERION"}),
+        "children": frozenset({"CRITERION_VERDICT", "COMPLETED_CRITERION"}),
     },
     "STEP_COMPLETION_PROGRESS": {
         "fields": frozenset({"ALL_COMPLETED"}),

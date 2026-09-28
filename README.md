@@ -316,7 +316,7 @@ poetry run agent run --goal '检查项目中的待办事项并整理摘要' --ex
 }
 ```
 
-降低日志量时使用 `--log-level error`。该选项不会改变执行结果，只隐藏 LLM 请求、响应、流式事件和中间 thought/output 的详细内容。
+需要查看每个流式返回片段时使用 `--log-level debug`；降低日志量时使用 `--log-level error`。这些选项不会改变执行结果。
 
 `--cwd` 指定 Agent 操作的项目目录。它会被强制写入每一个 Atom MCP 工具调用的 `cwd` 参数；未指定时使用启动 `agent` 命令时的当前目录。恢复 run 时应使用与原 run 相同的 `--cwd`，该目录属于持久化配置的一部分。
 
@@ -417,9 +417,9 @@ poetry run agent conversation resume --conv-id <uuidv4> --config agent.yaml --re
 
 CLI 输出包含 `command`、`status`、`run_id` 等字段；发生错误时还包含 `error`。退出码如下：
 
-运行过程日志使用带有 `[llm thought]`、`[llm output]`、`[plan]`、`[execute]`、`[tool call]` 和 `[tool result]` 前缀的文本格式写入 stderr，因此不会污染 stdout 中的一行 JSON 结果。
+运行过程日志使用带有 `[llm stream]`、`[llm event]`、`[llm timing]`、`[plan]`、`[execute]`、`[tool call]` 和 `[tool result]` 前缀的文本格式写入 stderr，因此不会污染 stdout 中的一行 JSON 结果。
 
-每行运行日志都会以 `run_id` 作为前缀。默认日志级别为 `info`。`[llm context]` 请求上下文与 `[llm final]` 最终返回仅在 `info` 级别输出；每次 LLM 调用完成都会在所有级别输出 `[llm usage]` token usage。需要降低输出量时可使用 `--log-level error`：隐藏 LLM 的请求/响应详情、流式事件与中间 thought/output，只保留 usage、Plan/Execute 状态和工具调用信息；tool result 只显示工具名，tool call 保留传入参数。
+每行运行日志都会以 `run_id` 作为前缀。默认日志级别为 `info`。`--log-level debug` 会在流式事件之外输出每个 `[llm stream] chunk=...` 片段；`[llm context]` 请求上下文与 `[llm final]` 最终返回在 `info` 和 `debug` 级别输出。`info` 和 `debug` 级别会输出 `[llm usage]` 与 `[llm timing]`，`error` 级别也会保留这两类统计信息。流式片段只在 `debug` 级别输出；`info` 级别保留非片段事件和完整响应。`error` 级别隐藏 LLM 请求、响应和流式事件，只保留 usage、timing、Plan/Execute 状态和工具调用信息；tool result 只显示工具名，tool call 保留传入参数。
 
 | 退出码 | 含义 |
 | ---: | --- |

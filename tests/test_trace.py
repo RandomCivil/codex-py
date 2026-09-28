@@ -107,6 +107,48 @@ def test_llm_event_prints_complete_event_payload():
     ]
 
 
+def test_debug_level_prints_each_streaming_text_fragment():
+    output = StringIO()
+    trace = RunTrace(output, level="debug")
+
+    trace.llm_stream_chunk(SimpleNamespace(content="hello"))
+    trace.llm_stream_chunk(SimpleNamespace(content=" world"))
+
+    assert output.getvalue().splitlines() == [
+        '[llm stream] chunk="hello"',
+        '[llm stream] chunk=" world"',
+    ]
+
+
+def test_debug_stream_event_prints_fragment_as_one_log_line():
+    output = StringIO()
+    trace = RunTrace(output, level="debug")
+
+    trace.llm_event(SimpleNamespace(type="response.output_text.delta", delta="line 1\nline 2"))
+
+    assert '[llm stream] chunk="line 1\\nline 2"' in output.getvalue().splitlines()
+
+
+def test_info_level_hides_streaming_fragment_logs():
+    output = StringIO()
+    trace = RunTrace(output)
+
+    trace.llm_event(SimpleNamespace(type="response.output_text.delta", delta="partial"))
+    trace.llm_event(SimpleNamespace(type="response.completed", response=SimpleNamespace()))
+
+    assert "[llm stream]" not in output.getvalue()
+    assert "partial" not in output.getvalue()
+
+
+def test_error_level_hides_streaming_fragments():
+    output = StringIO()
+    trace = RunTrace(output, level="error")
+
+    trace.llm_event(SimpleNamespace(type="response.output_text.delta", delta="secret"))
+
+    assert output.getvalue() == ""
+
+
 def test_error_level_suppresses_streaming_llm_events_and_final_response_but_keeps_usage():
     output = StringIO()
     trace = RunTrace(output, level="error")
@@ -155,11 +197,32 @@ def test_error_level_reports_per_output_token_time_and_generation_throughput():
             )
         )
 
-    assert output.getvalue().splitlines()[-1] == (
+    assert (
         "[llm timing] first_token_ms=500.00 stream_duration_ms=2000.00 "
         "time_per_output_token_ms=666.67 "
         "tokens_per_second=1.50"
-    )
+    ) in output.getvalue().splitlines()
+
+
+def test_info_level_reports_per_output_token_time_and_generation_throughput():
+    output = StringIO()
+    trace = RunTrace(output)
+
+    with patch("agent.trace.time.perf_counter", side_effect=(10.0, 10.5, 12.0)):
+        trace.llm_request("planner", {"model": "test-model"})
+        trace.llm_event(SimpleNamespace(type="response.output_text.delta", delta="hello"))
+        trace.llm_event(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(usage={"output_tokens": 3}),
+            )
+        )
+
+    assert (
+        "[llm timing] first_token_ms=500.00 stream_duration_ms=2000.00 "
+        "time_per_output_token_ms=666.67 "
+        "tokens_per_second=1.50"
+    ) in output.getvalue().splitlines()
 
 
 def test_llm_usage_is_printed_from_completion_event_at_info_level():

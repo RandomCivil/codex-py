@@ -47,7 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-id")
     parser.add_argument("--recovery", choices=("fail", "abort"))
     parser.add_argument("--cwd", help="working directory supplied to Atom MCP tool calls")
-    parser.add_argument("--log-level", "--level", dest="log_level", choices=("info", "error"))
+    parser.add_argument("--log-level", "--level", dest="log_level", choices=("debug", "info", "error"))
     parser.add_argument("--config")
     parser.add_argument("--execution", choices=("direct", "tool_agent", "react", "plan_execute"))
     parser.add_argument("--conv-id")

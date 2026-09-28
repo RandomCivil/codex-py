@@ -17,8 +17,8 @@ class RunTrace:
     """Print the useful parts of a run as they happen."""
 
     def __init__(self, stream: Any = None, *, level: str = "info", run_id: str | None = None) -> None:
-        if level not in {"info", "error"}:
-            raise ValueError("level must be either 'info' or 'error'")
+        if level not in {"debug", "info", "error"}:
+            raise ValueError("level must be one of 'debug', 'info', or 'error'")
         self._stream = stream or sys.stderr
         self._level = level
         self._run_id = run_id
@@ -53,11 +53,20 @@ class RunTrace:
         self._stream_first_token_at = None
 
     def llm_stream_chunk(self, chunk: Any = None) -> None:
-        """Record the first generated chunk of a streaming model response."""
+        """Record and, at debug level, print one generated stream chunk."""
         if self._stream_started_at is None:
             self.llm_stream_start()
         if self._stream_first_token_at is None and _has_stream_output(chunk):
             self._stream_first_token_at = time.perf_counter()
+        if self._level == "debug":
+            fragment = _stream_fragment(chunk)
+            if fragment:
+                rendered = (
+                    json.dumps(fragment, ensure_ascii=False)
+                    if isinstance(fragment, str)
+                    else _compact(fragment)
+                )
+                self._line(f"[llm stream] chunk={rendered}")
 
     def llm_stream_end(self) -> None:
         """Finish timing one streamed response until its usage metadata arrives."""
@@ -95,21 +104,25 @@ class RunTrace:
         # specialised lines below are still useful for following a run, but
         # they intentionally omit fields such as ids, status, usage, and
         # provider-specific metadata.
-        self._line(f"[llm event] data={_compact(event)}")
+        if event_type not in {
+            "response.reasoning.delta",
+            "response.reasoning_summary_text.delta",
+            "response.output_text.delta",
+        }:
+            self._line(f"[llm event] data={_compact(event)}")
         if event_type in {"response.reasoning.delta", "response.reasoning_summary_text.delta"}:
-            self._write("thought", getattr(event, "delta", ""))
+            self.llm_stream_chunk(event)
         elif event_type == "response.output_text.delta":
             delta = getattr(event, "delta", "")
             self._output_buffer += delta
-            self._write("output", delta)
+            self.llm_stream_chunk(event)
         elif event_type == "response.created":
             self._output_buffer = ""
-        elif event_type == "response.completed" and self._output_buffer:
-            self._write("output complete", self._output_buffer)
-            self._output_buffer = ""
         if event_type == "response.completed":
+            self.llm_stream_end()
             self._llm_usage(event)
             self.llm_final(getattr(event, "response", event))
+            self._output_buffer = ""
             self._llm_attribution = None
 
     def _llm_usage(
@@ -174,7 +187,7 @@ class RunTrace:
 
     def _write_stream_timing(self, output_tokens: Any) -> None:
         """Emit per-response streaming performance once token usage is known."""
-        if self._level != "error" or not self._completed_streams:
+        if not self._completed_streams:
             return
         duration, first_token = self._completed_streams.pop(0)
         token_count = _positive_number(output_tokens)
@@ -416,6 +429,30 @@ def _has_stream_output(value: Any) -> bool:
         or getattr(value, "tool_call_chunks", None)
         or getattr(value, "delta", None)
     )
+
+
+def _stream_fragment(value: Any) -> Any:
+    """Return the generated portion of a provider or LangChain stream chunk."""
+    if isinstance(value, str):
+        return value
+    delta = getattr(value, "delta", None)
+    if isinstance(delta, str):
+        return delta
+    content = getattr(value, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        fragments = []
+        for item in content:
+            if isinstance(item, Mapping):
+                text = item.get("text")
+            else:
+                text = getattr(item, "text", None)
+            if isinstance(text, str):
+                fragments.append(text)
+        if fragments:
+            return "".join(fragments)
+    return None
 
 
 def _as_serializable(value: Any) -> Any:

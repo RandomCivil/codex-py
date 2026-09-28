@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 import pytest
 
@@ -412,6 +412,118 @@ def test_runtime_context_renders_as_prompt_sections():
     assert "### Observations\n- Confirmed facts:\n  - (none)\n- Reported errors:\n  - (none)\n- Model inferences:\n  - (none)" in prompt
     assert "### Raw tool results\n- (none)" in prompt
     assert prompt.endswith('### Goal\n"inspect"')
+
+
+def test_messages_layout_reconstructs_visible_raw_tool_calls_in_batch_order():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [
+                {"id": "read-1", "name": "read_file", "args": {"path": "app.py"}},
+                {"id": "list-1", "name": "list_dir", "args": {"path": "src"}},
+            ],
+            ["print('ready')", {"entries": ["app.py"]}],
+        )
+
+    asyncio.run(run())
+
+    messages = policy.assemble({"goal": "inspect"}).as_messages(layout="messages")
+
+    assert isinstance(messages[0], AIMessage)
+    assert messages[0].tool_calls == [
+        {"id": "read-1", "name": "read_file", "args": {"path": "app.py"}, "type": "tool_call"},
+        {"id": "list-1", "name": "list_dir", "args": {"path": "src"}, "type": "tool_call"},
+    ]
+    assert [message.tool_call_id for message in messages[1:3]] == ["read-1", "list-1"]
+    assert all(isinstance(message, ToolMessage) for message in messages[1:3])
+    assert messages[1].content == "print('ready')"
+    assert messages[2].content == '{"entries": ["app.py"]}'
+
+
+def test_messages_layout_marks_failed_tool_result_and_keeps_its_error():
+    policy = RuntimeContextPolicy(ObservationModel({}))
+
+    asyncio.run(policy.record_tool_round(
+        1,
+        [{"id": "write-1", "name": "apply_patch", "args": {"patch": "bad"}}],
+        [{"details": ["line 2"]}],
+        ["patch rejected"],
+    ))
+
+    messages = policy.assemble({}).as_messages(layout="messages")
+
+    assert messages[1].status == "error"
+    assert '"details": ["line 2"]' in messages[1].content
+    assert "patch rejected" in messages[1].content
+
+
+def test_messages_layout_places_fixed_messages_and_feedback_around_context_layers():
+    context = RuntimeContextPolicy(ObservationModel({})).assemble({"goal": "inspect"})
+
+    messages = context.as_messages(
+        layout="messages",
+        prefix_messages=[SystemMessage(content="fixed instructions"), HumanMessage(content="user input")],
+        feedback_messages=[HumanMessage(content="repair feedback")],
+        completion_criteria_status="1. [pending] inspect",
+    )
+
+    assert [message.type for message in messages] == [
+        "system", "human", "human", "human", "human", "human", "human",
+    ]
+    assert [message.content for message in messages] == [
+        "fixed instructions",
+        "user input",
+        "## Durable state\n\n{}",
+        "## Observations\n\n### Confirmed facts\n- (none)\n\n### Reported errors\n- (none)\n\n### Model inferences\n- (none)",
+        "repair feedback",
+        '## Goal\n\n"inspect"',
+        "## Completion criteria\n\n1. [pending] inspect",
+    ]
+
+
+def test_messages_layout_prunes_observation_replaced_calls_from_a_partial_batch():
+    model = ObservationModel({
+        "round": 1,
+        "confirmed_facts": [{"text": "found the target", "tool_call_ids": ["search-1"]}],
+        "reported_errors": [],
+        "model_inferences": [],
+    })
+    policy = RuntimeContextPolicy(model)
+
+    async def run():
+        await policy.record_tool_round(
+            1,
+            [
+                {"id": "search-1", "name": "search", "args": {"query": "target"}},
+                {"id": "read-1", "name": "read_file", "args": {"path": "target.txt"}},
+            ],
+            ["target found", "target contents"],
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    messages = policy.assemble({}).as_messages(layout="messages")
+
+    raw_ai = next(message for message in messages if isinstance(message, AIMessage))
+    assert raw_ai.tool_calls == [
+        {"id": "read-1", "name": "read_file", "args": {"path": "target.txt"}, "type": "tool_call"}
+    ]
+    assert [message.tool_call_id for message in messages if isinstance(message, ToolMessage)] == ["read-1"]
+    observation_message = next(message for message in messages if message.content.startswith("## Observations"))
+    assert "found the target" in observation_message.content
+
+
+def test_messages_layout_budgets_fixed_messages_and_fails_when_required_request_cannot_fit():
+    policy = RuntimeContextPolicy(ObservationModel({}), budget=1, layout="messages")
+
+    with pytest.raises(ContextMaintenanceError, match="exceeds"):
+        asyncio.run(policy.maintain(
+            {"goal": "inspect"},
+            prefix_messages=[SystemMessage(content="fixed instructions"), HumanMessage(content="user input")],
+        ))
 
 
 def test_native_read_results_are_grouped_by_file_across_rounds_in_request_order():

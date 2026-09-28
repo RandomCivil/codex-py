@@ -161,11 +161,19 @@ add any explanation, commentary, reasoning, labels, or other text before or
 after the block. The first output characters must be BEGIN TASK_ANALYSIS and
 the last output characters must be END TASK_ANALYSIS.
 
+The block must contain these six required fields exactly once and in this exact
+order: TASK_TYPE, GOAL_CLARITY, NEEDS_TOOLS, EXPECTED_STEPS,
+EXPECTED_HORIZON, REASONING_SUMMARY. REASONING_SUMMARY is required; never omit
+it. COMPLETION_CRITERION is the only optional field. Include one or more
+COMPLETION_CRITERION fields only when needs_tools=true, expected_steps>1, and
+expected_horizon is not "long"; otherwise include none. When included, place
+them after REASONING_SUMMARY.
+
 BEGIN TASK_ANALYSIS
-TASK_TYPE="research"
-GOAL_CLARITY=0.0
-NEEDS_TOOLS=false
-EXPECTED_STEPS=1
+TASK_TYPE="coding"
+GOAL_CLARITY=0.8
+NEEDS_TOOLS=true
+EXPECTED_STEPS=3
 EXPECTED_HORIZON="short"
 REASONING_SUMMARY="Briefly explain the main task characteristics without recommending an architecture."
 COMPLETION_CRITERION="One independently verifiable requested outcome"
@@ -173,8 +181,8 @@ END TASK_ANALYSIS
 
 Use uppercase snake-case field names exactly as shown. Scalar values must be JSON
 literals (strings quoted and escaped). Repeat COMPLETION_CRITERION for each
-criterion when the task characteristics require it; otherwise omit it. Do not
-include prose or additional fields.
+criterion when the task characteristics require it. Do not include prose or
+additional fields.
 """
 
 

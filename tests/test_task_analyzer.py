@@ -61,6 +61,9 @@ def test_task_analyzer_prompts_for_task_analysis_without_provider_formatting_opt
     assert "BEGIN TASK_ANALYSIS" in text_stream.request["instructions"]
     assert "Do not wrap the block in Markdown code fences" in text_stream.request["instructions"]
     assert "first output characters must be BEGIN TASK_ANALYSIS" in text_stream.request["instructions"]
+    assert "six required fields exactly once and in this exact\norder" in text_stream.request["instructions"]
+    assert "REASONING_SUMMARY is required; never omit\nit" in text_stream.request["instructions"]
+    assert 'NEEDS_TOOLS=true\nEXPECTED_STEPS=3\nEXPECTED_HORIZON="short"' in text_stream.request["instructions"]
 
 
 def test_task_analyzer_includes_prior_conversation_history_in_model_input():

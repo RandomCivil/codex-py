@@ -50,6 +50,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--log-level", "--level", dest="log_level", choices=("debug", "info", "error"))
     parser.add_argument("--config")
     parser.add_argument("--execution", choices=("direct", "tool_agent", "react", "plan_execute"))
+    parser.add_argument("--runtime-context-layout", choices=("grouped", "messages"), default="grouped")
     parser.add_argument("--conv-id")
     parser.add_argument("--input", "--user-input", dest="input")
     parser.add_argument("--json", action="store_true", dest="json_output")
@@ -73,7 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError
         except (ValueError, AttributeError):
             return _emit({"command": "resume", "status": "invalid", "error": "resume requires a UUIDv4 --run-id"}, EXIT_INVALID_INVOCATION)
-    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd or args.log_level or args.config or args.execution):
+    if args.command == "migrate" and (args.goal or args.run_id or args.recovery or args.cwd or args.log_level or args.config or args.execution or args.runtime_context_layout != "grouped"):
             return _emit({"command": "migrate", "status": "invalid", "error": "migrate does not accept --goal, --run-id, --recovery, --cwd, --log-level, --config, or --execution"}, EXIT_INVALID_INVOCATION)
     if args.command == "conversation":
         if args.conversation_action == "run" and (not args.input or not args.config or args.goal or args.run_id or args.recovery):
@@ -114,6 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 options["log_level"] = args.log_level
             if args.execution:
                 options["execution_mode"] = args.execution
+            options["runtime_context_layout"] = args.runtime_context_layout
             run = run_agent(os.environ["CODEX_MYSQL_URL"], args.goal, **options)
             result = {"command": args.command, **run}
             result.setdefault("run_id", str(uuid.uuid4()))
@@ -125,6 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 options["cwd"] = args.cwd
             if args.log_level:
                 options["log_level"] = args.log_level
+            options["runtime_context_layout"] = args.runtime_context_layout
             resumed = resume_agent(os.environ["CODEX_MYSQL_URL"], args.run_id, **options)
             result = {"command": args.command, **resumed}
         elif args.conversation_action == "run":
@@ -134,6 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "configuration": configuration,
                 "cwd": args.cwd,
                 "log_level": args.log_level or "info",
+                "runtime_context_layout": args.runtime_context_layout,
             }
             if args.execution:
                 conversation_options["execution_mode"] = args.execution
@@ -152,6 +156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     conv_id=args.conv_id,
                     recovery=args.recovery,
                     configuration=configuration,
+                    runtime_context_layout=args.runtime_context_layout,
                 ).as_dict(),
             }
         elif args.conversation_action == "chat":
@@ -162,6 +167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cwd=args.cwd,
                 log_level=args.log_level or "info",
                 execution_mode=args.execution,
+                runtime_context_layout=args.runtime_context_layout,
                 recovery=args.recovery,
                 json_output=args.json_output,
             )
@@ -217,6 +223,7 @@ def _run_chat(
     cwd: str | None,
     log_level: str,
     execution_mode: str | None,
+    runtime_context_layout: str,
     recovery: str | None,
     json_output: bool,
 ) -> int:
@@ -230,6 +237,7 @@ def _run_chat(
                 conv_id=current_conv_id,
                 recovery=recovery,
                 configuration=configuration,
+                runtime_context_layout=runtime_context_layout,
             )
         except KeyboardInterrupt:
             _emit_reconnect_guidance(current_conv_id)
@@ -266,6 +274,7 @@ def _run_chat(
                 cwd=cwd,
                 log_level=log_level,
                 create=creating,
+                runtime_context_layout=runtime_context_layout,
                 **({"execution_mode": execution_mode} if execution_mode else {}),
             )
         except KeyboardInterrupt:

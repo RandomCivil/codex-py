@@ -226,6 +226,7 @@ class ConversationService:
         execution_mode: ExecutionModeName | None = None,
         conv_id: str | None = None,
         create: bool = False,
+        runtime_context_layout: str = "grouped",
     ) -> ConversationResult:
         if not isinstance(user_input, str) or not user_input.strip():
             raise ValueError("conversation run requires nonempty user input")
@@ -271,7 +272,7 @@ class ConversationService:
         if execution_mode in {"direct", "tool_agent", "react"}:
             self._active_ephemeral_runs.add(run_id)
 
-        runner = self._make_runner(execution_mode, run_id, completion_criteria)
+        runner = self._make_runner(execution_mode, run_id, completion_criteria, runtime_context_layout)
         try:
             answer = await runner.run(conversation_input)
             if not isinstance(answer, ExecutionAnswer):
@@ -337,14 +338,14 @@ class ConversationService:
         conversation = await _maybe_await(self._store.get(conv_id))
         return [turn.public() for turn in conversation.turns]
 
-    def _make_runner(self, mode: str, run_id: str, completion_criteria: tuple[str, ...] = ()) -> Any:
+    def _make_runner(self, mode: str, run_id: str, completion_criteria: tuple[str, ...] = (), runtime_context_layout: str = "grouped") -> Any:
         if mode != "react":
-            return _call_factory(self._runner_factory, mode, run_id, one_argument=run_id)
+            args = (mode, run_id, runtime_context_layout) if runtime_context_layout != "grouped" else (mode, run_id)
+            return _call_factory(self._runner_factory, *args, one_argument=run_id)
+        args = (mode, run_id, completion_criteria, runtime_context_layout) if runtime_context_layout != "grouped" else (mode, run_id, completion_criteria)
         return _call_factory(
             self._runner_factory,
-            mode,
-            run_id,
-            completion_criteria,
+            *args,
             one_argument=run_id,
         )
 
@@ -396,6 +397,7 @@ def run_mysql_conversation(
     log_level: str = "info",
     execution_mode: ExecutionModeName | None = None,
     create: bool = False,
+    runtime_context_layout: str = "grouped",
 ) -> ConversationResult:
     return asyncio.run(
         _run_mysql_conversation(
@@ -407,6 +409,7 @@ def run_mysql_conversation(
             log_level=log_level,
             execution_mode=execution_mode,
             create=create,
+            runtime_context_layout=runtime_context_layout,
         )
     )
 
@@ -421,10 +424,12 @@ def resume_mysql_conversation(
     conv_id: str,
     recovery: str | None,
     configuration: Any,
+    runtime_context_layout: str = "grouped",
 ) -> ConversationResult:
     return asyncio.run(
         _resume_mysql_conversation(
-            url, conv_id=conv_id, recovery=recovery, configuration=configuration
+            url, conv_id=conv_id, recovery=recovery, configuration=configuration,
+            runtime_context_layout=runtime_context_layout,
         )
     )
 
@@ -434,7 +439,7 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
     from .migration import _connection_pool, _parse_url, ensure_schema_initialized
 
     def runner_factory(
-        mode: str, run_id: str, completion_criteria: tuple[str, ...] = ()
+        mode: str, run_id: str, completion_criteria: tuple[str, ...] = (), runtime_context_layout: str = "grouped"
     ) -> Any:
         if mode == "plan_execute":
             return DurableConversationRunner(
@@ -443,6 +448,7 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
                     kwargs["configuration"],
                     kwargs.get("cwd"),
                     log_level=kwargs.get("log_level", "info"),
+                    runtime_context_layout=runtime_context_layout,
                 ),
                 run_id,
             )
@@ -453,6 +459,7 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
             cwd=kwargs.get("cwd"),
             log_level=kwargs.get("log_level", "info"),
             completion_criteria=completion_criteria,
+            runtime_context_layout=runtime_context_layout,
         )
 
     async def select_mode(conversation_input: ConversationInput, run_id: str) -> ConversationModeSelection:
@@ -477,6 +484,7 @@ async def _run_mysql_conversation(url: str, **kwargs: Any) -> ConversationResult
             conv_id=kwargs["conv_id"],
             execution_mode=kwargs.get("execution_mode"),
             create=kwargs.get("create", False),
+            runtime_context_layout=kwargs.get("runtime_context_layout", "grouped"),
         )
 
 
@@ -485,6 +493,7 @@ async def _select_conversation_mode(
     run_id: str,
     *,
     configuration: Any,
+    runtime_context_layout: str = "grouped",
     log_level: str,
 ) -> ConversationModeSelection:
     from llm import LLM
@@ -498,6 +507,7 @@ async def _select_conversation_mode(
         analyzer_configuration.api_key,
         analyzer_configuration.model_name,
         stream=getattr(analyzer_configuration, "stream", True),
+        reasoning={"effort": "none"},
         on_event=trace.llm_event,
         on_stream_end=trace.llm_stream_end,
         on_request=lambda request: trace.llm_request("task_analyzer", request),
@@ -530,6 +540,7 @@ def _make_ephemeral_runner(
     cwd: str | None,
     log_level: str,
     completion_criteria: tuple[str, ...] = (),
+    runtime_context_layout: str = "grouped",
 ) -> Any:
     """Create an ephemeral mode with the same host-selected tool boundary as durable runs."""
     from .trace import RunTrace
@@ -544,6 +555,7 @@ def _make_ephemeral_runner(
     }
     if mode == "react":
         options["completion_criteria"] = completion_criteria
+    options["runtime_context_layout"] = runtime_context_layout
     return create_execution_mode(mode, **options)
 
 
@@ -553,6 +565,7 @@ async def _resume_mysql_conversation(
     conv_id: str,
     recovery: str | None,
     configuration: Any,
+    runtime_context_layout: str = "grouped",
 ) -> ConversationResult:
     from .migration import _connection_pool, _parse_url, ensure_schema_initialized
 
@@ -562,7 +575,7 @@ async def _resume_mysql_conversation(
             if mode != "plan_execute":
                 return None
             return DurableConversationRunner(
-                _MySQLDurableAgent(url, configuration, None, restore_cwd=True),
+                _MySQLDurableAgent(url, configuration, None, restore_cwd=True, runtime_context_layout=runtime_context_layout),
                 run_id,
             )
 
@@ -585,12 +598,14 @@ class _MySQLDurableAgent:
         *,
         log_level: str = "info",
         restore_cwd: bool = False,
+        runtime_context_layout: str = "grouped",
     ) -> None:
         self._url = url
         self._configuration = configuration
         self._cwd = cwd
         self._log_level = log_level
         self._restore_cwd = restore_cwd
+        self._runtime_context_layout = runtime_context_layout
 
     async def run(
         self,
@@ -618,6 +633,7 @@ class _MySQLDurableAgent:
             log_level=self._log_level,
             configuration=self._configuration,
             execution_mode="plan_execute",
+            runtime_context_layout=self._runtime_context_layout,
             conversation_input=conversation_input,
         )
 
@@ -664,7 +680,7 @@ def _call_factory(factory: Callable[..., Any], *args: Any, one_argument: Any = _
         return factory(args[-1] if one_argument is _MISSING else one_argument)
     if required <= len(args) - 1 <= len(positional):
         return factory(*args[:-1])
-    return factory(*args)
+    return factory(*args[: len(positional)])
 
 
 def _validate_uuid4(value: str) -> None:

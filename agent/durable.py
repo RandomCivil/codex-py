@@ -415,10 +415,13 @@ async def _run(
     log_level: str = "info",
     configuration: ComponentProviderConfiguration | None = None,
     execution_mode: str | None = None,
+    runtime_context_layout: str = "grouped",
     conversation_input: Any = None,
 ) -> dict[str, Any]:
     if configuration is None:
         raise ValueError("an explicit component provider configuration is required")
+    if runtime_context_layout not in {"grouped", "messages"}:
+        raise ValueError("runtime context layout must be 'grouped' or 'messages'")
     planner_configuration = configuration.planner
     executor_configuration = configuration.executor
     analyzer_configuration = configuration.task_analyzer
@@ -435,6 +438,7 @@ async def _run(
             "cwd": "/home/xzp/workspace/atom-mcp",
             "tool_cwd": tool_cwd,
         },
+        runtime_context_layout=runtime_context_layout,
     )
     owner = str(uuid.uuid4())
     async with _connection_pool(_parse_url(url)) as pool:
@@ -465,16 +469,16 @@ async def _run(
                         on_response=lambda response: trace.llm_response(response, component="planner"),
                     )
                     planner = Planner(llm, trace=trace, stream=planner_configuration.stream)
-                    executor = Executor(
-                        base_url=executor_configuration.base_url,
-                        api_key=executor_configuration.api_key,
-                        model_name=executor_configuration.model_name,
-                        stream=executor_configuration.stream,
-                        checkpointer=saver,
-                        run_id=run_id,
-                        trace=trace,
-                        tool_cwd=tool_cwd,
-                        context_model=(
+                    executor_options = {
+                        "base_url": executor_configuration.base_url,
+                        "api_key": executor_configuration.api_key,
+                        "model_name": executor_configuration.model_name,
+                        "stream": executor_configuration.stream,
+                        "checkpointer": saver,
+                        "run_id": run_id,
+                        "trace": trace,
+                        "tool_cwd": tool_cwd,
+                        "context_model": (
                             ChatOpenAI(
                                 base_url=runtime_context_configuration.base_url,
                                 api_key=runtime_context_configuration.api_key,
@@ -485,7 +489,17 @@ async def _run(
                             if runtime_context_configuration
                             else None
                         ),
-                    )
+                    }
+                    executor_signature = inspect.signature(Executor)
+                    if (
+                        "runtime_context_layout" in executor_signature.parameters
+                        or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in executor_signature.parameters.values()
+                        )
+                    ):
+                        executor_options["runtime_context_layout"] = runtime_context_layout
+                    executor = Executor(**executor_options)
                     initial = AgentState(goal) if goal is not None else None
                     durable = DurableAgent(
                         planner,
@@ -505,6 +519,7 @@ async def _run(
                                 analyzer_configuration.api_key,
                                 analyzer_configuration.model_name,
                                 stream=analyzer_configuration.stream,
+                                reasoning={"effort": "none"},
                                 on_event=trace.llm_event,
                                 on_stream_end=trace.llm_stream_end,
                                 on_request=lambda request: trace.llm_request("task_analyzer", request),
@@ -524,6 +539,7 @@ async def _run(
                                     durable_agent=durable,
                                     tool_cwd=tool_cwd,
                                     trace=trace,
+                                    runtime_context_layout=runtime_context_layout,
                                 )
                                 result = _routed_result(run_id, await router.run(goal))
                             finally:
@@ -554,6 +570,7 @@ def run_agent(
     *,
     configuration: ComponentProviderConfiguration | None = None,
     execution_mode: str | None = None,
+    runtime_context_layout: str = "grouped",
 ) -> dict[str, Any]:
     return asyncio.run(
         _run(
@@ -564,6 +581,7 @@ def run_agent(
             log_level=log_level,
             configuration=configuration,
             execution_mode=execution_mode,
+            runtime_context_layout=runtime_context_layout,
         )
     )
 
@@ -576,8 +594,9 @@ def resume_agent(
     log_level: str = "info",
     *,
     configuration: ComponentProviderConfiguration | None = None,
+    runtime_context_layout: str = "grouped",
 ) -> dict[str, Any]:
-    return asyncio.run(_run(url, run_id, None, recovery, cwd, log_level, configuration))
+    return asyncio.run(_run(url, run_id, None, recovery, cwd, log_level, configuration, runtime_context_layout=runtime_context_layout))
 
 
 def _routed_result(run_id: str, routed: RoutedExecutionAnswer) -> dict[str, Any]:
@@ -600,6 +619,7 @@ def _task_router(
     durable_agent: DurableAgent,
     tool_cwd: str,
     trace: Any,
+    runtime_context_layout: str = "grouped",
 ) -> TaskRouter:
     """Compose the one run-entry router with the existing mode-factory seam."""
     return TaskRouter(
@@ -612,6 +632,7 @@ def _task_router(
             tool_runtime=ToolRuntime(tool_cwd=tool_cwd, trace=trace),
             trace=trace,
             completion_criteria=(analysis.completion_criteria if mode == "react" and analysis else ()),
+            runtime_context_layout=runtime_context_layout,
         ),
     )
 

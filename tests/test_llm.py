@@ -26,6 +26,25 @@ def test_event_stream_omits_provider_text_format_and_reports_request(monkeypatch
     assert "text" not in observed
 
 
+def test_event_stream_can_disable_reasoning(monkeypatch):
+    observed = {}
+
+    class Stream:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def __aiter__(self): return self
+        async def __anext__(self): raise StopAsyncIteration
+
+    class Client:
+        def __init__(self, **kwargs): self.responses = SimpleNamespace(stream=lambda **kwargs: observed.update(kwargs) or Stream())
+        async def close(self): pass
+
+    monkeypatch.setattr("llm.llm.AsyncOpenAI", Client)
+    asyncio.run(_consume(LLM("https://provider.test", "secret", "model", reasoning={"effort": "none"}), "hello"))
+
+    assert observed["reasoning"] == {"effort": "none"}
+
+
 def test_text_stream_yields_only_text_deltas_in_order(monkeypatch):
     events = [
         SimpleNamespace(type="response.output_text.delta", delta="Hello"),

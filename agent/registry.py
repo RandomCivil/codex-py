@@ -41,8 +41,11 @@ def configuration_snapshot(
     runtime_context: Mapping[str, Any] | None = None,
     base_url: str | None = None,
     model: str | None = None,
+    runtime_context_layout: str = "grouped",
 ) -> dict[str, Any]:
     """Return effective non-secret component and execution configuration."""
+    if runtime_context_layout not in {"grouped", "messages"}:
+        raise ValueError("runtime context layout must be 'grouped' or 'messages'")
     if planner is None:
         planner = {"base_url": base_url or "", "model_name": model or ""}
     if executor is None:
@@ -54,6 +57,7 @@ def configuration_snapshot(
         "executor": _provider_snapshot(executor),
         "task_analyzer": _provider_snapshot(task_analyzer),
         "runtime_context": _provider_snapshot(runtime_context) if runtime_context is not None else None,
+        "runtime_context_layout": runtime_context_layout,
         "mcp": _without_secrets(mcp),
     }
 

@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -74,9 +74,12 @@ class Executor:
         context_policy: RuntimeContextPolicy | None = None,
         context_budget: int = 128_000,
         context_model: Any | None = None,
+        runtime_context_layout: Literal["grouped", "messages"] = "grouped",
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
+        if runtime_context_layout not in {"grouped", "messages"}:
+            raise ValueError("runtime context layout must be 'grouped' or 'messages'")
         if model is None:
             if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
                 raise ValueError("Executor requires explicit base_url, api_key, and model_name when no model is injected")
@@ -110,6 +113,7 @@ class Executor:
         self._context_policy = context_policy
         self._context_budget = context_budget
         self._context_model = context_model
+        self._runtime_context_layout = runtime_context_layout
         self._active_context_policy: RuntimeContextPolicy | None = None
         self._active_durable_state: Any = None
         self._client = None
@@ -166,12 +170,15 @@ class Executor:
             )
             policy_model = self._context_model or self._model
             if self._active_context_policy is None and (
-                self._context_model is not None or isinstance(self._model, ChatOpenAI)
+                self._context_model is not None
+                or isinstance(self._model, ChatOpenAI)
+                or self._runtime_context_layout == "messages"
             ):
                 self._active_context_policy = RuntimeContextPolicy(
                     policy_model,
                     budget=self._context_budget,
                     trace=self._trace,
+                    layout=self._runtime_context_layout,
                 )
             graph_result = await self._execute_with_tools(
                 state, revision, step, step_context, recovery=recovery, attempt=attempt
@@ -335,12 +342,39 @@ class Executor:
             request = list(messages)
             if self._active_context_policy is not None:
                 self._active_context_policy.record_model_use()
-                context = await self._active_context_policy.maintain(self._active_durable_state)
-                request = [
-                    SystemMessage(content=self._INSTRUCTIONS),
-                    *context.as_messages(completion_criteria_status=status),
-                    *pending_messages,
-                ]
+                messages_layout = (
+                    isinstance(self._active_context_policy, RuntimeContextPolicy)
+                    and self._active_context_policy.layout == "messages"
+                )
+                context = await self._active_context_policy.maintain(
+                    self._active_durable_state,
+                    **(
+                        {
+                            "prefix_messages": messages[:2],
+                            "feedback_messages": pending_messages,
+                            "completion_criteria_status": status,
+                        }
+                        if messages_layout
+                        else {}
+                    ),
+                )
+                request = context.as_messages(
+                    completion_criteria_status=status,
+                    **(
+                        {
+                            "prefix_messages": messages[:2],
+                            "feedback_messages": pending_messages,
+                        }
+                        if messages_layout
+                        else {}
+                    ),
+                )
+                if not messages_layout:
+                    request = [
+                        SystemMessage(content=self._INSTRUCTIONS),
+                        *request,
+                        *pending_messages,
+                    ]
             else:
                 request.append(HumanMessage(content="Completion criterion status:\n" + status))
                 request.extend(pending_messages)
@@ -376,8 +410,16 @@ class Executor:
                     message for message in results
                     if isinstance(message, ToolMessage) and _tool_error(message) is not None
                 ]
+                if (
+                    isinstance(self._active_context_policy, RuntimeContextPolicy)
+                    and self._active_context_policy.layout == "messages"
+                ):
+                    # The native layout reconstructs failed calls as complete
+                    # AI/Tool pairs from Runtime context. Keeping this direct
+                    # ToolMessage too would create a duplicate dangling result.
+                    pending_messages = []
                 failed_tool_results.extend(_failed_tool_evidence(calls, results))
-                completion_context: list[BaseMessage] = []
+                completion_context: RuntimeContext | list[BaseMessage] = []
                 if self._active_context_policy is not None:
                     await self._record_executor_round(operational_response, results)
                     # The settled batch is part of the Runtime context before
@@ -385,7 +427,7 @@ class Executor:
                     # Refuse to judge when that required context cannot fit;
                     # silently dropping evidence could produce false completion.
                     settled_context = await self._active_context_policy.maintain(self._active_durable_state)
-                    completion_context = _completion_context_messages(settled_context)
+                    completion_context = settled_context
                 successful = [message for message in results if _tool_error(message) is None]
                 if successful:
                     judged = await self._judge_step_completion(
@@ -402,11 +444,9 @@ class Executor:
                     messages.extend([graph_response, *results])
                 continue
 
-            completion_context = []
+            completion_context: RuntimeContext | list[BaseMessage] = []
             if self._active_context_policy is not None:
-                completion_context = _completion_context_messages(
-                    await self._active_context_policy.maintain(self._active_durable_state)
-                )
+                completion_context = await self._active_context_policy.maintain(self._active_durable_state)
             judged = await self._judge_step_completion(
                 step, request, completion_context, response, (), (), criterion_completed,
                 failed_tool_results,
@@ -426,13 +466,17 @@ class Executor:
         self,
         step: PlanStep,
         request: list[BaseMessage],
-        runtime_context: list[BaseMessage],
+        runtime_context: RuntimeContext | list[BaseMessage],
         response: BaseMessage,
         calls: list[dict[str, Any]],
         results: list[BaseMessage],
         completed: bool,
         prior_failed_tool_results: list[dict[str, Any]],
     ) -> str | None:
+        messages_layout = (
+            isinstance(self._active_context_policy, RuntimeContextPolicy)
+            and self._active_context_policy.layout == "messages"
+        )
         evidence = {
             "selected_step": {
                 "id": step.id,
@@ -440,8 +484,23 @@ class Executor:
                 "completion_criterion": step.completion_criterion,
             },
             "criterion_status": "completed" if completed else "pending",
-            "operational_request": [_message_reference(item) for item in request],
-            "runtime_context_snapshot": [_message_reference(item) for item in runtime_context],
+            "operational_request": [
+                _message_reference(item)
+                for item in request
+                if not (
+                    messages_layout
+                    and isinstance(item, ToolMessage)
+                    and _tool_error(item) is not None
+                )
+            ],
+            "runtime_context_snapshot": [
+                _message_reference(item)
+                for item in (
+                    _completion_context_messages(runtime_context)
+                    if isinstance(runtime_context, RuntimeContext)
+                    else runtime_context
+                )
+            ],
             "operational_response": _message_reference(response),
             "successful_tool_results": [
                 {
@@ -453,7 +512,10 @@ class Executor:
                 for call, message in zip(calls, results)
                 if _tool_error(message) is None
             ],
-            "failed_tool_results": prior_failed_tool_results,
+            # Failed calls are correction-loop evidence only.  In the native
+            # Runtime-context layout they must not cross the Plan-step judge's
+            # evidence boundary, including through the provenance payload.
+            "failed_tool_results": [] if messages_layout else prior_failed_tool_results,
         }
         instructions = (
             "You are a tool-free completion judge for one Plan step. Evaluate only the selected "
@@ -482,10 +544,48 @@ class Executor:
             "Replace the example evidence with a concise fact from this request. "
             "Return only the applicable block."
         )
-        context = [
-            SystemMessage(content=instructions),
-            HumanMessage(content=json.dumps(evidence, ensure_ascii=False, sort_keys=True, default=str)),
-        ]
+        evidence_message = HumanMessage(
+            content=json.dumps(evidence, ensure_ascii=False, sort_keys=True, default=str)
+        )
+        if messages_layout:
+            # Keep the judge's original structured step input, reconstruct only
+            # successful native Raw pairs, then place judge evidence between
+            # Observations and Goal.  The criterion remains the final layer.
+            judge_prefix = [SystemMessage(content=instructions), request[1]]
+            if not isinstance(self._active_context_policy, RuntimeContextPolicy):
+                raise RuntimeError("messages-layout judge requires Runtime context")
+            # Budget the actual judge request, including its fixed instructions,
+            # structured input, and trailing judge evidence. The policy's full
+            # Raw window is a conservative superset; filter failed pairs only
+            # after it has either fit or explicitly failed to fit.
+            runtime_context = await self._active_context_policy.maintain(
+                self._active_durable_state,
+                prefix_messages=judge_prefix,
+                feedback_messages=[evidence_message],
+                completion_criteria_status=_step_criterion_status(step, completed),
+            )
+            context = RuntimeContext(
+                runtime_context.durable_state,
+                runtime_context.observations,
+                tuple(
+                    RawToolResult(
+                        item.round,
+                        tuple(call for call in item.calls if call.error is None),
+                    )
+                    for item in runtime_context.raw_tool_results
+                    if any(call.error is None for call in item.calls)
+                ),
+                layout="messages",
+            ).as_messages(
+                prefix_messages=judge_prefix,
+                feedback_messages=[evidence_message],
+                completion_criteria_status=_step_criterion_status(step, completed),
+            )
+        else:
+            context = [
+                SystemMessage(content=instructions),
+                evidence_message,
+            ]
         judge_model = self._model.bind_tools(())
         trace_llm_request(
             self._trace,
@@ -508,14 +608,15 @@ class Executor:
         except LineProtocolError as error:
             if self._trace is not None:
                 self._trace.llm_validation_retry("completion_judge", error)
-            repair = [
-                *context,
-                HumanMessage(content=(
-                    f"Validation error: {error}\nRejected output (JSON-encoded): "
-                    f"{json.dumps(_message_text(judged), ensure_ascii=False)}\n"
-                    "Return the corrected STEP_COMPLETION_PROGRESS block only."
-                )),
-            ]
+            repair_feedback = HumanMessage(content=(
+                f"Validation error: {error}\nRejected output (JSON-encoded): "
+                f"{json.dumps(_message_text(judged), ensure_ascii=False)}\n"
+                "Return the corrected STEP_COMPLETION_PROGRESS block only."
+            ))
+            if messages_layout:
+                repair = _insert_before_goal(context, repair_feedback)
+            else:
+                repair = [*context, repair_feedback]
             trace_llm_request(
                 self._trace,
                 "completion_judge",
@@ -735,8 +836,17 @@ def _completion_context_messages(context: RuntimeContext) -> list[BaseMessage]:
             for item in context.raw_tool_results
             if any(call.error is None for call in item.calls)
         ),
+        layout=context.layout,
     )
     return evidence_only.as_messages()
+
+
+def _insert_before_goal(messages: list[BaseMessage], feedback: BaseMessage) -> list[BaseMessage]:
+    """Keep native-layout correction feedback before Goal and criteria."""
+    for index, message in enumerate(messages):
+        if isinstance(message, HumanMessage) and message.content.startswith("## Goal"):
+            return [*messages[:index], feedback, *messages[index:]]
+    return [*messages, feedback]
 
 
 def _failed_tool_evidence(calls: list[dict[str, Any]], results: list[BaseMessage]) -> list[dict[str, Any]]:

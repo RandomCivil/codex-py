@@ -12,6 +12,7 @@ class LLM:
         model_name: str,
         *,
         stream: bool = False,
+        reasoning: Mapping[str, Any] | None = None,
         on_event: Callable[[ResponseStreamEvent], None] | None = None,
         on_stream_end: Callable[[], None] | None = None,
         on_request: Callable[[Mapping[str, Any]], None] | None = None,
@@ -19,6 +20,7 @@ class LLM:
     ) -> None:
         self._model_name = model_name
         self._stream = stream
+        self._reasoning = reasoning
         self._on_event = on_event
         self._on_stream_end = on_stream_end
         self._on_request = on_request
@@ -53,6 +55,8 @@ class LLM:
             request["instructions"] = instructions
         if tools is not None:
             request["tools"] = tools
+        if self._reasoning is not None:
+            request["reasoning"] = self._reasoning
 
         if self._on_request is not None:
             self._on_request(request)

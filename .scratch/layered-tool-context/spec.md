@@ -1,4 +1,4 @@
-# Runtime-context goal placement and evidence presentation
+# Runtime-context layouts and evidence presentation
 
 Status: ready-for-agent
 
@@ -14,16 +14,19 @@ adding information needed for the next decision.
 
 The application needs a more direct model-facing presentation while retaining
 the authoritative Raw tool result and Observation records for provenance,
-diagnostics, and lifecycle management.
+diagnostics, and lifecycle management. It must also expose an opt-in native
+message layout for callers that want tool evidence represented as AI and Tool
+messages instead of a file-grouped prompt section.
 
 ## Solution
 
 Keep Goal as a dedicated Runtime-context section after the evidence. It remains omitted
 only from the rendered Durable State payload and remains unchanged in Agent
 state, Checkpoints, planning, recovery, and all other Durable State uses.
-ReAct Completion criteria and their status remain in the Completion judge's
-context. After a rejected terminal proposal, the latest validated judge
-verdict, evidence, and gaps enter ReAct context without the criteria text.
+ReAct Completion criteria and their host-maintained status follow Goal in both
+operational and Completion-judge Runtime contexts. After a rejected terminal
+proposal, the latest validated judge verdict, evidence, and gaps enter ReAct
+context before Goal.
 
 Within Raw tool results, render only native permanent-raw `grep` and
 `read_file` calls as file groups spanning the active invocation's Tool rounds.
@@ -43,6 +46,53 @@ Render Observations as three direct categories—Confirmed facts, Reported
 errors, and Model inferences—without per-Observation Round headings or
 tool-call IDs in the model-facing text. Keep all provenance and the existing
 evidence lifecycle in the internal data model and diagnostics.
+
+## Runtime-context layouts
+
+The CLI exposes `--runtime-context-layout grouped|messages`, defaulting to
+`grouped`. The selected layout is part of the durable run configuration
+fingerprint. `resume` accepts the flag and requires its value to match the
+created run; omitting it selects `grouped` for that comparison. The flag is
+accepted for every execution selection, including `direct` and `tool_agent`,
+where no Runtime context request means it has no effect.
+
+`grouped` retains the presentation specified above. `messages` replaces its
+single rendered Runtime-context prompt with a complete request layout for
+every model request that consumes Runtime context, including operational
+tool-loop and Completion-judge requests:
+
+1. Component fixed system prompt(s).
+2. The original structured user input, followed by retained AI tool-call and
+   Tool result messages in Tool-round and original request order.
+3. Separate human messages for Durable State and Observations.
+4. Protocol-repair instructions or the latest validated completion-rejection
+   feedback, when applicable.
+5. Separate human messages for Goal and applicable acceptance criteria.
+
+The fixed prompt(s) are always first. Repair and correction feedback appears
+after Observations and before Goal, even though it was previously modeled as
+an appended operational message. Conversation history remains the original
+structured user message; this layout does not unfold it into a transcript.
+Each consumer retains its existing evidence selection: in particular, a
+Plan-step Completion judge receives its existing evidence-only snapshot and
+therefore reconstructs only successful Raw AI/Tool pairs. Failed-call evidence
+continues to belong to the operational correction loop.
+
+For each visible Raw call, reconstruct a provider-native AI tool-call message
+and its matching Tool message from the stored call ID, name, arguments, full
+result, and error. A batch whose calls have different visible lifecycles is
+pruned to exactly its visible Raw calls before reconstructing its AI message;
+there can be no dangling tool call or result. A failed Tool message carries
+the complete stable result content and its error status/text. Native reads
+are never grouped by file in this layout. When an Observation replaces a Raw
+call, remove that call's entire reconstructed AI/Tool pair and retain its
+summary only in the Observations message.
+
+The Runtime-context budget applies to the entire `messages` request, including
+component system text, user input, AI/Tool messages, and all trailing state
+messages. It retains the existing oldest-Observation merge and explicit
+failure behavior when required Durable State or Raw AI/Tool evidence cannot
+fit.
 
 For example, after a `read_file` and a path-prefixed `grep` on the same file,
 followed by a non-native `exec` result, the relevant rendered sections are:
@@ -91,13 +141,17 @@ def login(): pass
 19. As a tool-calling model, I want resolved read results shown directly beneath each file heading, with one block per result and no call metadata, so that file contents are the first thing I see.
 20. As a tool-calling model, I want Observations combined under three category headings with no displayed Round or tool-call ID, so that the evidence reads as one concise section.
 21. As a tool-calling model, I want non-native Raw tool results after all file groups, retaining their own Round headings and call details, so that they remain diagnosable without interrupting file evidence.
-22. As a ReAct caller, I want the latest validated Completion judge verdict, evidence, and gaps after a rejected terminal proposal, so that I can correct the shortfall without receiving criteria text.
+22. As a ReAct caller, I want the latest validated Completion judge verdict, evidence, and gaps after a rejected terminal proposal, so that I can correct the shortfall against the displayed criteria.
+23. As a CLI caller, I want to select `grouped` or `messages` Runtime-context layout, so that I can opt into native message evidence without changing existing callers.
+24. As a tool-calling model, I want retained Raw evidence represented by matching AI tool-call and Tool result messages, so that tool invocation semantics remain explicit without file grouping.
+25. As a recovery operator, I want a resumed durable run to use the same selected layout, so that its prompt organization cannot change during recovery.
+26. As a Completion judge, I want the same selected Runtime-context layout and acceptance criteria ordering as the tool loop, so that I evaluate the same evidence boundary.
 
 ## Implementation Decisions
 
 - Amend the Runtime-context renderer while leaving the RuntimeContext data model and Tool-call evidence policy intact.
 - Derive the displayed goal from applicable Durable State and omit that same goal field from the Durable State presentation. Support both ReAct's direct goal payload and the Agent-state goal nested in the Plan-step Executor's durable payload.
-- Render `### Goal` after `### Raw tool results`; retain the other top-level Runtime-context sections. Keep ReAct Completion criteria and their status out of operational Runtime context. After judge rejection, append only the latest validated structured verdict with evidence and gaps, without criteria text.
+- Render `### Goal` after `### Raw tool results`; retain the other top-level Runtime-context sections. Render ReAct Completion criteria and their host-maintained status immediately after Goal in operational and Completion-judge Runtime contexts. After judge rejection, append the latest validated structured verdict with evidence and gaps before Goal.
 - Treat only native tools named exactly `grep` and `read_file` as file-grouped native reads. Do not extend file grouping to `exec`, including shell commands classified as permanent raw.
 - Resolve a `read_file` group from its explicit path argument. Resolve a `grep` group from an explicit single-file path argument when available; otherwise parse path-prefixed grep result lines and split their matched content by path.
 - Collect file groups across all selected Raw tool results. Preserve each group's entries in ascending Tool-round order and original request order within a batch. Append each result as a separate first-level code block directly under `#### File: <path>`; use a fence that cannot collide with the result text. Show complete multi-line content without an extra `result:` label. For path-prefixed grep output, split the matched lines by file, remove each line's path prefix in the displayed block, and append each block to its corresponding file group. Retain round, tool name, arguments, tool-call ID, and complete original result internally and in diagnostics, but omit them from resolved file groups in the model-facing text.
@@ -107,6 +161,12 @@ def login(): pass
 - For every successful observation-class call, provide the Runtime-context component a deterministic decision summary containing the Goal, execution mode, applicable Plan step and completion criterion, and the triggering tool name and arguments. Require `affects_current_decision` and `affected_targets` (`confirmed_facts`, `summary`, and/or `durable_state`) in its Observation. A positive Observation replaces its Raw fallback; a negative result keeps Raw evidence only through its existing window, then leaves Runtime context. Do not block either loop for this asynchronous decision.
 - Retain Raw fallback for a pending, failed, or invalid decision-impact Observation. Require nonempty targets for a positive impact and no targets for a negative one; when budget merging positive Observations, retain positive impact and union their targets. Treat `durable_state` strictly as explanatory metadata, never as a state mutation.
 - Preserve Raw tool-result retention, per-call classification, asynchronous Observation lifecycle, token budgeting, tracing, Checkpoint exclusion, and recovery boundaries defined by ADR-0018.
+- Make `grouped` and `messages` explicit Runtime-context layout values. Default every CLI entry point to `grouped`, propagate the selected value through execution construction, and include it in durable-run configuration identity.
+- In `messages`, compose the full request in this order: component system messages; original user message; reconstructed visible Raw AI/Tool pairs; Durable State; Observations; repair or correction feedback; Goal; acceptance criteria. Each trailing Runtime-context layer is a distinct HumanMessage.
+- Reconstruct only visible Raw calls. For a partially visible batch, emit one AIMessage containing only those calls and the matching ToolMessages in request order. Serialize complete results stably, and mark failed ToolMessages with their complete error information.
+- Apply `messages` composition to both ReAct and Plan-step operational and Completion-judge requests. Keep conversation history as its existing structured user message.
+- Preserve each request's existing evidence selection under either layout. In particular, the Plan-step Completion judge continues to omit failed Tool calls while the operational loop retains them for correction.
+- Budget the complete selected request. Continue existing Observation merging; fail explicitly rather than dropping required Durable State or Raw AI/Tool pairs.
 
 ## Testing Decisions
 
@@ -121,8 +181,12 @@ def login(): pass
 - Test positive and negative decision-impact Observations for each existing observation-class tool, including `exec`; verify negative calls retain Raw evidence through their normal window before omission, invalid or failed judgments retain Raw fallback, and merged Observations union their affected targets without mutating Durable State.
 - Test that Observations flatten into three always-present categories with no displayed Round or tool-call IDs, preserving evidence order and duplicates while keeping their internal provenance.
 - Test that non-native-read calls appear after the file groups with their existing round-grouped rendering, and that no existing context-budget, Raw-evidence, or diagnostic provenance behavior regresses.
-- Test that a ReAct request does not render Completion criteria text or status; after a rejected completion proposal, it receives only the latest validated structured verdict with evidence and gaps.
+- Test that a ReAct request renders Completion criteria and their current host-maintained status immediately after Goal; after a rejected completion proposal, it receives the latest validated structured verdict with evidence and gaps before Goal.
 - Retain high-level ReAct and Plan-step Executor tests as confirmation that both modes pass the resulting Runtime context to later model requests.
+- Add CLI tests for default selection, explicit `messages`, propagation through run, resume, conversation, and chat, matching resume configuration identity, and harmless use with modes that never construct Runtime context.
+- Assert `messages` request role/order, including system prompts first; original structured conversation input; full raw result and failed-call encoding; partial-batch pruning; Observation replacement; repair and rejection feedback between Observations and Goal; Goal and criteria last; and no file grouping.
+- Exercise both operational and Completion-judge requests in ReAct and Plan-step execution. Verify their complete request budget includes fixed system and user messages, and retains the existing merge-or-fail contract.
+- Verify that Plan-step Completion-judge message requests preserve their evidence-only filter while operational message requests retain failed-call correction evidence.
 
 ## Out of Scope
 
@@ -132,6 +196,7 @@ def login(): pass
 - Grouping `list_dir`, `glob`, write-class calls, or Observations by file.
 - Adding a new diagnostic store, changing trace contents, or persisting Runtime-context evidence.
 - Changing tool schemas, tool permissions, execution-mode selection, or provider configuration.
+- Changing the `grouped` layout's file grouping or evidence presentation contract.
 
 ## Further Notes
 
@@ -139,8 +204,9 @@ This specification uses the glossary terms Agent state, Durable State, Goal,
 Raw tool result, Tool round, Tool-call batch, Tool-call evidence policy,
 Runtime context window, Observation, ReAct mode, and Plan-step Executor.
 ADR-0018 remains authoritative for evidence lifecycle and internal provenance.
-The model-facing rendering intentionally omits some resolved native-read
-request metadata and redundant grep path prefixes while preserving the
-complete original Raw tool result internally. Goal remains after the evidence;
-this revision changes the presentation of native
-reads, other Raw results, and Observations.
+The model-facing `grouped` rendering intentionally omits some resolved
+native-read request metadata and redundant grep path prefixes while preserving
+the complete original Raw tool result internally. `messages` preserves native
+tool-call semantics instead of presenting file groups. Goal remains after the
+evidence in `grouped`; in `messages` it follows Durable State, Observations,
+and any repair or correction feedback, and precedes acceptance criteria.

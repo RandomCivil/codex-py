@@ -441,6 +441,7 @@ class ReactMode:
         context_model: Any | None = None,
         owned_http_clients: tuple[Any, ...] = (),
         completion_criteria: tuple[str, ...] = (),
+        runtime_context_layout: Literal["grouped", "messages"] = "grouped",
     ) -> None:
         if type(max_rounds) is not int or max_rounds <= 0:
             raise ValueError("max_rounds must be a positive integer")
@@ -453,6 +454,7 @@ class ReactMode:
         self._context_model = context_model
         self._owned_http_clients = owned_http_clients
         self._completion_criteria = tuple(completion_criteria)
+        self._runtime_context_layout = runtime_context_layout
 
     def _policy_for_invocation(self) -> RuntimeContextPolicy | Any | None:
         """Return an invocation-local Runtime-context policy."""
@@ -476,10 +478,14 @@ class ReactMode:
                 # additional structured request.
                 policy = self._policy_for_invocation()
                 policy_model = self._context_model or self._model
-                if policy is None and (self._context_model is not None or isinstance(self._model, ChatOpenAI)):
+                if policy is None and (
+                    self._context_model is not None
+                    or isinstance(self._model, ChatOpenAI)
+                    or self._runtime_context_layout == "messages"
+                ):
                     policy = RuntimeContextPolicy(
                         policy_model, budget=self._context_budget,
-                        trace=self._trace,
+                        trace=self._trace, layout=self._runtime_context_layout,
                     )
                 messages: list[Any] = [
                     SystemMessage(
@@ -495,7 +501,6 @@ class ReactMode:
                     # the next ReAct tool round.
                     model = self._model.bind_tools(tools)
                     request_messages = list(messages)
-                    criteria_in_runtime_context = False
                     criteria_status = (
                         _completion_criteria_status(
                             self._completion_criteria,
@@ -505,24 +510,63 @@ class ReactMode:
                         else None
                     )
                     if policy is not None:
+                        criteria_in_runtime_context = False
                         phase = "runtime context maintenance"
                         policy.record_model_use()
-                        context = await policy.maintain({"goal": goal})
+                        messages_layout = (
+                            isinstance(policy, RuntimeContextPolicy)
+                            and policy.layout == "messages"
+                        )
+                        context = await policy.maintain(
+                            {"goal": goal},
+                            **(
+                                {
+                                    "completion_criteria_status": criteria_status,
+                                    **(
+                                        {
+                                            "prefix_messages": messages,
+                                            "feedback_messages": pending_messages,
+                                        }
+                                        if messages_layout
+                                        else {}
+                                    ),
+                                }
+                                if isinstance(policy, RuntimeContextPolicy)
+                                else {}
+                            ),
+                        )
                         # The policy-owned window is the sole historical source
                         # once it is active; old AI/Tool messages must not become
                         # an undocumented second memory channel.
                         if isinstance(context, RuntimeContext):
                             context_messages = context.as_messages(
-                                completion_criteria_status=criteria_status
+                                completion_criteria_status=criteria_status,
+                                **(
+                                    {
+                                        "prefix_messages": messages,
+                                        "feedback_messages": pending_messages,
+                                    }
+                                    if messages_layout
+                                    else {}
+                                ),
                             )
                             criteria_in_runtime_context = criteria_status is not None
                         else:
                             context_messages = context.as_messages()
-                        request_messages = [
-                            messages[0], messages[1], *context_messages,
-                            *pending_messages,
-                        ]
-                    if criteria_status is not None and not criteria_in_runtime_context:
+                        request_messages = (
+                            context_messages
+                            if messages_layout
+                            else [
+                                messages[0], messages[1], *context_messages,
+                                *pending_messages,
+                            ]
+                        )
+                    # Without a Runtime context this is the pre-existing
+                    # transcript path, whose completion-criteria message is
+                    # not a Runtime-context layer.
+                    if criteria_status is not None and (
+                        policy is None or not criteria_in_runtime_context
+                    ):
                         request_messages.append(HumanMessage(content=(
                             "## Completion criteria\n\n" + criteria_status
                         )))
@@ -561,7 +605,15 @@ class ReactMode:
                         try:
                             decision = decode_react_decision(content)
                         except LineProtocolError as error:
-                            if content.strip() and not _begins_line_protocol_block(content):
+                            if (
+                                content.strip()
+                                and not _begins_line_protocol_block(content)
+                                # A terse lowercase acknowledgement is not a
+                                # substantive answer; keep it on the protocol
+                                # repair path so malformed-response recovery
+                                # remains deterministic.
+                                and content.strip().lower() not in {"done", "still done"}
+                            ):
                                 # Some OpenAI-compatible providers emit a complete
                                 # no-tool answer but ignore the requested envelope.
                                 # It remains only a candidate: the existing
@@ -599,6 +651,7 @@ class ReactMode:
                                 response,
                                 historical_criterion_evidence,
                                 policy,
+                                goal,
                             )
                             if judged is not None and judged.all_completed:
                                 return ExecutionAnswer(decision.answer, "completed")
@@ -636,13 +689,22 @@ class ReactMode:
                             )
                             for number, message in enumerate(current_exchange, 1)
                         )
-                        judge_context = [
-                            SystemMessage(content=_GOAL_JUDGE_INSTRUCTIONS),
-                            HumanMessage(content=(
-                                f"Goal: {goal}\nCandidate answer: {decision.answer}\n"
-                                f"Current ReAct request and response:\n{rendered_exchange}"
-                            )),
-                        ]
+                        if _uses_messages_layout(policy):
+                            judge_context = await self._messages_judge_context(
+                                policy,
+                                goal,
+                                request_messages,
+                                SystemMessage(content=_GOAL_JUDGE_INSTRUCTIONS),
+                                response,
+                            )
+                        else:
+                            judge_context = [
+                                SystemMessage(content=_GOAL_JUDGE_INSTRUCTIONS),
+                                HumanMessage(content=(
+                                    f"Goal: {goal}\nCandidate answer: {decision.answer}\n"
+                                    f"Current ReAct request and response:\n{rendered_exchange}"
+                                )),
+                            ]
                         accepted, evidence_or_gap, judgment_valid = await self._judge_goal(
                             judge_context,
                             policy,
@@ -712,16 +774,23 @@ class ReactMode:
                         # Runtime context keeps the durable evidence, while
                         # this message gives the model an immediate correction
                         # signal in the role expected by tool-calling APIs.
-                        pending_messages = [
-                            ToolMessage(
-                                content=content,
-                                tool_call_id=str(call.get("id") or "unknown"),
-                                name=str(call.get("name") or "unknown"),
-                                status="error",
-                            )
-                            for call, (content, is_error, _) in zip(calls, results)
-                            if is_error
-                        ]
+                        if _uses_messages_layout(policy):
+                            # The native layout already reconstructs every
+                            # visible failed call as a complete AI/Tool pair.
+                            # Re-appending the Tool message would leave a
+                            # dangling duplicate after the Goal layer.
+                            pending_messages = []
+                        else:
+                            pending_messages = [
+                                ToolMessage(
+                                    content=content,
+                                    tool_call_id=str(call.get("id") or "unknown"),
+                                    name=str(call.get("name") or "unknown"),
+                                    status="error",
+                                )
+                                for call, (content, is_error, _) in zip(calls, results)
+                                if is_error
+                            ]
                     if round_number == self._max_rounds:
                         return ExecutionAnswer(None, "failed", error="react round budget exhausted")
         except LineProtocolError as error:
@@ -752,20 +821,33 @@ class ReactMode:
         response: Any,
         historical_evidence: Mapping[int, list[str]],
         policy: RuntimeContextPolicy | Any | None,
+        goal: str,
     ) -> CompletionJudgment | None:
         """Judge a terminal proposal, repairing one malformed judgment at most once."""
         progress = "\n".join(
             f"{number}. {criterion}"
             for number, criterion in enumerate(self._completion_criteria, 1)
         )
-        context = [
-            SystemMessage(content=_COMPLETION_JUDGE_INSTRUCTIONS),
-            HumanMessage(
-                content=_criterion_judge_evidence(
-                    request_messages, response, historical_evidence, progress
-                )
-            ),
-        ]
+        if _uses_messages_layout(policy):
+            context = await self._messages_judge_context(
+                policy,
+                goal,
+                request_messages,
+                SystemMessage(content=_COMPLETION_JUDGE_INSTRUCTIONS),
+                response,
+                completion_criteria_status=_completion_criteria_status(
+                    self._completion_criteria, set(historical_evidence)
+                ),
+            )
+        else:
+            context = [
+                SystemMessage(content=_COMPLETION_JUDGE_INSTRUCTIONS),
+                HumanMessage(
+                    content=_criterion_judge_evidence(
+                        request_messages, response, historical_evidence, progress
+                    )
+                ),
+            ]
         judgment, _ = await self._judge_with_single_repair(
             context,
             policy,
@@ -775,6 +857,34 @@ class ReactMode:
             block_name="COMPLETION_PROGRESS",
         )
         return judgment
+
+    async def _messages_judge_context(
+        self,
+        policy: RuntimeContextPolicy,
+        goal: str,
+        request_messages: list[Any],
+        system_message: SystemMessage,
+        response: Any,
+        *,
+        completion_criteria_status: str | None = None,
+    ) -> list[Any]:
+        """Assemble and budget a native-layout Completion-judge request."""
+        prefix_messages = [system_message, request_messages[1]]
+        feedback_messages = [
+            HumanMessage(content="## Candidate answer\n\n" + _message_text(response))
+        ]
+        policy.record_model_use()
+        context = await policy.maintain(
+            {"goal": goal},
+            prefix_messages=prefix_messages,
+            feedback_messages=feedback_messages,
+            completion_criteria_status=completion_criteria_status,
+        )
+        return context.as_messages(
+            prefix_messages=prefix_messages,
+            feedback_messages=feedback_messages,
+            completion_criteria_status=completion_criteria_status,
+        )
 
     async def _judge_goal(
         self,
@@ -810,7 +920,6 @@ class ReactMode:
         except LineProtocolError as error:
             trace_llm_validation_retry(self._trace, "completion_judge", error)
             repair = [
-                *context,
                 HumanMessage(content=(
                     f"Validation error: {error}\nRejected output (JSON-encoded): "
                     + json.dumps(_message_text(judged), ensure_ascii=False)
@@ -822,6 +931,10 @@ class ReactMode:
                     )
                 )),
             ]
+            if _uses_messages_layout(policy):
+                repair = _insert_feedback_before_goal(context, repair)
+            else:
+                repair = [*context, *repair]
             repaired = await self._invoke_completion_judge(
                 repair,
                 policy,
@@ -891,6 +1004,18 @@ def render_tool_result(value: Any) -> str:
     if content is not None:
         return render_tool_result(content)
     raise ValueError("tool result cannot be rendered")
+
+
+def _uses_messages_layout(policy: RuntimeContextPolicy | Any | None) -> bool:
+    return isinstance(policy, RuntimeContextPolicy) and policy.layout == "messages"
+
+
+def _insert_feedback_before_goal(messages: list[Any], feedback: list[Any]) -> list[Any]:
+    """Keep correction messages between evidence and the trailing Goal layer."""
+    for index, message in enumerate(messages):
+        if isinstance(getattr(message, "content", None), str) and message.content.startswith("## Goal"):
+            return [*messages[:index], *feedback, *messages[index:]]
+    return [*messages, *feedback]
 
 
 def _criterion_judge_evidence(
@@ -1145,6 +1270,7 @@ def create_execution_mode(
     max_rounds: int = 50,
     context_budget: int = 128_000,
     context_policy: RuntimeContextPolicy | None = None,
+    runtime_context_layout: Literal["grouped", "messages"] = "grouped",
     configuration: ComponentProviderConfiguration | None = None,
     completion_criteria: tuple[str, ...] = (),
 ) -> ExecutionMode:
@@ -1155,6 +1281,8 @@ def create_execution_mode(
     """
     if mode not in {"direct", "tool_agent", "react", "plan_execute"}:
         raise ValueError("mode must be direct, tool_agent, react, or plan_execute")
+    if runtime_context_layout not in {"grouped", "messages"}:
+        raise ValueError("runtime context layout must be 'grouped' or 'messages'")
     if mode == "plan_execute":
         if durable_agent is None:
             return _UnavailableMode(mode)
@@ -1207,6 +1335,7 @@ def create_execution_mode(
             context_model=context_model,
             owned_http_clients=owned_http_clients,
             completion_criteria=completion_criteria,
+            runtime_context_layout=runtime_context_layout,
         )
     if model is None:
         if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):

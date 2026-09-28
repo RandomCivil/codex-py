@@ -249,5 +249,9 @@ The conservative static classification of an `exec` command under the Tool-call 
 _Avoid_: command intent, heuristic safety classification
 
 **Runtime context window**:
-The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. Its rendered Goal is a distinct section near the end. ReAct criteria text belongs to the Completion judge's context; the latest validated negative judgment may return to ReAct as correction context. The durable goal remains part of Agent state. The window has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
+The context supplied to every Model request within a tool loop: retained evidence selected independently for every Tool call by the Tool-call evidence policy, plus applicable Durable State. Its presentation follows the selected Runtime-context layout; the durable goal remains part of Agent state. ReAct criteria text belongs to the Completion judge's context; the latest validated negative judgment may return to ReAct as correction context. The window has an explicit token budget, defaulting to 128,000 tokens and configurable per component; if compaction cannot fit Durable State and required Raw tool results, execution fails.
 _Avoid_: Durable State, message transcript
+
+**Runtime-context layout**:
+The model-facing organization selected for a Runtime context window. `grouped` is the existing single-message, file-grouped rendering; `messages` places component system instructions before preserved user, assistant, and Tool messages, then appends Durable State, Observations, protocol repair or correction feedback, Goal, and applicable acceptance criteria as separate messages. The complete model request shares the Runtime context window's token budget.
+_Avoid_: prompt format, context mode

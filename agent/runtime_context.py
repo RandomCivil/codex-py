@@ -13,7 +13,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from llm.line_protocol import LineProtocolError, parse_line_protocol
 from agent.model_request import stream_model_response
@@ -161,9 +161,29 @@ class RuntimeContext:
     durable_state: Any
     observations: tuple[Observation, ...]
     raw_tool_results: tuple[RawToolResult, ...]
+    layout: Literal["grouped", "messages"] = "grouped"
 
-    def as_messages(self, *, completion_criteria_status: str | None = None) -> list[HumanMessage]:
+    def as_messages(
+        self,
+        *,
+        completion_criteria_status: str | None = None,
+        layout: Literal["grouped", "messages"] | None = None,
+        prefix_messages: Sequence[Any] = (),
+        feedback_messages: Sequence[Any] = (),
+    ) -> list[Any]:
         """Render the policy-owned layers for a model request."""
+        selected_layout = self.layout if layout is None else layout
+        if selected_layout == "messages":
+            return _runtime_context_messages(
+                self,
+                completion_criteria_status,
+                prefix_messages=prefix_messages,
+                feedback_messages=feedback_messages,
+            )
+        if selected_layout != "grouped":
+            raise ValueError("runtime context layout must be 'grouped' or 'messages'")
+        if prefix_messages or feedback_messages:
+            raise ValueError("fixed and feedback messages require the messages layout")
         return [HumanMessage(content=_runtime_context_prompt(self, completion_criteria_status))]
 
 
@@ -177,15 +197,19 @@ class RuntimeContextPolicy:
         budget: int = DEFAULT_CONTEXT_BUDGET,
         raw_rounds: int = RAW_ROUND_WINDOW,
         trace: Any | None = None,
+        layout: Literal["grouped", "messages"] = "grouped",
     ) -> None:
         if type(budget) is not int or budget <= 0:
             raise ValueError("context budget must be a positive integer")
         if type(raw_rounds) is not int or raw_rounds <= 0:
             raise ValueError("raw_rounds must be a positive integer")
+        if layout not in {"grouped", "messages"}:
+            raise ValueError("runtime context layout must be 'grouped' or 'messages'")
         self.model = model
         self.budget = budget
         self.raw_rounds = raw_rounds
         self._trace = trace
+        self.layout = layout
         self._raw: list[RawToolResult] = []
         self._observations: list[Observation] = []
         self._observation_outcomes: dict[tuple[int, str], ObservationOutcome] = {}
@@ -216,6 +240,7 @@ class RuntimeContextPolicy:
             budget=self.budget,
             raw_rounds=self.raw_rounds,
             trace=self._trace,
+            layout=self.layout,
         )
 
     @property
@@ -333,12 +358,24 @@ class RuntimeContextPolicy:
                 for call in item.calls
             )
         )
-        return RuntimeContext(durable_state, observations, raw_results)
+        return RuntimeContext(durable_state, observations, raw_results, self.layout)
 
-    async def maintain(self, durable_state: Any) -> RuntimeContext:
+    async def maintain(
+        self,
+        durable_state: Any,
+        *,
+        prefix_messages: Sequence[Any] = (),
+        feedback_messages: Sequence[Any] = (),
+        completion_criteria_status: str | None = None,
+    ) -> RuntimeContext:
         """Assemble a window, merging oldest Observations until it fits."""
         context = self.assemble(durable_state)
-        while _estimate_tokens(context) > self.budget:
+        while self._context_token_cost(
+            context,
+            prefix_messages=prefix_messages,
+            feedback_messages=feedback_messages,
+            completion_criteria_status=completion_criteria_status,
+        ) > self.budget:
             visible = [
                 item
                 for item in self._observations
@@ -353,6 +390,22 @@ class RuntimeContextPolicy:
             self._observations[first_index : second_index + 1] = [merged]
             context = self.assemble(durable_state)
         return context
+
+    def _context_token_cost(
+        self,
+        context: RuntimeContext,
+        *,
+        prefix_messages: Sequence[Any],
+        feedback_messages: Sequence[Any],
+        completion_criteria_status: str | None,
+    ) -> int:
+        if self.layout == "grouped":
+            return _estimate_tokens(context)
+        return _estimate_tokens(context.as_messages(
+            prefix_messages=prefix_messages,
+            feedback_messages=feedback_messages,
+            completion_criteria_status=completion_criteria_status,
+        ))
 
     def _expire_observations(self) -> None:
         # Observations remain retained in history; assemble() controls whether
@@ -737,6 +790,79 @@ def _runtime_context_prompt(
     if completion_criteria_status is not None:
         sections.extend(("", "### Completion criteria", completion_criteria_status))
     return "\n".join(sections)
+
+
+def _runtime_context_messages(
+    context: RuntimeContext,
+    completion_criteria_status: str | None = None,
+    *,
+    prefix_messages: Sequence[Any] = (),
+    feedback_messages: Sequence[Any] = (),
+) -> list[Any]:
+    """Render visible Raw evidence as native assistant and Tool messages."""
+    durable_state, goal, steps = _runtime_durable_state_goal_and_steps(context.durable_state)
+    messages: list[Any] = list(prefix_messages)
+    for raw in context.raw_tool_results:
+        if not raw.calls:
+            continue
+        messages.append(AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": call.tool_call_id,
+                    "name": call.name,
+                    "args": dict(call.arguments),
+                    "type": "tool_call",
+                }
+                for call in raw.calls
+            ],
+        ))
+        messages.extend(
+            ToolMessage(
+                content=_tool_message_content(call),
+                tool_call_id=call.tool_call_id,
+                name=call.name,
+                status="error" if call.error is not None else "success",
+            )
+            for call in raw.calls
+        )
+    messages.extend([
+        HumanMessage(content="## Durable state\n\n" + _prompt_value(durable_state)),
+        HumanMessage(content=_messages_observations(context.observations)),
+    ])
+    messages.extend(feedback_messages)
+    messages.append(HumanMessage(content="## Goal\n\n" + _prompt_value(goal)))
+    if steps is not None:
+        messages.append(HumanMessage(content="## Steps\n\n" + _prompt_value(steps)))
+    if completion_criteria_status is not None:
+        messages.append(HumanMessage(content="## Completion criteria\n\n" + completion_criteria_status))
+    return messages
+
+
+def _stable_tool_result(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _tool_message_content(call: RawToolCall) -> str:
+    result = _stable_tool_result(call.result)
+    if call.error is None:
+        return result
+    return f"{result}\n\nTool error: {call.error}"
+
+
+def _messages_observations(observations: tuple[Observation, ...]) -> str:
+    lines = ["## Observations"]
+    for title, attribute in (
+        ("Confirmed facts", "confirmed_facts"),
+        ("Reported errors", "reported_errors"),
+        ("Model inferences", "model_inferences"),
+    ):
+        lines.extend(("", f"### {title}"))
+        evidence = [entry for observation in observations for entry in getattr(observation, attribute)]
+        lines.extend(f"- {entry.text}" for entry in evidence) if evidence else lines.append("- (none)")
+    return "\n".join(lines)
 
 
 def _render_code_block(value: Any) -> list[str]:

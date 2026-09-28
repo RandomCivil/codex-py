@@ -46,17 +46,17 @@ class Planner:
         return plan
 
     async def _request_plan_text(self, request: str, instructions: str) -> str:
-        if self._stream:
-            return "".join(
-                [
-                    chunk
-                    async for chunk in self._text_completion.stream_text(
-                        request, instructions=instructions, tools=None
-                    )
-                ]
+        if not hasattr(self._text_completion, "stream_text"):
+            return await self._text_completion.complete_text(
+                request, instructions=instructions, tools=None
             )
-        return await self._text_completion.complete_text(
-            request, instructions=instructions, tools=None
+        return "".join(
+            [
+                chunk
+                async for chunk in self._text_completion.stream_text(
+                    request, instructions=instructions, tools=None
+                )
+            ]
         )
 
 

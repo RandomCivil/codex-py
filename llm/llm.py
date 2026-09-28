@@ -13,12 +13,14 @@ class LLM:
         *,
         stream: bool = False,
         on_event: Callable[[ResponseStreamEvent], None] | None = None,
+        on_stream_end: Callable[[], None] | None = None,
         on_request: Callable[[Mapping[str, Any]], None] | None = None,
         on_response: Callable[[Any], None] | None = None,
     ) -> None:
         self._model_name = model_name
         self._stream = stream
         self._on_event = on_event
+        self._on_stream_end = on_stream_end
         self._on_request = on_request
         self._on_response = on_response
         self._client = AsyncOpenAI(
@@ -55,11 +57,17 @@ class LLM:
         if self._on_request is not None:
             self._on_request(request)
 
-        async with self._client.responses.stream(**request) as stream:
-            async for event in stream:
-                if self._on_event is not None:
-                    self._on_event(event)
-                yield event
+        completed = False
+        try:
+            async with self._client.responses.stream(**request) as stream:
+                async for event in stream:
+                    if self._on_event is not None:
+                        self._on_event(event)
+                    completed = event.type == "response.completed"
+                    yield event
+        finally:
+            if not completed and self._on_stream_end is not None:
+                self._on_stream_end()
 
     async def stream_text(
         self,
@@ -83,18 +91,12 @@ class LLM:
         instructions: str | None = None,
         tools: Iterable[dict[str, Any]] | None = None,
     ) -> str:
-        """Return one complete non-streaming Responses API text result."""
-        request: dict[str, Any] = {
-            "model": self._model_name,
-            "input": input,
-        }
-        if instructions is not None:
-            request["instructions"] = instructions
-        if tools is not None:
-            request["tools"] = tools
-        if self._on_request is not None:
-            self._on_request(request)
-        response = await self._client.responses.create(**request)
-        if self._on_response is not None:
-            self._on_response(response)
-        return response.output_text
+        """Collect a text stream for compatibility with older callers."""
+        return "".join(
+            [
+                chunk
+                async for chunk in self.stream_text(
+                    input, instructions=instructions, tools=tools
+                )
+            ]
+        )

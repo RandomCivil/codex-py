@@ -1,6 +1,7 @@
 from io import StringIO
 from types import SimpleNamespace
 import re
+from unittest.mock import patch
 
 from agent.trace import RunTrace
 
@@ -127,9 +128,38 @@ def test_error_level_suppresses_streaming_llm_events_and_final_response_but_keep
         )
     )
 
-    assert output.getvalue().splitlines() == [
-        "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 cached_tokens=4 reasoning_tokens=1",
-    ]
+    lines = output.getvalue().splitlines()
+    assert lines[0] == (
+        "[llm usage] input_tokens=10 output_tokens=3 total_tokens=13 "
+        "cached_tokens=4 reasoning_tokens=1"
+    )
+    assert re.fullmatch(
+        r"\[llm timing\] first_token_ms=[0-9.]+ stream_duration_ms=[0-9.]+ "
+        r"time_per_output_token_ms=[0-9.]+ "
+        r"tokens_per_second=[0-9.]+",
+        lines[1],
+    )
+
+
+def test_error_level_reports_per_output_token_time_and_generation_throughput():
+    output = StringIO()
+    trace = RunTrace(output, level="error")
+
+    with patch("agent.trace.time.perf_counter", side_effect=(10.0, 10.5, 12.0)):
+        trace.llm_request("planner", {"model": "test-model"})
+        trace.llm_event(SimpleNamespace(type="response.output_text.delta", delta="hello"))
+        trace.llm_event(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(usage={"output_tokens": 3}),
+            )
+        )
+
+    assert output.getvalue().splitlines()[-1] == (
+        "[llm timing] first_token_ms=500.00 stream_duration_ms=2000.00 "
+        "time_per_output_token_ms=666.67 "
+        "tokens_per_second=1.50"
+    )
 
 
 def test_llm_usage_is_printed_from_completion_event_at_info_level():

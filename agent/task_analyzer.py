@@ -211,17 +211,17 @@ class TaskAnalyzer:
         )
 
     async def _request_analysis_text(self, model_input: str, instructions: str) -> str:
-        if self._stream:
-            return "".join(
-                [
-                    chunk
-                    async for chunk in self._text_stream.stream_text(
-                        model_input, instructions=instructions, tools=None
-                    )
-                ]
+        if not hasattr(self._text_stream, "stream_text"):
+            return await self._text_stream.complete_text(
+                model_input, instructions=instructions, tools=None
             )
-        return await self._text_stream.complete_text(
-            model_input, instructions=instructions, tools=None
+        return "".join(
+            [
+                chunk
+                async for chunk in self._text_stream.stream_text(
+                    model_input, instructions=instructions, tools=None
+                )
+            ]
         )
 
 

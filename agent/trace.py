@@ -7,6 +7,7 @@ safe for callers that consume stdout as a machine-readable interface.
 import hashlib
 import json
 import sys
+import time
 import traceback
 from collections.abc import Mapping
 from typing import Any
@@ -23,6 +24,9 @@ class RunTrace:
         self._run_id = run_id
         self._output_buffer = ""
         self._llm_attribution: tuple[str, str] | None = None
+        self._stream_started_at: float | None = None
+        self._stream_first_token_at: float | None = None
+        self._completed_streams: list[tuple[float, float | None]] = []
 
     def llm_request(
         self,
@@ -40,7 +44,35 @@ class RunTrace:
         label = component.strip() if isinstance(component, str) and component.strip() else "unknown"
         shape = _cache_relevant_shape(request) if static_shape is None else static_shape
         self._llm_attribution = (label, _request_family(shape))
+        self.llm_stream_start()
         self.llm_context(request)
+
+    def llm_stream_start(self) -> None:
+        """Start timing one streaming model response."""
+        self._stream_started_at = time.perf_counter()
+        self._stream_first_token_at = None
+
+    def llm_stream_chunk(self, chunk: Any = None) -> None:
+        """Record the first generated chunk of a streaming model response."""
+        if self._stream_started_at is None:
+            self.llm_stream_start()
+        if self._stream_first_token_at is None and _has_stream_output(chunk):
+            self._stream_first_token_at = time.perf_counter()
+
+    def llm_stream_end(self) -> None:
+        """Finish timing one streamed response until its usage metadata arrives."""
+        if self._stream_started_at is None:
+            return
+        finished_at = time.perf_counter()
+        duration = finished_at - self._stream_started_at
+        first_token = (
+            self._stream_first_token_at - self._stream_started_at
+            if self._stream_first_token_at is not None
+            else None
+        )
+        self._completed_streams.append((duration, first_token))
+        self._stream_started_at = None
+        self._stream_first_token_at = None
 
     def llm_event(self, event: Any) -> None:
         event_type = getattr(event, "type", "")
@@ -49,9 +81,11 @@ class RunTrace:
                 self._output_buffer = ""
             elif event_type == "response.output_text.delta":
                 self._output_buffer += getattr(event, "delta", "")
+                self.llm_stream_chunk(event)
             elif event_type == "response.completed":
                 # Token accounting remains useful at every level.  The full
                 # request/response payload is reserved for info-level tracing.
+                self.llm_stream_end()
                 self._llm_usage(event)
                 self._output_buffer = ""
                 self._llm_attribution = None
@@ -135,6 +169,23 @@ class RunTrace:
             f"total_tokens={_get_field(usage, 'total_tokens')} "
             f"cached_tokens={cached_tokens} "
             f"reasoning_tokens={_get_field(output_details, 'reasoning_tokens')}"
+        )
+        self._write_stream_timing(output_tokens)
+
+    def _write_stream_timing(self, output_tokens: Any) -> None:
+        """Emit per-response streaming performance once token usage is known."""
+        if self._level != "error" or not self._completed_streams:
+            return
+        duration, first_token = self._completed_streams.pop(0)
+        token_count = _positive_number(output_tokens)
+        time_per_output_token = None if token_count is None else duration / token_count
+        tokens_per_second = None if token_count is None else token_count / duration if duration else None
+        self._line(
+            "[llm timing] "
+            f"first_token_ms={_milliseconds(first_token)} "
+            f"stream_duration_ms={_milliseconds(duration)} "
+            f"time_per_output_token_ms={_milliseconds(time_per_output_token)} "
+            f"tokens_per_second={_number(tokens_per_second)}"
         )
 
     def llm_usage(self, message: Any) -> None:
@@ -334,6 +385,37 @@ def _compact(value: Any) -> str:
 
 def _truncate_log_text(value: str) -> str:
     return value if len(value) <= 100 else value[:100] + "..."
+
+
+def _milliseconds(value: float | None) -> str:
+    return "None" if value is None else f"{value * 1000:.2f}"
+
+
+def _number(value: float | None) -> str:
+    return "None" if value is None else f"{value:.2f}"
+
+
+def _positive_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+def _has_stream_output(value: Any) -> bool:
+    if value is None:
+        return False
+    content = getattr(value, "content", None)
+    if isinstance(content, str):
+        return bool(content)
+    if content:
+        return True
+    return bool(
+        getattr(value, "tool_calls", None)
+        or getattr(value, "tool_call_chunks", None)
+        or getattr(value, "delta", None)
+    )
 
 
 def _as_serializable(value: Any) -> Any:

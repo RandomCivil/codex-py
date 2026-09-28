@@ -15,7 +15,13 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 
 from agent.configuration import ComponentProviderConfiguration
-from agent.model_request import tool_request_shape, trace_llm_context, trace_llm_request, trace_llm_validation_retry
+from agent.model_request import (
+    stream_model_response,
+    tool_request_shape,
+    trace_llm_context,
+    trace_llm_request,
+    trace_llm_validation_retry,
+)
 from agent.planner import PlanningValidationError
 from llm.llm import LLM
 from llm.text_stream import validated_text, validation_feedback_instructions
@@ -106,6 +112,25 @@ EVIDENCE when the Goal is met; otherwise use COMPLETED=false and nonempty GAP.
 An explanatory answer may satisfy a Goal without Tool calls. Do not treat a claimed
 external effect as verified solely because ReAct says it happened.
 """
+
+
+_GOAL_JUDGE_FORMAT = """Use Line Protocol, not Markdown, JSON, prose, or a table. Your entire
+response must start with `BEGIN GOAL_JUDGMENT` and end with `END GOAL_JUDGMENT`.
+Use exactly one `NAME=JSON_LITERAL` field per line, with `=` (never `:`).
+When the Goal is satisfied, use COMPLETED=true and a nonempty JSON-quoted EVIDENCE;
+otherwise use COMPLETED=false and a nonempty JSON-quoted GAP.
+
+Example when the Goal is satisfied:
+BEGIN GOAL_JUDGMENT
+COMPLETED=true
+EVIDENCE="The requested file exists and contains the required content."
+END GOAL_JUDGMENT
+
+Example when the Goal is not satisfied:
+BEGIN GOAL_JUDGMENT
+COMPLETED=false
+GAP="The requested file has not been verified."
+END GOAL_JUDGMENT"""
 
 
 _COMPLETION_JUDGE_FORMAT = """Use Line Protocol, not Markdown, JSON, prose, or a table. Your entire
@@ -226,16 +251,16 @@ class DirectMode:
         return ExecutionAnswer(answer, "completed")
 
     async def _request_answer_text(self, goal: Any, instructions: str) -> str:
-        if self._stream:
-            return "".join(
-                [
-                    chunk
-                    async for chunk in self._model.stream_text(
-                        goal, tools=None, instructions=instructions
-                    )
-                ]
-            )
-        return await self._model.complete_text(goal, tools=None, instructions=instructions)
+        if not hasattr(self._model, "stream_text"):
+            return await self._model.complete_text(goal, tools=None, instructions=instructions)
+        return "".join(
+            [
+                chunk
+                async for chunk in self._model.stream_text(
+                    goal, tools=None, instructions=instructions
+                )
+            ]
+        )
 
 
 class ToolRuntime:
@@ -360,8 +385,10 @@ class ToolAgentMode:
                         "instructions": _TOOL_AGENT_INSTRUCTIONS,
                     },
                 )
-                response = await bound.ainvoke(
-                    [SystemMessage(content=_TOOL_AGENT_INSTRUCTIONS), HumanMessage(content=goal)]
+                response = await stream_model_response(
+                    bound,
+                    [SystemMessage(content=_TOOL_AGENT_INSTRUCTIONS), HumanMessage(content=goal)],
+                    self._trace,
                 )
                 _trace_llm_response(self._trace, response)
                 calls = list(getattr(response, "tool_calls", []) or [])
@@ -370,7 +397,8 @@ class ToolAgentMode:
                         return ExecutionAnswer(decode_answer(_message_text(response)), "completed")
                     except LineProtocolError as error:
                         trace_llm_validation_retry(self._trace, "tool_agent", error)
-                        response = await bound.ainvoke(
+                        response = await stream_model_response(
+                            bound,
                             [
                                 SystemMessage(
                                     content=validation_feedback_instructions(
@@ -380,7 +408,8 @@ class ToolAgentMode:
                                     )
                                 ),
                                 HumanMessage(content=goal),
-                            ]
+                            ],
+                            self._trace,
                         )
                         _trace_llm_response(self._trace, response)
                         calls = list(getattr(response, "tool_calls", []) or [])
@@ -508,7 +537,7 @@ class ReactMode:
                         },
                     )
                     phase = "model invocation"
-                    response = await model.ainvoke(request_messages)
+                    response = await stream_model_response(model, request_messages, self._trace)
                     _trace_llm_response(self._trace, response, component="react")
                     phase = "model response processing"
                     calls = list(getattr(response, "tool_calls", []) or [])
@@ -786,7 +815,11 @@ class ReactMode:
                     f"Validation error: {error}\nRejected output (JSON-encoded): "
                     + json.dumps(_message_text(judged), ensure_ascii=False)
                     + f"\nReturn the corrected {block_name} block only.\n\n"
-                    + _COMPLETION_JUDGE_FORMAT
+                    + (
+                        _GOAL_JUDGE_FORMAT
+                        if block_name == "GOAL_JUDGMENT"
+                        else _COMPLETION_JUDGE_FORMAT
+                    )
                 )),
             ]
             repaired = await self._invoke_completion_judge(
@@ -822,7 +855,7 @@ class ReactMode:
         # The judge evaluates evidence only. Bind an explicit empty tool set so
         # the provider cannot issue native calls from this request.
         judge_model = self._model.bind_tools(())
-        response = await judge_model.ainvoke(messages)
+        response = await stream_model_response(judge_model, messages, self._trace)
         _trace_llm_response(self._trace, response, component="completion_judge")
         return response
 
@@ -1134,8 +1167,9 @@ def create_execution_mode(
                 provider.base_url,
                 provider.api_key,
                 provider.model_name,
-                stream=provider.stream,
+                stream=True,
                 on_event=getattr(trace, "llm_event", None),
+                on_stream_end=getattr(trace, "llm_stream_end", None),
                 on_response=(getattr(trace, "llm_response", None) if trace is not None else None),
                 on_request=(
                     (lambda request: trace.llm_request("direct", request))
@@ -1182,6 +1216,7 @@ def create_execution_mode(
             api_key,
             model_name,
             on_event=getattr(trace, "llm_event", None),
+            on_stream_end=getattr(trace, "llm_stream_end", None),
             on_response=(getattr(trace, "llm_response", None) if trace is not None else None),
             on_request=(
                 (lambda request: trace.llm_request("direct", request))
@@ -1189,7 +1224,7 @@ def create_execution_mode(
                 else None
             ),
         )
-    return DirectMode(model, trace=trace, stream=(provider.stream if provider is not None else True))
+    return DirectMode(model, trace=trace, stream=True)
 
 
 def _configured_chat_model(provider: Any) -> tuple[ChatOpenAI, httpx.AsyncClient]:
@@ -1205,7 +1240,7 @@ def _configured_chat_model(provider: Any) -> tuple[ChatOpenAI, httpx.AsyncClient
             base_url=provider.base_url,
             api_key=provider.api_key,
             model=provider.model_name,
-            streaming=provider.stream,
+            streaming=True,
             max_retries=0,
             http_async_client=http_client,
         ),

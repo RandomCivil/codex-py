@@ -499,6 +499,7 @@ async def _select_conversation_mode(
         analyzer_configuration.model_name,
         stream=getattr(analyzer_configuration, "stream", True),
         on_event=trace.llm_event,
+        on_stream_end=trace.llm_stream_end,
         on_request=lambda request: trace.llm_request("task_analyzer", request),
         on_response=trace.llm_response,
     )

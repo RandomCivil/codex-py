@@ -460,6 +460,7 @@ async def _run(
                         planner_configuration.model_name,
                         stream=planner_configuration.stream,
                         on_event=trace.llm_event,
+                        on_stream_end=trace.llm_stream_end,
                         on_request=lambda request: trace.llm_request("planner", request),
                         on_response=lambda response: trace.llm_response(response, component="planner"),
                     )
@@ -478,7 +479,7 @@ async def _run(
                                 base_url=runtime_context_configuration.base_url,
                                 api_key=runtime_context_configuration.api_key,
                                 model=runtime_context_configuration.model_name,
-                                streaming=runtime_context_configuration.stream,
+                                streaming=True,
                                 max_retries=0,
                             )
                             if runtime_context_configuration
@@ -505,6 +506,7 @@ async def _run(
                                 analyzer_configuration.model_name,
                                 stream=analyzer_configuration.stream,
                                 on_event=trace.llm_event,
+                                on_stream_end=trace.llm_stream_end,
                                 on_request=lambda request: trace.llm_request("task_analyzer", request),
                                 on_response=lambda response: trace.llm_response(
                                     response, component="task_analyzer"

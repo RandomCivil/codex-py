@@ -4,6 +4,38 @@ from collections.abc import Iterable
 from typing import Any
 
 
+async def stream_model_response(model: Any, messages: Any, trace: Any | None = None) -> Any:
+    """Consume one LangChain model response through its streaming interface."""
+    if trace is not None:
+        callback = getattr(trace, "llm_stream_start", None)
+        if callable(callback):
+            callback()
+    response = None
+    try:
+        # Keep injected legacy test doubles usable. Production ChatOpenAI
+        # instances implement astream and therefore never take this branch.
+        if not hasattr(model, "astream"):
+            response = await model.ainvoke(messages)
+        else:
+            async for chunk in model.astream(messages):
+                if trace is not None:
+                    callback = getattr(trace, "llm_stream_chunk", None)
+                    if callable(callback):
+                        callback(chunk)
+                response = chunk if response is None else response + chunk
+    except Exception:
+        if trace is not None:
+            callback = getattr(trace, "llm_stream_end", None)
+            if callable(callback):
+                callback()
+        raise
+    if trace is not None:
+        callback = getattr(trace, "llm_stream_end", None)
+        if callable(callback):
+            callback()
+    return response
+
+
 def trace_llm_context(trace: Any | None, context: Any) -> None:
     """Send request context to legacy trace doubles when available."""
     if trace is not None:

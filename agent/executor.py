@@ -17,7 +17,7 @@ from agent.runtime_context import (
     RuntimeContextPolicy,
     observation_decision_context,
 )
-from agent.model_request import tool_request_shape, trace_llm_request
+from agent.model_request import stream_model_response, tool_request_shape, trace_llm_request
 from agent.tool_binding import canonical_mcp_tool_set
 from agent.tool_results import tool_result_failed
 
@@ -58,7 +58,7 @@ class Executor:
         base_url: str | None = None,
         api_key: str | None = None,
         model_name: str | None = None,
-        stream: bool = False,
+        stream: bool = True,
         command: str = "poetry",
         args: tuple[str, ...] = ("run", "atom-mcp"),
         cwd: str = "/home/xzp/workspace/atom-mcp",
@@ -84,7 +84,7 @@ class Executor:
                 base_url=base_url,
                 api_key=api_key,
                 model=model_name,
-                streaming=stream,
+                streaming=True,
                 max_retries=0,
             )
         self._model = model
@@ -308,7 +308,7 @@ class Executor:
                             "request_kind": "step_handoff" if handoff_attempt == 0 else "step_handoff_repair",
                         },
                     )
-                    handoff = await handoff_model.ainvoke(handoff_request)
+                    handoff = await stream_model_response(handoff_model, handoff_request, self._trace)
                     _trace_llm_response(self._trace, handoff)
                     valid_handoff = (
                         not getattr(handoff, "tool_calls", None)
@@ -355,7 +355,7 @@ class Executor:
                     "request_kind": "tool_round",
                 },
             )
-            response = await self._bound_model.ainvoke(request)
+            response = await stream_model_response(self._bound_model, request, self._trace)
             response = self._with_tool_cwd(response)
             _trace_llm_response(self._trace, response)
             calls = list(getattr(response, "tool_calls", []) or [])
@@ -494,7 +494,7 @@ class Executor:
             static_shape={"instructions": instructions, "tools": None, "request_kind": "completion_judge"},
         )
         try:
-            judged = await judge_model.ainvoke(context)
+            judged = await stream_model_response(judge_model, context, self._trace)
         except Exception as error:
             raise CompletionJudgeProviderError(str(error) or "provider request failed") from error
         _trace_llm_response(self._trace, judged, component="completion_judge")
@@ -523,7 +523,7 @@ class Executor:
                 static_shape={"instructions": instructions, "tools": None, "request_kind": "completion_judge_repair"},
             )
             try:
-                repaired = await judge_model.ainvoke(repair)
+                repaired = await stream_model_response(judge_model, repair, self._trace)
             except Exception as error:
                 raise CompletionJudgeProviderError(str(error) or "provider repair request failed") from error
             _trace_llm_response(self._trace, repaired, component="completion_judge")

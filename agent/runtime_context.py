@@ -16,6 +16,7 @@ from typing import Any, Literal, Mapping, Sequence
 from langchain_core.messages import HumanMessage
 
 from llm.line_protocol import LineProtocolError, parse_line_protocol
+from agent.model_request import stream_model_response
 
 
 DEFAULT_CONTEXT_BUDGET = 128_000
@@ -479,7 +480,7 @@ class RuntimeContextPolicy:
                     callback = getattr(self._trace, "llm_context", None)
                     if callback is not None:
                         callback(messages)
-            response = await bound.ainvoke(messages)
+            response = await stream_model_response(bound, messages, self._trace)
             if self._trace is not None:
                 callback = getattr(self._trace, "llm_response", None)
                 runtime_context_callback = getattr(self._trace, "runtime_context_llm_response", None)

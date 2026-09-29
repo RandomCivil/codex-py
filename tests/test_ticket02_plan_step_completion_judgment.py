@@ -54,7 +54,7 @@ def _judge(completed: bool, evidence: str = "state proves artifact is available"
     ))
 
 
-def test_no_tool_step_judges_agent_state_and_step_context_before_handoff(monkeypatch):
+def test_no_tool_step_judges_agent_state_and_step_context_before_completion(monkeypatch):
     async def load_tools(_session):
         return []
 
@@ -63,7 +63,6 @@ def test_no_tool_step_judges_agent_state_and_step_context_before_handoff(monkeyp
     model = _Model(
         AIMessage(content="It is already done."),
         _judge(True),
-        AIMessage(content="Published from existing context."),
     )
 
     async def run():
@@ -78,7 +77,7 @@ def test_no_tool_step_judges_agent_state_and_step_context_before_handoff(monkeyp
     outcome = asyncio.run(run())
 
     assert outcome.execution.status == "completed", outcome.execution.error
-    assert outcome.execution.result == "Published from existing context."
+    assert outcome.execution.result == "It is already done."
     assert outcome.execution.completion_evidence == "state proves artifact is available"
     judge_request = model.requests[1]
     judge_payload = "\n".join(getattr(message, "content", "") for message in judge_request)
@@ -87,7 +86,7 @@ def test_no_tool_step_judges_agent_state_and_step_context_before_handoff(monkeyp
     assert model.tool_bindings[-1] == ()
 
 
-def test_completed_step_repairs_invalid_tool_free_handoff_once(monkeypatch):
+def test_completed_step_uses_candidate_without_tool_free_handoff_repair(monkeypatch):
     async def load_tools(_session):
         return []
 
@@ -96,8 +95,6 @@ def test_completed_step_repairs_invalid_tool_free_handoff_once(monkeypatch):
     model = _Model(
         AIMessage(content="Premature answer."),
         _judge(True),
-        AIMessage(content="", tool_calls=[{"name": "unexpected", "args": {}, "id": "call-1"}]),
-        AIMessage(content="Final handoff after repair."),
     )
 
     async def run():
@@ -107,9 +104,8 @@ def test_completed_step_repairs_invalid_tool_free_handoff_once(monkeypatch):
     outcome = asyncio.run(run())
 
     assert outcome.execution.status == "completed"
-    assert outcome.execution.result == "Final handoff after repair."
-    assert len(model.requests) == 4
-    assert all(binding == () for binding in model.tool_bindings[1:])
+    assert outcome.execution.result == "Premature answer."
+    assert len(model.requests) == 2
 
 
 def test_pending_no_tool_response_continues_with_tools_and_consumes_round_budget(monkeypatch):
@@ -126,12 +122,12 @@ def test_pending_no_tool_response_continues_with_tools_and_consumes_round_budget
         AIMessage(content="Not finished yet."),
         _judge(False),
         AIMessage(content="", tool_calls=[{"name": "record", "args": {}, "id": "call-1"}]),
-        _judge(True, "record confirms the artifact is available"),
         AIMessage(content="Completed after checking."),
+        _judge(True, "record confirms the artifact is available"),
     )
 
     async def run():
-        async with Executor(model=model, max_rounds=2) as executor:
+        async with Executor(model=model, max_rounds=3) as executor:
             return await executor.execute(_state(), 1, "publish")
 
     outcome = asyncio.run(run())

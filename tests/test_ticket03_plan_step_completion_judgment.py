@@ -58,7 +58,7 @@ def _judge(completed: bool = True) -> AIMessage:
     ))
 
 
-def test_mixed_tool_batch_judges_only_success_and_returns_failure_for_correction(monkeypatch):
+def test_mixed_tool_batch_waits_for_candidate_and_returns_failure_for_correction(monkeypatch):
     async def load_tools(_session):
         def fail():
             """Fail the requested operation."""
@@ -76,7 +76,6 @@ def test_mixed_tool_batch_judges_only_success_and_returns_failure_for_correction
             {"name": "record", "args": {}, "id": "success"},
             {"name": "fail", "args": {}, "id": "failed"},
         ]),
-        _judge(False),
         AIMessage(content="Still checking."),
         _judge(False),
     )
@@ -89,21 +88,18 @@ def test_mixed_tool_batch_judges_only_success_and_returns_failure_for_correction
 
     assert outcome.execution.status == "failed", outcome.execution.error
     assert model.requests, outcome.execution.error
-    judge_request = model.requests[1]
+    judge_request = model.requests[2]
     judge_text = "\n".join(getattr(message, "content", "") for message in judge_request)
     assert "artifact is available" in judge_text
     judge_evidence = json.loads(judge_request[-1].content)
     assert "permission denied" not in json.dumps(judge_evidence["successful_tool_results"])
     assert "permission denied" in judge_evidence["failed_tool_results"][0]["error"]
-    correction_request = next(
-        request for request in model.requests
-        if any(getattr(message, "status", None) == "error" for message in request)
-    )
+    correction_request = model.requests[1]
     correction_text = "\n".join(getattr(message, "content", "") for message in correction_request)
     assert "permission denied" in correction_text
 
 
-def test_all_failed_tool_batch_does_not_invoke_completion_judge(monkeypatch):
+def test_all_failed_tool_batch_waits_for_candidate_before_invoking_completion_judge(monkeypatch):
     def fail():
         """Fail the requested operation."""
         raise RuntimeError("unavailable")
@@ -126,7 +122,8 @@ def test_all_failed_tool_batch_does_not_invoke_completion_judge(monkeypatch):
     outcome = asyncio.run(run())
 
     assert outcome.execution.status == "failed"
-    assert len(model.requests) == 1
+    assert len(model.requests) == 3
+    assert "tool-free completion judge" not in model.requests[1][0].content
 
 
 class _BudgetFailurePolicy:
@@ -184,8 +181,6 @@ def test_invalid_judgment_repair_is_attempted_once_and_failed_repair_keeps_progr
     malformed = AIMessage(content="not a STEP_COMPLETION_PROGRESS block")
     model = _Model(
         AIMessage(content="", tool_calls=[{"name": "record", "args": {}, "id": "call-1"}]),
-        malformed,
-        malformed,
         AIMessage(content="Try again."),
         malformed,
         malformed,
@@ -199,11 +194,10 @@ def test_invalid_judgment_repair_is_attempted_once_and_failed_repair_keeps_progr
 
     assert outcome.execution.status == "failed"
     assert outcome.execution.completion_evidence is None
-    assert len(model.requests) == 6
-    repair_text = "\n".join(getattr(message, "content", "") for message in model.requests[2])
+    assert len(model.requests) == 4
+    repair_text = "\n".join(getattr(message, "content", "") for message in model.requests[3])
     assert "Validation error:" in repair_text
     assert "not a STEP_COMPLETION_PROGRESS block" in repair_text
-    assert "[pending] The artifact is available" in model.requests[3][-1].content
 
 
 def test_completion_judge_provider_failure_fails_the_step(monkeypatch):

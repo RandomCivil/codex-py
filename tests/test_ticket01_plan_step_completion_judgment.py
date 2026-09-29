@@ -69,10 +69,9 @@ def test_executor_keeps_pending_after_judge_and_exposes_state_to_next_operationa
     monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
     model = _Model(
         AIMessage(content="", tool_calls=[{"name": "record", "args": {}, "id": "call-1"}]),
-        _judge(False),
         AIMessage(content="Still checking", tool_calls=[{"name": "record", "args": {}, "id": "call-2"}]),
-        _judge(True, "record returned artifact is available"),
         AIMessage(content="Published."),
+        _judge(True, "record returned artifact is available"),
     )
 
     async def run():
@@ -89,7 +88,7 @@ def test_executor_keeps_pending_after_judge_and_exposes_state_to_next_operationa
     )
 
 
-def test_executor_uses_separate_tool_free_handoff_after_completed_judgment(monkeypatch):
+def test_executor_uses_terminal_candidate_after_completed_judgment(monkeypatch):
     async def load_tools(_session):
         return [StructuredTool.from_function(_record, name="record")]
 
@@ -98,8 +97,8 @@ def test_executor_uses_separate_tool_free_handoff_after_completed_judgment(monke
     output = StringIO()
     model = _Model(
         AIMessage(content="", tool_calls=[{"name": "record", "args": {}, "id": "call-1"}]),
-        _judge(True, "record returned artifact is available"),
         AIMessage(content="Published."),
+        _judge(True, "record returned artifact is available"),
     )
 
     async def run():
@@ -110,5 +109,5 @@ def test_executor_uses_separate_tool_free_handoff_after_completed_judgment(monke
 
     assert outcome.execution.status == "completed"
     assert outcome.execution.result == "Published."
-    assert model.tool_bindings[-1] == ()
+    assert len(model.requests) == 3
     assert "tool-free completion judge" in output.getvalue()

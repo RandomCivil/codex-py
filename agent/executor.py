@@ -247,7 +247,7 @@ class Executor:
         recovery: bool = False,
         attempt: int | None = None,
     ) -> dict[str, Any]:
-        """Run operational rounds, judging each settled batch at the host boundary."""
+        """Run operational rounds and judge only nonempty terminal no-tool candidates."""
         if self._tools is None:
             self._client = MultiServerMCPClient({"atom": self._connection})
             self._session = self._client.session("atom")
@@ -290,55 +290,10 @@ class Executor:
             if thread_id is not None:
                 await self._checkpoint_running({"configurable": {"thread_id": thread_id}})
         self._rounds = 0
-        criterion_completed = False
-        completion_evidence: str | None = None
         failed_tool_results: list[dict[str, Any]] = []
         pending_messages: list[BaseMessage] = []
         while True:
-            if criterion_completed:
-                handoff_request = [
-                    SystemMessage(content=(
-                        "The selected Plan step completion criterion is completed by host-validated "
-                        "evidence. Return a concise, nonempty final Step handoff. Do not call tools."
-                    )),
-                    HumanMessage(content=_step_criterion_status(step, True)),
-                ]
-                handoff_model = self._model.bind_tools(())
-                for handoff_attempt in range(2):
-                    trace_llm_request(
-                        self._trace,
-                        "executor",
-                        handoff_request,
-                        static_shape={
-                            "instructions": handoff_request[0].content,
-                            "tools": None,
-                            "request_kind": "step_handoff" if handoff_attempt == 0 else "step_handoff_repair",
-                        },
-                    )
-                    handoff = await stream_model_response(handoff_model, handoff_request, self._trace)
-                    _trace_llm_response(self._trace, handoff)
-                    valid_handoff = (
-                        not getattr(handoff, "tool_calls", None)
-                        and isinstance(getattr(handoff, "content", None), str)
-                        and handoff.content.strip()
-                    )
-                    if valid_handoff:
-                        return {"messages": [handoff], "completion_evidence": completion_evidence}
-                    if handoff_attempt == 0:
-                        handoff_request = [
-                            *handoff_request,
-                            HumanMessage(content=(
-                                "The previous handoff was invalid: return nonempty text only, "
-                                "without native tool calls. Re-state the completed Plan-step handoff. "
-                                f"Rejected response: {json.dumps(_message_reference(handoff), ensure_ascii=False, default=str)}"
-                            )),
-                        ]
-                return {
-                    "messages": [AIMessage(content="")],
-                    "error": "model did not return a final text response",
-                    "completion_evidence": completion_evidence,
-                }
-            status = _step_criterion_status(step, criterion_completed)
+            status = _step_criterion_status(step, False)
             request = list(messages)
             if self._active_context_policy is not None:
                 self._active_context_policy.record_model_use()
@@ -394,8 +349,8 @@ class Executor:
             _trace_llm_response(self._trace, response)
             calls = list(getattr(response, "tool_calls", []) or [])
             if calls:
-                if criterion_completed:
-                    return {"messages": [AIMessage(content="")], "completion_evidence": completion_evidence, "error": "tool call after completion"}
+                if self._rounds >= self._max_rounds:
+                    return {"messages": [AIMessage(content="")], "error": "tool round budget exhausted"}
                 self._rounds += 1
                 if self._trace is not None:
                     for call in calls:
@@ -419,48 +374,44 @@ class Executor:
                     # ToolMessage too would create a duplicate dangling result.
                     pending_messages = []
                 failed_tool_results.extend(_failed_tool_evidence(calls, results))
-                completion_context: RuntimeContext | list[BaseMessage] = []
                 if self._active_context_policy is not None:
                     await self._record_executor_round(operational_response, results)
-                    # The settled batch is part of the Runtime context before
-                    # its evidence can be trusted by the completion judge.
-                    # Refuse to judge when that required context cannot fit;
-                    # silently dropping evidence could produce false completion.
-                    settled_context = await self._active_context_policy.maintain(self._active_durable_state)
-                    completion_context = settled_context
-                successful = [message for message in results if _tool_error(message) is None]
-                if successful:
-                    judged = await self._judge_step_completion(
-                        step, request, completion_context, operational_response, calls, results,
-                        criterion_completed,
-                        failed_tool_results,
-                    )
-                    if judged is not None:
-                        criterion_completed, completion_evidence = True, judged
-                        continue
-                if self._rounds >= self._max_rounds:
-                    return {"messages": [AIMessage(content="")], "error": "tool round budget exhausted"}
                 if self._active_context_policy is None:
                     messages.extend([graph_response, *results])
                 continue
 
-            completion_context: RuntimeContext | list[BaseMessage] = []
-            if self._active_context_policy is not None:
-                completion_context = await self._active_context_policy.maintain(self._active_durable_state)
-            judged = await self._judge_step_completion(
-                step, request, completion_context, response, (), (), criterion_completed,
-                failed_tool_results,
-            )
-            if judged is not None:
-                criterion_completed, completion_evidence = True, judged
-                continue
+            candidate = isinstance(response.content, str) and response.content.strip()
+            if candidate:
+                completion_context: RuntimeContext | list[BaseMessage] = []
+                if self._active_context_policy is not None:
+                    # The accumulated Runtime context, including preceding
+                    # Tool batches, is the judge's evidence at the terminal
+                    # candidate boundary.
+                    completion_context = await self._active_context_policy.maintain(self._active_durable_state)
+                judged = await self._judge_step_completion(
+                    step,
+                    request,
+                    completion_context,
+                    response,
+                    [],
+                    [],
+                    failed_tool_results,
+                )
+                if judged is not None:
+                    return {"messages": [response], "completion_evidence": judged}
+                feedback = (
+                    "The selected completion criterion is still pending. The proposed Step answer was "
+                    "not accepted as direct evidence. Continue with the available tools and address the remaining gap."
+                )
+            else:
+                feedback = (
+                    "The selected completion criterion is still pending. The no-tool response was empty. "
+                    "Continue with the available tools and address the remaining gap."
+                )
             self._rounds += 1
             if self._rounds >= self._max_rounds:
                 return {"messages": [AIMessage(content="")], "error": "tool round budget exhausted"}
-            pending_messages = [HumanMessage(content=(
-                "The selected completion criterion is still pending. Continue with the available tools "
-                "and address the remaining gap."
-            ))]
+            pending_messages = [HumanMessage(content=feedback)]
 
     async def _judge_step_completion(
         self,
@@ -470,7 +421,6 @@ class Executor:
         response: BaseMessage,
         calls: list[dict[str, Any]],
         results: list[BaseMessage],
-        completed: bool,
         prior_failed_tool_results: list[dict[str, Any]],
     ) -> str | None:
         messages_layout = (
@@ -483,7 +433,7 @@ class Executor:
                 "intent": step.intent,
                 "completion_criterion": step.completion_criterion,
             },
-            "criterion_status": "completed" if completed else "pending",
+            "criterion_status": "pending",
             "operational_request": [
                 _message_reference(item)
                 for item in request
@@ -562,7 +512,7 @@ class Executor:
                 self._active_durable_state,
                 prefix_messages=judge_prefix,
                 feedback_messages=[evidence_message],
-                completion_criteria_status=_step_criterion_status(step, completed),
+                completion_criteria_status=_step_criterion_status(step, False),
             )
             context = RuntimeContext(
                 runtime_context.durable_state,
@@ -579,7 +529,7 @@ class Executor:
             ).as_messages(
                 prefix_messages=judge_prefix,
                 feedback_messages=[evidence_message],
-                completion_criteria_status=_step_criterion_status(step, completed),
+                completion_criteria_status=_step_criterion_status(step, False),
             )
         else:
             context = [
@@ -599,9 +549,7 @@ class Executor:
             raise CompletionJudgeProviderError(str(error) or "provider request failed") from error
         _trace_llm_response(self._trace, judged, component="completion_judge")
         try:
-            progress, all_completed = decode_step_completion_progress(
-                _message_text(judged), completed=completed
-            )
+            progress, all_completed = _decode_step_judgment(judged)
             if all_completed:
                 return progress[0][1]
             return None
@@ -629,9 +577,7 @@ class Executor:
                 raise CompletionJudgeProviderError(str(error) or "provider repair request failed") from error
             _trace_llm_response(self._trace, repaired, component="completion_judge")
             try:
-                progress, all_completed = decode_step_completion_progress(
-                    _message_text(repaired), completed=completed
-                )
+                progress, all_completed = _decode_step_judgment(repaired)
                 return progress[0][1] if all_completed else None
             except LineProtocolError:
                 return None
@@ -812,6 +758,12 @@ def _message_text(message: Any) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _decode_step_judgment(message: Any) -> tuple[Any, bool]:
+    if getattr(message, "tool_calls", None) or getattr(message, "invalid_tool_calls", None):
+        raise LineProtocolError("completion judge must not call tools")
+    return decode_step_completion_progress(_message_text(message), completed=False)
 
 
 def _message_reference(message: Any) -> dict[str, Any]:

@@ -149,18 +149,18 @@ def test_plan_step_messages_layout_judge_reconstructs_only_successful_tool_pairs
             {"name": "succeed", "args": {}, "id": "ok-1"},
             {"name": "fail", "args": {}, "id": "bad-1"},
         ]),
-        _judge(),
         AIMessage(content="No progress."),
+        _judge(),
     )
 
     policy = _TrackingPolicy(None, layout="messages")
 
     async def run():
-        async with Executor(model=model, context_policy=policy, max_rounds=1) as executor:
+        async with Executor(model=model, context_policy=policy, max_rounds=2) as executor:
             return await executor.execute(_state(), 1, "publish")
 
     asyncio.run(run())
-    judge = model.requests[1]
+    judge = model.requests[2]
     assert [message.tool_call_id for message in judge if isinstance(message, ToolMessage)] == ["ok-1"]
     assert all(getattr(message, "tool_call_id", None) != "bad-1" for message in judge)
     assert "permission denied" not in "\n".join(getattr(message, "content", "") for message in judge)
@@ -174,3 +174,113 @@ def test_plan_step_messages_layout_judge_reconstructs_only_successful_tool_pairs
     )
     assert "selected_step" in judge_budget["feedback_messages"][0].content
     assert judge_budget["completion_criteria_status"].endswith("The artifact is available")
+
+
+def test_plan_step_messages_layout_terminal_candidate_receives_settled_tool_result(monkeypatch):
+    async def load_tools(_session):
+        def succeed():
+            """Produce the artifact."""
+            return "artifact is available"
+
+        return [StructuredTool.from_function(succeed, name="succeed")]
+
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", _Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    model = _Model(
+        AIMessage(content="", tool_calls=[{"name": "succeed", "args": {}, "id": "ok-1"}]),
+        AIMessage(content="Published the artifact."),
+        _judge(completed=True),
+    )
+
+    async def run():
+        async with Executor(model=model, runtime_context_layout="messages") as executor:
+            return await executor.execute(_state(), 1, "publish")
+
+    outcome = asyncio.run(run())
+    assert outcome.execution.status == "completed", outcome.execution.error
+    candidate = model.requests[1]
+    assert [message.tool_call_id for message in candidate if isinstance(message, ToolMessage)] == ["ok-1"]
+    assert next(message for message in candidate if isinstance(message, ToolMessage)).content == "artifact is available"
+    assert any(isinstance(message, AIMessage) and message.tool_calls[0]["id"] == "ok-1" for message in candidate)
+    assert "[pending]" in candidate[-1].content
+
+
+def test_plan_step_messages_layout_rejected_candidate_keeps_tool_result(monkeypatch):
+    async def load_tools(_session):
+        def succeed():
+            """Produce the artifact."""
+            return "artifact is available"
+
+        return [StructuredTool.from_function(succeed, name="succeed")]
+
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", _Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    model = _Model(
+        AIMessage(content="", tool_calls=[{"name": "succeed", "args": {}, "id": "ok-1"}]),
+        AIMessage(content="Premature."),
+        _judge(completed=False),
+        AIMessage(content="Published the artifact."),
+        _judge(completed=True),
+    )
+
+    async def run():
+        async with Executor(model=model, runtime_context_layout="messages", max_rounds=3) as executor:
+            return await executor.execute(_state(), 1, "publish")
+
+    outcome = asyncio.run(run())
+    assert outcome.execution.status == "completed", outcome.execution.error
+    retry = model.requests[3]
+    assert [message.tool_call_id for message in retry if isinstance(message, ToolMessage)] == ["ok-1"]
+    feedback_index = next(
+        index for index, message in enumerate(retry)
+        if isinstance(message, HumanMessage) and "proposed Step answer was not accepted" in message.content
+    )
+    goal_index = next(
+        index for index, message in enumerate(retry)
+        if isinstance(message, HumanMessage) and message.content.startswith("## Goal")
+    )
+    assert feedback_index < goal_index
+
+
+def test_plan_step_messages_judge_rejects_native_tool_calls(monkeypatch):
+    invocations = []
+
+    async def load_tools(_session):
+        def succeed():
+            """Produce the artifact."""
+            invocations.append("succeed")
+            return "artifact is available"
+
+        return [StructuredTool.from_function(succeed, name="succeed")]
+
+    class TrackingModel(_Model):
+        def __init__(self, *responses):
+            super().__init__(*responses)
+            self.bindings = []
+
+        def bind_tools(self, tools):
+            self.bindings.append(tuple(tools))
+            return self
+
+    monkeypatch.setattr("agent.executor.MultiServerMCPClient", _Client)
+    monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
+    judge_with_call = _judge(completed=True).model_copy(update={
+        "tool_calls": [{"name": "succeed", "args": {}, "id": "judge-call"}],
+    })
+    model = TrackingModel(
+        AIMessage(content="", tool_calls=[{"name": "succeed", "args": {}, "id": "ok-1"}]),
+        AIMessage(content="Published the artifact."),
+        judge_with_call,
+        _judge(completed=True),
+    )
+
+    async def run():
+        async with Executor(model=model, runtime_context_layout="messages") as executor:
+            return await executor.execute(_state(), 1, "publish")
+
+    outcome = asyncio.run(run())
+    assert outcome.execution.status == "completed", outcome.execution.error
+    assert invocations == ["succeed"]
+    assert len(model.requests) == 4
+    assert model.bindings[1:] == [()]
+    assert "Validation error:" in "\n".join(message.content for message in model.requests[3] if isinstance(message, HumanMessage))

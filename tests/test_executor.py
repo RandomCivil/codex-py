@@ -50,7 +50,6 @@ def test_executor_returns_freeform_content_without_a_completion_receipt(monkeypa
     model = Model(
         AIMessage(content="Published successfully.\n\n- Release artifact is available."),
         _completed_judgment("the release artifact is available"),
-        AIMessage(content="Published successfully.\n\n- Release artifact is available."),
     )
 
     async def run():
@@ -61,7 +60,7 @@ def test_executor_returns_freeform_content_without_a_completion_receipt(monkeypa
     assert outcome.execution.result == "Published successfully.\n\n- Release artifact is available."
     assert outcome.context_update is not None
     assert outcome.context_update.files_read == ()
-    assert len(model.requests) == 3
+    assert len(model.requests) == 2
     assert "NO_TOOL" not in model.requests[0][0].content
     assert "STEP_COMPLETION" not in model.requests[0][0].content
     assert "completion_criterion as fixed and authoritative" in model.requests[0][0].content
@@ -74,7 +73,7 @@ def test_executor_returns_content_verbatim_without_line_protocol_parsing(monkeyp
     monkeypatch.setattr("agent.executor.MultiServerMCPClient", Client)
     monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
     content = "BEGIN STEP_COMPLETION\nthis is ordinary text\nEND STEP_COMPLETION"
-    model = Model(AIMessage(content=content), _completed_judgment(), AIMessage(content=content))
+    model = Model(AIMessage(content=content), _completed_judgment())
 
     async def run():
         async with Executor(model=model) as executor:
@@ -90,7 +89,6 @@ def test_executor_traces_finish_reason_for_the_terminal_response(monkeypatch):
     model = Model(
         AIMessage(content="Published", response_metadata={"finish_reason": "length"}),
         _completed_judgment(),
-        AIMessage(content="Published"),
     )
     output = StringIO()
 
@@ -116,8 +114,8 @@ def test_executor_executes_a_tool_call_with_accompanying_text(monkeypatch):
     monkeypatch.setattr("agent.executor.load_mcp_tools", load_tools)
     model = Model(
         AIMessage(content="I'll record this.", tool_calls=[{"name": "record", "args": {}, "id": "1"}]),
-        _completed_judgment("recorded"),
         AIMessage(content="Recorded."),
+        _completed_judgment("recorded"),
     )
 
     async def run():
@@ -142,7 +140,6 @@ def test_judge_excludes_failed_tool_output_from_its_runtime_evidence(monkeypatch
         AIMessage(content="", tool_calls=[{"name": "apply_patch", "args": {}, "id": "reject-1"}]),
         AIMessage(content="Recovered after correction."),
         _completed_judgment("the correction is complete"),
-        AIMessage(content="Recovered after correction."),
     )
 
     async def run():

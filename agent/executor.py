@@ -1,16 +1,18 @@
 import json
 import os
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
+from llm import LLM
 from llm.line_protocol import LineProtocolError, decode_step_completion_progress
 
 from memory.state import AgentState, ContextUpdate, ExecutionOutcome, PlanStep, StepContext, StepExecution
+from agent.responses_adapter import responses_input, responses_tools
 from agent.runtime_context import (
     RawToolResult,
     RuntimeContext,
@@ -72,7 +74,7 @@ class Executor:
         attempt: int | None = None,
         trace: Any | None = None,
         context_policy: RuntimeContextPolicy | None = None,
-        context_budget: int = 128_000,
+        context_budget: int = 128_0000,
         context_model: Any | None = None,
         runtime_context_layout: Literal["grouped", "messages"] = "grouped",
     ) -> None:
@@ -80,16 +82,18 @@ class Executor:
             raise ValueError("max_rounds must be a positive integer")
         if runtime_context_layout not in {"grouped", "messages"}:
             raise ValueError("runtime context layout must be 'grouped' or 'messages'")
+        self._owns_model = model is None
+        self._owned_model_options = None
         if model is None:
             if not all(isinstance(value, str) and value.strip() for value in (base_url, api_key, model_name)):
                 raise ValueError("Executor requires explicit base_url, api_key, and model_name when no model is injected")
-            model = ChatOpenAI(
-                base_url=base_url,
-                api_key=api_key,
-                model=model_name,
-                streaming=True,
-                max_retries=0,
-            )
+            self._owned_model_options = {
+                "base_url": base_url,
+                "api_key": api_key,
+                "model_name": model_name,
+                "stream": stream,
+                "reasoning": {"effort": "none"},
+            }
         self._model = model
         self._connection = {
             "transport": "stdio",
@@ -127,6 +131,10 @@ class Executor:
     async def __aenter__(self) -> "Executor":
         if self._active:
             raise RuntimeError("Executor is already active")
+        # DurableAgent re-enters the same Executor for each Plan step.
+        # Owned HTTP clients belong to that context, not to the reusable shell.
+        if self._owns_model:
+            self._model = LLM(**self._owned_model_options)
         self._active = True
         return self
 
@@ -135,13 +143,21 @@ class Executor:
             if self._session is not None:
                 await self._session.__aexit__(exc_type, exc, traceback)
         finally:
-            self._client = None
-            self._session = None
-            self._tools = None
-            self._bound_model = None
-            self._tool_node = None
-            self._tool_graph = None
-            self._active = False
+            try:
+                if self._owns_model:
+                    await self._model.close()
+            finally:
+                if self._owns_model:
+                    self._model = None
+                self._client = None
+                self._session = None
+                self._tools = None
+                self._bound_model = None
+                self._tool_node = None
+                self._tool_graph = None
+                self._active_context_policy = None
+                self._active_durable_state = None
+                self._active = False
 
     # one plan step execution
     async def execute(
@@ -171,7 +187,7 @@ class Executor:
             policy_model = self._context_model or self._model
             if self._active_context_policy is None and (
                 self._context_model is not None
-                or isinstance(self._model, ChatOpenAI)
+                or isinstance(self._model, LLM)
                 or self._runtime_context_layout == "messages"
             ):
                 self._active_context_policy = RuntimeContextPolicy(
@@ -184,8 +200,10 @@ class Executor:
                 state, revision, step, step_context, recovery=recovery, attempt=attempt
             )
         except CompletionJudgeProviderError as error:
+            self._trace_execution_error(error, revision, step_id, phase="completion judge")
             return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"completion judge failed: {error}"))
         except Exception as error:
+            self._trace_execution_error(error, revision, step_id, phase="step execution")
             if self._checkpointer is not None:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
             return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"execution failed: {error}"))
@@ -233,9 +251,24 @@ class Executor:
                 ContextUpdate(),
             )
         except Exception as error:
+            self._trace_execution_error(error, revision, step_id, phase="final handoff")
             if self._checkpointer is not None:
                 raise PersistenceError("checkpointed step execution stopped before further tool work") from error
             return ExecutionOutcome(StepExecution(revision, step_id, "failed", error=f"execution failed: {error}"))
+
+    def _trace_execution_error(
+        self,
+        error: Exception,
+        revision: int,
+        step_id: str,
+        *,
+        phase: str,
+    ) -> None:
+        # Keep legacy trace doubles usable while logging before exceptions are
+        # wrapped or converted into the public step-failure contract.
+        callback = getattr(self._trace, "execution_error", None)
+        if callable(callback):
+            callback("executor", error, phase=f"{phase} revision={revision} step={step_id}")
 
     async def _execute_with_tools(
         self,
@@ -256,7 +289,11 @@ class Executor:
             if self._tool_allowlist is not None:
                 tools = [tool for tool in tools if tool.name in self._tool_allowlist]
             self._tools = canonical_mcp_tool_set(tools)
-            self._bound_model = self._model.bind_tools(self._tools)
+            self._bound_model = (
+                self._model
+                if isinstance(self._model, LLM)
+                else self._model.bind_tools(self._tools)
+            )
             # Preserve the accepted model → ToolNode → model boundary. ToolNode
             # owns MCP invocation and returns recoverable failures as ToolMessages.
             self._tool_node = ToolNode(self._tools, handle_tool_errors=True)
@@ -344,7 +381,12 @@ class Executor:
                     "request_kind": "tool_round",
                 },
             )
-            response = await stream_model_response(self._bound_model, request, self._trace)
+            response = await _executor_model_response(
+                self._bound_model,
+                request,
+                self._tools,
+                trace=self._trace,
+            )
             response = self._with_tool_cwd(response)
             _trace_llm_response(self._trace, response)
             calls = list(getattr(response, "tool_calls", []) or [])
@@ -500,7 +542,7 @@ class Executor:
         if messages_layout:
             # Keep the judge's original structured step input, reconstruct only
             # successful native Raw pairs, then place judge evidence between
-            # Observations and Goal.  The criterion remains the final layer.
+            # Observations and criteria. The criterion remains the final layer.
             judge_prefix = [SystemMessage(content=instructions), request[1]]
             if not isinstance(self._active_context_policy, RuntimeContextPolicy):
                 raise RuntimeError("messages-layout judge requires Runtime context")
@@ -536,7 +578,9 @@ class Executor:
                 SystemMessage(content=instructions),
                 evidence_message,
             ]
-        judge_model = self._model.bind_tools(())
+        judge_model = (
+            self._model if isinstance(self._model, LLM) else self._model.bind_tools(())
+        )
         trace_llm_request(
             self._trace,
             "completion_judge",
@@ -544,7 +588,7 @@ class Executor:
             static_shape={"instructions": instructions, "tools": None, "request_kind": "completion_judge"},
         )
         try:
-            judged = await stream_model_response(judge_model, context, self._trace)
+            judged = await _executor_model_response(judge_model, context, (), trace=self._trace)
         except Exception as error:
             raise CompletionJudgeProviderError(str(error) or "provider request failed") from error
         _trace_llm_response(self._trace, judged, component="completion_judge")
@@ -572,7 +616,7 @@ class Executor:
                 static_shape={"instructions": instructions, "tools": None, "request_kind": "completion_judge_repair"},
             )
             try:
-                repaired = await stream_model_response(judge_model, repair, self._trace)
+                repaired = await _executor_model_response(judge_model, repair, (), trace=self._trace)
             except Exception as error:
                 raise CompletionJudgeProviderError(str(error) or "provider repair request failed") from error
             _trace_llm_response(self._trace, repaired, component="completion_judge")
@@ -668,6 +712,62 @@ def _resolve_step(state: AgentState, revision: int, step_id: str) -> PlanStep | 
         if plan.revision == revision:
             return next((step for step in plan.steps if step.id == step_id), None)
     return None
+
+
+async def _executor_model_response(
+    model: Any,
+    messages: list[BaseMessage],
+    tools: Iterable[Any],
+    *,
+    trace: Any | None,
+) -> Any:
+    """Call the production Responses adapter or an injected LangChain model."""
+    if not isinstance(model, LLM):
+        return await stream_model_response(model, messages, trace)
+
+    request_response = getattr(model, "request_response", None)
+    if callable(request_response):
+        response = await request_response(
+            responses_input(messages),
+            tools=responses_tools(tools),
+            on_event=(getattr(trace, "llm_event", None) if trace is not None else None),
+            on_stream_end=(getattr(trace, "llm_stream_end", None) if trace is not None else None),
+        )
+    else:
+        response = await model.complete_response(
+            responses_input(messages),
+            tools=responses_tools(tools),
+        )
+
+    text = getattr(response, "output_text", "") or ""
+    calls = []
+    for item in getattr(response, "output", ()) or ():
+        if getattr(item, "type", None) != "function_call":
+            continue
+        arguments = getattr(item, "arguments", "{}")
+        try:
+            parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except json.JSONDecodeError:
+            parsed_arguments = arguments
+        calls.append(
+            {
+                "name": getattr(item, "name", "unknown"),
+                "args": parsed_arguments,
+                "id": getattr(item, "call_id", None) or getattr(item, "id", None),
+                "type": "tool_call",
+            }
+        )
+    usage = getattr(response, "usage", None)
+    if callable(getattr(usage, "model_dump", None)):
+        usage = usage.model_dump(mode="json")
+    metadata = {
+        "finish_reason": getattr(response, "status", None),
+        # ``RunTrace`` receives the adapted AIMessage below, rather than the
+        # native Responses object. Keep provider usage as plain data: nesting
+        # SDK models in AIMessage metadata can break checkpoint serialization.
+        "usage": usage,
+    }
+    return AIMessage(content=text, tool_calls=calls, response_metadata=metadata)
 
 
 def _request_payload(state: AgentState, revision: int, step: PlanStep) -> dict[str, Any]:
@@ -794,9 +894,9 @@ def _completion_context_messages(context: RuntimeContext) -> list[BaseMessage]:
 
 
 def _insert_before_goal(messages: list[BaseMessage], feedback: BaseMessage) -> list[BaseMessage]:
-    """Keep native-layout correction feedback before Goal and criteria."""
+    """Keep correction feedback before Goal or the final criteria layer."""
     for index, message in enumerate(messages):
-        if isinstance(message, HumanMessage) and message.content.startswith("## Goal"):
+        if isinstance(message, HumanMessage) and message.content.startswith(("## Goal", "## Completion criteria")):
             return [*messages[:index], feedback, *messages[index:]]
     return [*messages, feedback]
 

@@ -10,6 +10,12 @@ always first. The layout is part of durable-run configuration identity and its
 token budget covers the full model request, so recovery and bounded-context
 behavior cannot silently change when a caller selects the layout.
 
+Plan-step requests retain the complete structured Agent state in their fixed
+input. Their messages layout therefore omits `agent_state` from the rendered
+Durable State and omits the separate Goal and Steps messages. Internal state is
+preserved for Observation generation; feedback precedes the final acceptance
+criteria. ReAct and the grouped layout retain their existing rendering.
+
 Each model role retains its existing evidence filter. In particular, a
 Plan-step Completion judge receives only its established successful evidence
 view, while failed Tool results remain in the operational loop for correction.

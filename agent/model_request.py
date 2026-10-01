@@ -32,7 +32,7 @@ async def stream_model_response(model: Any, messages: Any, trace: Any | None = N
     if trace is not None:
         callback = getattr(trace, "llm_stream_end", None)
         if callable(callback):
-            callback()
+            callback(request_status="completed")
     return response
 
 

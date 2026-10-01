@@ -1,5 +1,6 @@
 import asyncio
 from io import StringIO
+from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage
 
@@ -7,6 +8,7 @@ from agent import PlanningValidationError
 from agent.configuration import ComponentProviderConfiguration, ProviderConfiguration
 from agent.execution import DirectMode, ExecutionAnswer, PlanExecuteMode, ReactMode, ToolAgentMode, create_execution_mode
 from agent.trace import RunTrace
+from llm.llm import LLM
 from tests.helpers import Runtime, ToolModel
 
 
@@ -396,22 +398,25 @@ def test_react_logs_the_original_exception_before_returning_safe_error():
 
 def test_react_factory_owns_and_closes_a_fresh_http_client_per_asyncio_run(monkeypatch):
     """Interactive chat starts a new event loop for each submitted turn."""
-    clients = []
+    models = []
 
-    class ChatModel:
-        def __init__(self, **kwargs):
-            clients.append(kwargs["http_async_client"])
+    class ResponsesModel(LLM):
+        def __init__(self, *args, **kwargs):
+            models.append(self)
+            self.closed = False
 
-        def bind_tools(self, tools):
-            self.tools = tools
-            return self
+        async def stream_events(self, input, *, instructions=None, tools=None):
+            text = (
+                'BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="Done"\nEND GOAL_JUDGMENT'
+                if "GOAL_JUDGMENT" in repr(input)
+                else 'BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done"\nEND REACT_DECISION'
+            )
+            yield SimpleNamespace(type="response.completed", response=SimpleNamespace(output_text=text, output=[]))
 
-        async def ainvoke(self, messages):
-            if self.tools == ():
-                return AIMessage(content='BEGIN GOAL_JUDGMENT\nCOMPLETED=true\nEVIDENCE="Done"\nEND GOAL_JUDGMENT')
-            return AIMessage(content='BEGIN REACT_DECISION\nSTATUS="completed"\nANSWER="Done"\nEND REACT_DECISION')
+        async def close(self):
+            self.closed = True
 
-    monkeypatch.setattr("agent.execution.ChatOpenAI", ChatModel)
+    monkeypatch.setattr("agent.execution.LLM", ResponsesModel)
     provider = ProviderConfiguration("https://provider.test/v1", "key", "model")
     configuration = ComponentProviderConfiguration(provider, provider, provider, react=provider)
 
@@ -422,6 +427,6 @@ def test_react_factory_owns_and_closes_a_fresh_http_client_per_asyncio_run(monke
     asyncio.run(submit_turn())
     asyncio.run(submit_turn())
 
-    assert len(clients) == 2
-    assert clients[0] is not clients[1]
-    assert all(client.is_closed for client in clients)
+    assert len(models) == 2
+    assert models[0] is not models[1]
+    assert all(model.closed for model in models)

@@ -2,12 +2,15 @@ import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+import pytest
+
 from agent.conversation import (
     ConversationInput,
     ConversationService,
     ConversationTurn,
     InMemoryConversationStore,
     _MySQLDurableAgent,
+    _run_mysql_conversation,
 )
 from agent.execution import ExecutionAnswer, create_execution_mode
 from agent.durable import DurableConversationRunner
@@ -21,6 +24,42 @@ class DurableRun:
     async def run(self, run_id, state, **kwargs):
         self.calls.append((run_id, state, kwargs))
         return {"run_id": run_id, "status": self.status, "state": None}
+
+
+@pytest.mark.parametrize("layout", ["grouped", "messages"])
+def test_mysql_plan_execute_conversation_preserves_runtime_context_layout(monkeypatch, layout):
+    calls = []
+    store = InMemoryConversationStore()
+
+    @asynccontextmanager
+    async def connection_pool(_configuration):
+        yield object()
+
+    async def initialize(_pool):
+        pass
+
+    async def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"run_id": args[1], "status": "blocked", "state": None}
+
+    monkeypatch.setattr("agent.migration._connection_pool", connection_pool)
+    monkeypatch.setattr("agent.migration._parse_url", lambda url: url)
+    monkeypatch.setattr("agent.migration.ensure_schema_initialized", initialize)
+    monkeypatch.setattr("agent.conversation.MySQLConversationStore", lambda _pool: store)
+    monkeypatch.setattr("agent.durable._run", run)
+
+    result = asyncio.run(_run_mysql_conversation(
+        "mysql://database",
+        user_input="Ship it",
+        conv_id=None,
+        configuration=object(),
+        execution_mode="plan_execute",
+        runtime_context_layout=layout,
+    ))
+
+    assert result.status == "blocked"
+    assert calls[0][1]["execution_mode"] == "plan_execute"
+    assert calls[0][1]["runtime_context_layout"] == layout
 
 
 def test_mysql_durable_adapter_delegates_plan_execute_run(monkeypatch):
@@ -96,7 +135,8 @@ def test_mysql_durable_adapter_restores_tool_cwd_for_recovery(monkeypatch):
     assert calls[0][1]["cwd"] == "/saved/project"
 
 
-def test_plan_execute_preserves_blocked_result_inside_an_independent_conversation_run():
+@pytest.mark.parametrize("layout", ["grouped", "messages"])
+def test_plan_execute_preserves_blocked_result_inside_an_independent_conversation_run(layout):
     durable = DurableRun("blocked")
     run_ids = []
 
@@ -106,7 +146,9 @@ def test_plan_execute_preserves_blocked_result_inside_an_independent_conversatio
 
     service = ConversationService(InMemoryConversationStore(), runner_factory)
 
-    result = asyncio.run(service.run(user_input="Ship it", execution_mode="plan_execute"))
+    result = asyncio.run(service.run(
+        user_input="Ship it", execution_mode="plan_execute", runtime_context_layout=layout
+    ))
 
     assert result.status == "blocked"
     assert result.run_id == run_ids[0][1]

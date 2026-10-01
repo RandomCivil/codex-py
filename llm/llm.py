@@ -73,6 +73,76 @@ class LLM:
             if not completed and self._on_stream_end is not None:
                 self._on_stream_end()
 
+    async def complete_response(
+        self,
+        input: str | Sequence[dict[str, Any]],
+        *,
+        instructions: str | None = None,
+        tools: Iterable[dict[str, Any]] | None = None,
+    ) -> Any:
+        """Return one complete Responses API response without opening a stream."""
+        request: dict[str, Any] = {
+            "model": self._model_name,
+            "input": input,
+        }
+        if instructions is not None:
+            request["instructions"] = instructions
+        if tools is not None:
+            request["tools"] = tools
+        if self._reasoning is not None:
+            request["reasoning"] = self._reasoning
+        if self._on_request is not None:
+            self._on_request(request)
+        response = await self._client.responses.create(**request)
+        if self._on_response is not None:
+            self._on_response(response)
+        return response
+
+    async def request_response(
+        self,
+        input: str | Sequence[dict[str, Any]],
+        *,
+        instructions: str | None = None,
+        tools: Iterable[dict[str, Any]] | None = None,
+        on_event: Callable[[ResponseStreamEvent], None] | None = None,
+        on_stream_end: Callable[[], None] | None = None,
+    ) -> Any:
+        """Return a complete response, using the configured transport mode."""
+        if not self._stream:
+            return await self.complete_response(input, instructions=instructions, tools=tools)
+
+        request: dict[str, Any] = {"model": self._model_name, "input": input}
+        if instructions is not None:
+            request["instructions"] = instructions
+        if tools is not None:
+            request["tools"] = tools
+        if self._reasoning is not None:
+            request["reasoning"] = self._reasoning
+        if self._on_request is not None:
+            self._on_request(request)
+
+        completed = False
+        try:
+            async with self._client.responses.stream(**request) as stream:
+                async for event in stream:
+                    if self._on_event is not None:
+                        self._on_event(event)
+                    if on_event is not None:
+                        on_event(event)
+                    if event.type == "response.completed":
+                        completed = True
+                        response = event.response
+            if not completed:
+                raise RuntimeError("Responses stream ended without a completed response")
+        finally:
+            if not completed and self._on_stream_end is not None:
+                self._on_stream_end()
+            if not completed and on_stream_end is not None:
+                on_stream_end()
+        if self._on_response is not None:
+            self._on_response(response)
+        return response
+
     async def stream_text(
         self,
         input: str | Sequence[dict[str, Any]],
@@ -95,12 +165,10 @@ class LLM:
         instructions: str | None = None,
         tools: Iterable[dict[str, Any]] | None = None,
     ) -> str:
-        """Collect a text stream for compatibility with older callers."""
-        return "".join(
-            [
-                chunk
-                async for chunk in self.stream_text(
-                    input, instructions=instructions, tools=tools
-                )
-            ]
+        """Return the text from one non-streaming Responses API response."""
+        response = await self.complete_response(
+            input,
+            instructions=instructions,
+            tools=tools,
         )
+        return getattr(response, "output_text", "") or ""

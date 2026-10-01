@@ -516,6 +516,37 @@ def test_messages_layout_prunes_observation_replaced_calls_from_a_partial_batch(
     assert "found the target" in observation_message.content
 
 
+def test_plan_step_messages_omit_duplicate_state_without_mutating_internal_payload():
+    agent_state = {
+        "goal": "write note",
+        "selected_plan_step": {"id": "write", "completion_criterion": "note exists"},
+        "plan_history": [{"revision": 1, "steps": [{"id": "write"}]}],
+    }
+    durable_state = {
+        "agent_state": agent_state,
+        "step_context": {"files_read": ["README.md"]},
+    }
+    original = json.dumps(durable_state, sort_keys=True)
+    context = RuntimeContextPolicy(None, layout="messages").assemble(durable_state)
+    messages = context.as_messages(
+        prefix_messages=[SystemMessage(content="instructions"), HumanMessage(content=json.dumps(agent_state))],
+        completion_criteria_status="1. [pending] note exists",
+    )
+
+    assert json.loads(messages[1].content) == agent_state
+    assert messages[2].content == '## Durable state\n\n{"step_context": {"files_read": ["README.md"]}}'
+    assert not any(message.content.startswith(("## Goal", "## Steps")) for message in messages)
+    assert messages[-1].content == "## Completion criteria\n\n1. [pending] note exists"
+    assert json.dumps(context.durable_state, sort_keys=True) == original
+    assert context.durable_state["agent_state"]["goal"] == "write note"
+
+    # The grouped layout still supplies the state, goal and steps itself.
+    grouped = context.as_messages(layout="grouped")[0].content
+    assert "### Goal" in grouped and "### Steps" in grouped
+    assert '"agent_state"' in grouped
+    assert json.dumps(context.durable_state, sort_keys=True) == original
+
+
 def test_messages_layout_budgets_fixed_messages_and_fails_when_required_request_cannot_fit():
     policy = RuntimeContextPolicy(ObservationModel({}), budget=1, layout="messages")
 

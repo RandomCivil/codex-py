@@ -19,7 +19,7 @@ from llm.line_protocol import LineProtocolError, parse_line_protocol
 from agent.model_request import stream_model_response
 
 
-DEFAULT_CONTEXT_BUDGET = 128_000
+DEFAULT_CONTEXT_BUDGET = 128_0000
 RAW_ROUND_WINDOW = 3
 NATIVE_LISTING_ROUND_WINDOW = 1
 
@@ -800,7 +800,21 @@ def _runtime_context_messages(
     feedback_messages: Sequence[Any] = (),
 ) -> list[Any]:
     """Render visible Raw evidence as native assistant and Tool messages."""
-    durable_state, goal, steps = _runtime_durable_state_goal_and_steps(context.durable_state)
+    # Plan-step requests already carry the complete structured Agent state in
+    # their fixed input. Keep the internal payload for Observation generation,
+    # but do not repeat that state or its Goal/Steps in the native layout.
+    agent_state = (
+        context.durable_state.get("agent_state")
+        if isinstance(context.durable_state, Mapping)
+        else None
+    )
+    plan_step = isinstance(agent_state, Mapping) and "selected_plan_step" in agent_state
+    if plan_step:
+        durable_state = dict(context.durable_state)
+        durable_state.pop("agent_state")
+        goal, steps = None, None
+    else:
+        durable_state, goal, steps = _runtime_durable_state_goal_and_steps(context.durable_state)
     messages: list[Any] = list(prefix_messages)
     for raw in context.raw_tool_results:
         if not raw.calls:
@@ -831,7 +845,8 @@ def _runtime_context_messages(
         HumanMessage(content=_messages_observations(context.observations)),
     ])
     messages.extend(feedback_messages)
-    messages.append(HumanMessage(content="## Goal\n\n" + _prompt_value(goal)))
+    if not plan_step:
+        messages.append(HumanMessage(content="## Goal\n\n" + _prompt_value(goal)))
     if steps is not None:
         messages.append(HumanMessage(content="## Steps\n\n" + _prompt_value(steps)))
     if completion_criteria_status is not None:

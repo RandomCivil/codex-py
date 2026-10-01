@@ -340,7 +340,7 @@ class ConversationService:
 
     def _make_runner(self, mode: str, run_id: str, completion_criteria: tuple[str, ...] = (), runtime_context_layout: str = "grouped") -> Any:
         if mode != "react":
-            args = (mode, run_id, runtime_context_layout) if runtime_context_layout != "grouped" else (mode, run_id)
+            args = (mode, run_id, completion_criteria, runtime_context_layout) if runtime_context_layout != "grouped" else (mode, run_id)
             return _call_factory(self._runner_factory, *args, one_argument=run_id)
         args = (mode, run_id, completion_criteria, runtime_context_layout) if runtime_context_layout != "grouped" else (mode, run_id, completion_criteria)
         return _call_factory(

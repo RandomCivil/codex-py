@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -108,13 +109,15 @@ def test_plan_step_messages_layout_orders_operational_context_and_retains_failed
 
     first = model.requests[0]
     assert [type(message) for message in first] == [
-        SystemMessage, HumanMessage, HumanMessage, HumanMessage, HumanMessage, HumanMessage,
-        HumanMessage,
+        SystemMessage, HumanMessage, HumanMessage, HumanMessage, HumanMessage,
     ]
     assert first[1].content.startswith('{"goal": "Publish"')
     assert "## Durable state" in first[2].content
+    assert json.loads(first[2].content.split("\n\n", 1)[1]) == {
+        "step_context": {"files_read": [], "files_modified": [], "observations": []},
+    }
     assert "## Observations" in first[3].content
-    assert "## Goal" in first[-3].content
+    assert not any(message.content.startswith(("## Goal", "## Steps")) for message in first)
     assert "## Completion criteria" in first[-1].content
 
     correction = next(
@@ -127,7 +130,8 @@ def test_plan_step_messages_layout_orders_operational_context_and_retains_failed
         if isinstance(message, ToolMessage)
     )
     assert [message.tool_call_id for message in correction if isinstance(message, ToolMessage)] == ["ok-1", "bad-1"]
-    assert correction.index(next(message for message in correction if isinstance(message, HumanMessage) and "## Goal" in message.content)) > correction.index(next(message for message in correction if isinstance(message, HumanMessage) and "## Observations" in message.content))
+    assert correction[-1].content.startswith("## Completion criteria")
+    assert not any(message.content.startswith(("## Goal", "## Steps")) for message in correction)
 
 
 def test_plan_step_messages_layout_judge_reconstructs_only_successful_tool_pairs(monkeypatch):
@@ -166,7 +170,9 @@ def test_plan_step_messages_layout_judge_reconstructs_only_successful_tool_pairs
     assert "permission denied" not in "\n".join(getattr(message, "content", "") for message in judge)
     assert isinstance(judge[0], SystemMessage)
     assert isinstance(judge[1], HumanMessage)
-    assert judge.index(next(message for message in judge if isinstance(message, HumanMessage) and "## Goal" in message.content)) > judge.index(next(message for message in judge if isinstance(message, HumanMessage) and "## Observations" in message.content))
+    assert judge[-1].content.startswith("## Completion criteria")
+    assert not any(message.content.startswith(("## Goal", "## Steps")) for message in judge)
+    assert json.loads(judge[1].content)["goal"] == "Publish"
     judge_budget = next(
         kwargs for kwargs in policy.maintain_calls
         if kwargs.get("prefix_messages")
@@ -235,11 +241,11 @@ def test_plan_step_messages_layout_rejected_candidate_keeps_tool_result(monkeypa
         index for index, message in enumerate(retry)
         if isinstance(message, HumanMessage) and "proposed Step answer was not accepted" in message.content
     )
-    goal_index = next(
+    criteria_index = next(
         index for index, message in enumerate(retry)
-        if isinstance(message, HumanMessage) and message.content.startswith("## Goal")
+        if isinstance(message, HumanMessage) and message.content.startswith("## Completion criteria")
     )
-    assert feedback_index < goal_index
+    assert feedback_index < criteria_index
 
 
 def test_plan_step_messages_judge_rejects_native_tool_calls(monkeypatch):
@@ -284,3 +290,4 @@ def test_plan_step_messages_judge_rejects_native_tool_calls(monkeypatch):
     assert len(model.requests) == 4
     assert model.bindings[1:] == [()]
     assert "Validation error:" in "\n".join(message.content for message in model.requests[3] if isinstance(message, HumanMessage))
+    assert model.requests[3][-1].content.startswith("## Completion criteria")

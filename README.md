@@ -79,20 +79,26 @@ flowchart TD
 ### 单个 Step 的 Executor 图
 
 Executor 为一个 Step 构建并运行独立的 LangGraph。`ToolNode` 会处理当前模型响应中的整个
-Tool-call batch；没有工具调用时直接结束工具图。工具图结束后，Executor 再单独请求严格 JSON
-格式的 completion receipt，用于判断 completion criterion 并生成后续 Step 的上下文。
+Tool-call batch；有工具调用时执行后继续请求执行模型。执行模型返回无工具调用且非空的文本时，
+Executor 才请求独立的 completion judge，按当前 Step 的 `completion_criterion` 和可用证据判断
+是否完成。若仍未完成，会把 pending 状态和缺口反馈给执行模型继续工作；若已完成，则再发起一次
+禁用工具的模型请求生成 Step handoff。judge 的结构化结果使用 `STEP_COMPLETION_PROGRESS`
+Line Protocol，并单独保存完成证据。
 
 ```mermaid
 flowchart LR
     S([START]) --> M[mark_running]
     M --> L[model]
-    L -->|有 tool_calls 且未超出轮数| T[tools / ToolNode]
+    L -->|有 tool_calls| T[tools / ToolNode]
     T -->|等待整个 Tool-call batch| L
-    L -->|无 tool_calls 或达到轮数上限| E([END])
-    E --> Q[completion receipt]
+    L -->|无 tool_calls 且非空| Q[completion judge]
     Q --> X{criterion met?}
-    X -->|是| D[Step completed]
-    X -->|否或格式无效| F[Step failed]
+    X -->|否| C[继续执行并反馈 pending 状态]
+    C --> L
+    X -->|是| H[禁用工具生成 handoff]
+    H -->|非空文本| D[Step completed]
+    H -->|无效或空响应| F[Step failed]
+    L -->|轮数耗尽| F
 ```
 
 Plan steps 始终串行；只有同一模型响应内相互独立的工具调用会在 `ToolNode` 中并发执行。
@@ -178,7 +184,7 @@ ReAct 和 Plan–execute 的单步 Executor 共用同一套 Runtime-context poli
 
 Observation 包含按 `confirmed_facts`、`reported_errors`、`model_inferences` 分类的证据，并关联源 tool-call ID。它会收到 Goal、执行模式、适用的 Plan step/完成标准及工具名和参数作为决策背景。Observation 不阻塞工具循环，也不能修改 Durable State；只有为满足显式 Runtime-context token budget 而压缩时，才会同步合并较早的 Observation，并保留来源和受影响目标。原始证据和 Durable State 不会为适配预算而截断或重新摘要；连同必要 Raw evidence 仍超预算时，该次执行安全失败。
 
-两种工具循环都按“检查完成标准、只处理具体缺口、验证后停止”收敛。ReAct 每轮收到当前证据；Task Analyzer 提供的 completion criteria 会附加 host 记录的逐项状态。每个有成功工具结果的 batch 后，独立的无工具 completion judge 只能根据该 batch 的成功原始结果报告新完成项；格式校验通过后，host 更新状态。只有所有 criteria 均由 host 记录为完成，judge 才能返回最终答案并结束 ReAct。未提供 criteria 的 ReAct 使用终止模型响应作为完成信号；达到轮数上限则失败。Plan-step Executor 则始终以当前 step 的 `completion_criterion` 为准：工具结果进入后续 Runtime context，模型直接返回最终文本 handoff 即表示该 step 完成，不再额外请求 completion receipt；Criterion 未满足时应继续处理明确缺口，满足后停止额外检查。同批工具仍并发执行，工具失败结果会留在下一轮以便纠正。
+两种工具循环都按“检查完成标准、只处理具体缺口、验证后停止”收敛。ReAct 每轮收到当前证据；Task Analyzer 提供的 completion criteria 会附加 host 记录的逐项状态。每个有成功工具结果的 batch 后，独立的无工具 completion judge 只能根据该 batch 的成功原始结果报告新完成项；格式校验通过后，host 更新状态。只有所有 criteria 均由 host 记录为完成，judge 才能返回最终答案并结束 ReAct。未提供 criteria 的 ReAct 使用终止模型响应作为完成信号；达到轮数上限则失败。Plan-step Executor 始终以当前 step 的 `completion_criterion` 为准；工具 batch 后继续由执行模型处理结果，不立即调用 judge。执行模型返回非空无工具响应时，Executor 才调用独立 judge 检查已累积的 step 证据。未满足时继续处理具体缺口；满足时再发出一次禁用工具的 handoff 请求。任一工具调用失败会抑制该 batch 的 judge 和 Observation 请求，失败结果留在后续执行上下文中供纠正。同批工具仍并发执行。
 
 ## 安装
 
@@ -251,7 +257,7 @@ task_analyzer:
   model_name: task-analysis-model
 ```
 
-需要结构化输出的非工具模型响应使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；ReAct 和 Plan-step Executor 的执行模型返回空 `tool_calls` 时，直接将 `content` 作为当前任务或 Plan step 的答案，不要求 Line Protocol。完成标准的独立 judge 仍使用 Line Protocol；native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，预计一步的工具目标使用 tool-agent，长周期工具目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
+需要结构化输出的非工具模型响应使用 ADR-0017 定义的 Line Protocol，并在本地完成严格校验；ReAct 和 Plan-step Executor 的执行模型返回空 `tool_calls` 时，直接将 `content` 作为当前任务或 Plan step 的候选文本，不要求 Line Protocol。Plan-step Executor 的 completion judge 使用 `STEP_COMPLETION_PROGRESS` Line Protocol；ReAct 的 completion judge 使用其对应协议。native MCP function call 仍由 provider 原生处理。`direct`、`tool_agent` 和 `react` 使用各自 provider 配置，`runtime_context` 可单独指定 provider，`task_analyzer` 默认继承 Planner 配置。`run` 始终先调用一次 Task Router：无工具目标使用 direct，预计一步的工具目标使用 tool-agent，长周期工具目标使用 Plan–execute，其余工具目标使用 ReAct。CLI 结果会包含 `execution_mode`、`execution`、`analysis` 和（分析失败时）安全的 `analysis_error`。`resume` 仅恢复既有的 Plan–execute Agent run，不会重新分析或更换模式。
 
 每个 provider 配置的 `stream` 必须是 YAML 布尔值，表示该组件是否使用 LLM 流式返回；省略时为 `false`。`stream` 也会参与 run 恢复时的配置兼容性检查。
 
@@ -455,6 +461,47 @@ llm/       OpenAI-compatible Responses API 异步适配器
 memory/    AgentState、Plan 和 StepExecution 领域模型
 tests/     单元测试和 MySQL 集成测试
 docs/adr/  关键架构决策
+```
+
+### Agent组件层级关系
+
+#### 顶层协调层
+- **Agent** (`agent/agent.py`): 最顶层协调器，负责整个 Plan-Execute 生命周期管理，包括状态恢复、失败重规划、多 revision 控制
+- **ConversationService** (`agent/conversation.py`): 应用层服务，管理多轮对话、持久化存储和模式选择
+
+#### 执行模式层 (Execution Modes)
+四种 whole-task 执行模式，由 Task Router 选择：
+1. **DirectMode**: 无工具调用的直接回答
+2. **ToolAgentMode**: 单轮最多一次工具调用
+3. **ReactMode**: 迭代工具调用直到满足完成标准
+4. **PlanExecuteMode**: 可恢复的多步 Plan 执行（适配 DurableAgent）
+
+#### 核心组件层
+- **Planner** (`agent/planner.py`): 生成结构化 Plan，包含多个 Step
+- **Executor** (`agent/executor.py`): 执行单个 Plan step，通过 LangGraph 构建 model → ToolNode → model 循环
+- **TaskAnalyzer** (`agent/task_analyzer.py`): 分析任务特征（task_type、needs_tools、expected_steps 等）
+- **TaskRouter** (`agent/task_analyzer.py`): 基于 TaskAnalysis 确定性地选择 Execution mode
+
+#### 运行时支持层
+- **RuntimeContext/RuntimeContextPolicy** (`agent/runtime_context.py`): 管理 tool-round observations、context budget、证据压缩
+- **ToolRuntime** (`agent/execution.py`): MCP 工具会话管理，提供工具调用边界
+- **Configuration** (`agent/configuration.py`): 加载和管理 provider 配置
+
+#### 依赖关系
+
+```text
+ConversationService
+  └─> TaskRouter
+       ├─> TaskAnalyzer
+       └─> ExecutionMode (DirectMode/ToolAgentMode/ReactMode/PlanExecuteMode)
+            ├─> Planner (仅 PlanExecuteMode 使用)
+            ├─> Executor (仅 PlanExecuteMode 使用)
+            ├─> ToolRuntime (tool-enabled modes 使用)
+            └─> RuntimeContextPolicy (ReAct 和 Executor 使用)
+
+Agent
+  └─> Planner + Executor
+       └─> Executor 内部使用 RuntimeContextPolicy
 ```
 
 更多术语和边界约定见 [CONTEXT.md](CONTEXT.md)，架构决策见 [docs/adr](docs/adr/)。

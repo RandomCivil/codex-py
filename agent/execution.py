@@ -6,10 +6,11 @@ import re
 import uuid
 from dataclasses import dataclass
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any, Literal, Mapping, Protocol
 
 import httpx
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
@@ -23,6 +24,7 @@ from agent.model_request import (
     trace_llm_validation_retry,
 )
 from agent.planner import PlanningValidationError
+from agent.responses_adapter import responses_input, responses_tools
 from llm.llm import LLM
 from llm.text_stream import validated_text, validation_feedback_instructions
 from agent.runtime_context import RuntimeContext, RuntimeContextPolicy, observation_decision_context
@@ -341,11 +343,111 @@ class _ToolExecutionError(RuntimeError):
         self.result = result
 
 
+async def _stream_responses_tool_agent(
+    model: LLM,
+    input_items: list[dict[str, Any]],
+    *,
+    instructions: str,
+    tools: list[dict[str, Any]],
+) -> Any:
+    """Adapt one streamed Responses response to the Tool-agent message seam."""
+    text: list[str] = []
+    completed_response: Any = None
+    calls: list[dict[str, Any]] = []
+    seen_call_ids: set[str] = set()
+    async for event in model.stream_events(
+        input_items,
+        instructions=instructions,
+        tools=tools,
+    ):
+        if getattr(event, "type", None) == "response.output_text.delta":
+            text.append(getattr(event, "delta", ""))
+        elif getattr(event, "type", None) == "response.output_item.done":
+            _append_response_call(calls, seen_call_ids, getattr(event, "item", None))
+        elif getattr(event, "type", None) == "response.completed":
+            completed_response = getattr(event, "response", None)
+            for item in getattr(completed_response, "output", ()) or ():
+                _append_response_call(calls, seen_call_ids, item)
+    output_text = getattr(completed_response, "output_text", None) if completed_response is not None else None
+    return SimpleNamespace(content=output_text or "".join(text), tool_calls=calls)
+
+
+async def _tool_agent_model_response(
+    model: Any,
+    *,
+    goal: str,
+    instructions: str,
+    tools: list[Any],
+    trace: Any | None,
+) -> Any:
+    if isinstance(model, LLM):
+        return await _stream_responses_tool_agent(
+            model,
+            [{"role": "user", "content": goal}],
+            instructions=instructions,
+            tools=responses_tools(tools),
+        )
+    return await stream_model_response(
+        _bind_tools(model, tools),
+        [SystemMessage(content=instructions), HumanMessage(content=goal)],
+        trace,
+    )
+
+
+async def _stream_responses_react(
+    model: LLM, messages: list[Any], tools: list[Any], trace: Any | None
+) -> AIMessage:
+    """Adapt one streamed Responses response to the ReAct message seam."""
+    text: list[str] = []
+    calls: list[dict[str, Any]] = []
+    seen_call_ids: set[str] = set()
+    completed_response: Any = None
+    try:
+        async for event in model.stream_events(
+            responses_input(messages), tools=responses_tools(tools)
+        ):
+            if trace is not None and getattr(model, "_on_event", None) != trace.llm_event:
+                trace.llm_event(event)
+            if getattr(event, "type", None) == "response.output_text.delta":
+                text.append(getattr(event, "delta", ""))
+            elif getattr(event, "type", None) == "response.output_item.done":
+                _append_response_call(calls, seen_call_ids, getattr(event, "item", None))
+            elif getattr(event, "type", None) == "response.completed":
+                completed_response = getattr(event, "response", None)
+                for item in getattr(completed_response, "output", ()) or ():
+                    _append_response_call(calls, seen_call_ids, item)
+    except Exception:
+        if trace is not None:
+            trace.llm_stream_end()
+        raise
+    content = getattr(completed_response, "output_text", None) or "".join(text)
+    return AIMessage(content=content, tool_calls=calls)
+
+
+def _append_response_call(calls: list[dict[str, Any]], seen_call_ids: set[str], item: Any) -> None:
+    if getattr(item, "type", None) != "function_call":
+        return
+    call_id = str(getattr(item, "call_id", None) or getattr(item, "id", None) or "unknown")
+    if call_id in seen_call_ids:
+        return
+    arguments = getattr(item, "arguments", "{}")
+    try:
+        arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError:
+        pass
+    calls.append({"name": getattr(item, "name", "unknown"), "args": arguments, "id": call_id})
+    seen_call_ids.add(call_id)
+
+
 async def _close_owned_http_clients(clients: tuple[Any, ...]) -> None:
     """Release per-invocation HTTP pools before their event loop is closed."""
     for client in clients:
         try:
-            await client.aclose()
+            close = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
         except Exception:
             # A close failure must not replace the execution result or obscure its
             # original error.  The client is only an implementation resource.
@@ -375,20 +477,22 @@ class ToolAgentMode:
         try:
             async with self._runtime as runtime:
                 tools = canonical_mcp_tool_set(runtime.tools)
-                bound = _bind_tools(self._model, tools)
-                trace_llm_request(
-                    self._trace,
-                    "tool_agent",
-                    [SystemMessage(content=_TOOL_AGENT_INSTRUCTIONS), HumanMessage(content=goal)],
-                    static_shape={
-                        "tools": tool_request_shape(tools),
-                        "instructions": _TOOL_AGENT_INSTRUCTIONS,
-                    },
-                )
-                response = await stream_model_response(
-                    bound,
-                    [SystemMessage(content=_TOOL_AGENT_INSTRUCTIONS), HumanMessage(content=goal)],
-                    self._trace,
+                if not callable(getattr(self._model, "_on_request", None)):
+                    trace_llm_request(
+                        self._trace,
+                        "tool_agent",
+                        [SystemMessage(content=_TOOL_AGENT_INSTRUCTIONS), HumanMessage(content=goal)],
+                        static_shape={
+                            "tools": tool_request_shape(tools),
+                            "instructions": _TOOL_AGENT_INSTRUCTIONS,
+                        },
+                    )
+                response = await _tool_agent_model_response(
+                    self._model,
+                    goal=goal,
+                    instructions=_TOOL_AGENT_INSTRUCTIONS,
+                    tools=tools,
+                    trace=self._trace,
                 )
                 _trace_llm_response(self._trace, response)
                 calls = list(getattr(response, "tool_calls", []) or [])
@@ -397,19 +501,16 @@ class ToolAgentMode:
                         return ExecutionAnswer(decode_answer(_message_text(response)), "completed")
                     except LineProtocolError as error:
                         trace_llm_validation_retry(self._trace, "tool_agent", error)
-                        response = await stream_model_response(
-                            bound,
-                            [
-                                SystemMessage(
-                                    content=validation_feedback_instructions(
-                                        _TOOL_AGENT_INSTRUCTIONS,
-                                        error,
-                                        _message_text(response),
-                                    )
-                                ),
-                                HumanMessage(content=goal),
-                            ],
-                            self._trace,
+                        response = await _tool_agent_model_response(
+                            self._model,
+                            goal=goal,
+                            instructions=validation_feedback_instructions(
+                                _TOOL_AGENT_INSTRUCTIONS,
+                                error,
+                                _message_text(response),
+                            ),
+                            tools=tools,
+                            trace=self._trace,
                         )
                         _trace_llm_response(self._trace, response)
                         calls = list(getattr(response, "tool_calls", []) or [])
@@ -437,7 +538,7 @@ class ReactMode:
         *,
         max_rounds: int = 50,
         context_policy: RuntimeContextPolicy | None = None,
-        context_budget: int = 128_000,
+        context_budget: int = 128_0000,
         context_model: Any | None = None,
         owned_http_clients: tuple[Any, ...] = (),
         completion_criteria: tuple[str, ...] = (),
@@ -471,7 +572,7 @@ class ReactMode:
         try:
             async with self._runtime as runtime:
                 tools = canonical_mcp_tool_set(runtime.tools)
-                model = self._model.bind_tools(tools)
+                model = self._model if isinstance(self._model, LLM) else self._model.bind_tools(tools)
                 # Injected doubles can predate the no-tool Observation seam.  The
                 # production ChatOpenAI path always enables it; tests and embedders
                 # may provide a policy explicitly when their model supports that
@@ -499,7 +600,7 @@ class ReactMode:
                     # Rebind the execution model each round so mutable test
                     # doubles and embedders cannot carry that restriction into
                     # the next ReAct tool round.
-                    model = self._model.bind_tools(tools)
+                    model = self._model if isinstance(self._model, LLM) else self._model.bind_tools(tools)
                     request_messages = list(messages)
                     criteria_status = (
                         _completion_criteria_status(
@@ -581,8 +682,13 @@ class ReactMode:
                         },
                     )
                     phase = "model invocation"
-                    response = await stream_model_response(model, request_messages, self._trace)
-                    _trace_llm_response(self._trace, response, component="react")
+                    if isinstance(self._model, LLM):
+                        response = await _stream_responses_react(
+                            model, request_messages, tools, self._trace
+                        )
+                    else:
+                        response = await stream_model_response(model, request_messages, self._trace)
+                        _trace_llm_response(self._trace, response, component="react")
                     phase = "model response processing"
                     calls = list(getattr(response, "tool_calls", []) or [])
                     content = _message_text(response) if getattr(response, "content", None) not in (None, "") else ""
@@ -967,9 +1073,12 @@ class ReactMode:
         )
         # The judge evaluates evidence only. Bind an explicit empty tool set so
         # the provider cannot issue native calls from this request.
-        judge_model = self._model.bind_tools(())
-        response = await stream_model_response(judge_model, messages, self._trace)
-        _trace_llm_response(self._trace, response, component="completion_judge")
+        if isinstance(self._model, LLM):
+            response = await _stream_responses_react(self._model, messages, [], self._trace)
+        else:
+            judge_model = self._model.bind_tools(())
+            response = await stream_model_response(judge_model, messages, self._trace)
+            _trace_llm_response(self._trace, response, component="completion_judge")
         return response
 
     async def _invoke_for_react(self, runtime: Any, call: Mapping[str, Any]) -> tuple[str, bool, Any]:
@@ -1268,7 +1377,7 @@ def create_execution_mode(
     durable_agent: Any | None = None,
     run_id: str | None = None,
     max_rounds: int = 50,
-    context_budget: int = 128_000,
+    context_budget: int = 128_0000,
     context_policy: RuntimeContextPolicy | None = None,
     runtime_context_layout: Literal["grouped", "messages"] = "grouped",
     configuration: ComponentProviderConfiguration | None = None,
@@ -1305,6 +1414,31 @@ def create_execution_mode(
                     else None
                 ),
             )
+        elif mode == "tool_agent":
+            model = LLM(
+                provider.base_url,
+                provider.api_key,
+                provider.model_name,
+                stream=True,
+                on_event=getattr(trace, "llm_event", None),
+                on_stream_end=getattr(trace, "llm_stream_end", None),
+                on_request=(
+                    (lambda request: trace.llm_request("tool_agent", request))
+                    if trace is not None
+                    else None
+                ),
+            )
+            owned_http_clients = (model,)
+        elif mode == "react":
+            model = LLM(
+                provider.base_url,
+                provider.api_key,
+                provider.model_name,
+                stream=True,
+                on_event=getattr(trace, "llm_event", None),
+                on_stream_end=getattr(trace, "llm_stream_end", None),
+            )
+            owned_http_clients = (model,)
         else:
             model, http_client = _configured_chat_model(provider)
             owned_http_clients = (http_client,)

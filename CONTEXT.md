@@ -205,8 +205,8 @@ The durable recovery-facing record for one Execution attempt, pairing its Step e
 _Avoid_: checkpoint internals, message transcript, tool trace
 
 **Tool-calling model**:
-A LangChain chat model configured for an OpenAI-compatible provider that can request tools from an MCP tool set during Step execution.
-_Avoid_: text stream, planner model
+An OpenAI-compatible model invoked through the shared Responses API adapter that can request tools from an MCP tool set; the host retains responsibility for Tool execution and follow-up Model requests.
+_Avoid_: LangChain chat model, text stream, planner model
 
 **Completion judge**:
 A tool-free Model role that evaluates available execution evidence against completion criteria or, for ReAct without criteria, the whole Goal. The host accepts ReAct's candidate answer only after a positive current-state judgment.

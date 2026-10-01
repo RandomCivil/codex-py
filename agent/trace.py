@@ -26,7 +26,8 @@ class RunTrace:
         self._llm_attribution: tuple[str, str] | None = None
         self._stream_started_at: float | None = None
         self._stream_first_token_at: float | None = None
-        self._completed_streams: list[tuple[float, float | None]] = []
+        self._stream_last_token_at: float | None = None
+        self._completed_streams: list[dict[str, Any]] = []
 
     def llm_request(
         self,
@@ -51,13 +52,17 @@ class RunTrace:
         """Start timing one streaming model response."""
         self._stream_started_at = time.perf_counter()
         self._stream_first_token_at = None
+        self._stream_last_token_at = None
 
     def llm_stream_chunk(self, chunk: Any = None) -> None:
         """Record and, at debug level, print one generated stream chunk."""
         if self._stream_started_at is None:
             self.llm_stream_start()
-        if self._stream_first_token_at is None and _has_stream_output(chunk):
-            self._stream_first_token_at = time.perf_counter()
+        if _has_stream_output(chunk):
+            observed_at = time.perf_counter()
+            if self._stream_first_token_at is None:
+                self._stream_first_token_at = observed_at
+            self._stream_last_token_at = observed_at
         if self._level == "debug":
             fragment = _stream_fragment(chunk)
             if fragment:
@@ -68,20 +73,34 @@ class RunTrace:
                 )
                 self._line(f"[llm stream] chunk={rendered}")
 
-    def llm_stream_end(self) -> None:
-        """Finish timing one streamed response until its usage metadata arrives."""
+    def llm_stream_end(self, *, request_status: str = "failed") -> None:
+        """Finish one stream, emitting failure timing when completion was not observed."""
         if self._stream_started_at is None:
             return
         finished_at = time.perf_counter()
-        duration = finished_at - self._stream_started_at
-        first_token = (
-            self._stream_first_token_at - self._stream_started_at
-            if self._stream_first_token_at is not None
-            else None
+        self._completed_streams.append(
+            {
+                "duration": finished_at - self._stream_started_at,
+                "first_token": (
+                    self._stream_first_token_at - self._stream_started_at
+                    if self._stream_first_token_at is not None
+                    else None
+                ),
+                "generation_duration": (
+                    self._stream_last_token_at - self._stream_first_token_at
+                    if self._stream_first_token_at is not None
+                    and self._stream_last_token_at is not None
+                    else None
+                ),
+                "status": request_status,
+                "attribution": self._llm_attribution,
+            }
         )
-        self._completed_streams.append((duration, first_token))
         self._stream_started_at = None
         self._stream_first_token_at = None
+        self._stream_last_token_at = None
+        if request_status == "failed":
+            self._write_stream_timing(None)
 
     def llm_event(self, event: Any) -> None:
         event_type = getattr(event, "type", "")
@@ -94,8 +113,10 @@ class RunTrace:
             elif event_type == "response.completed":
                 # Token accounting remains useful at every level.  The full
                 # request/response payload is reserved for info-level tracing.
-                self.llm_stream_end()
-                self._llm_usage(event)
+                self.llm_stream_end(request_status="completed")
+                has_usage = self._llm_usage(event)
+                if not has_usage:
+                    self._write_stream_timing(None)
                 self._output_buffer = ""
                 self._llm_attribution = None
             return
@@ -106,11 +127,16 @@ class RunTrace:
         # provider-specific metadata.
         if event_type not in {
             "response.reasoning.delta",
+            "response.reasoning_text.delta",
             "response.reasoning_summary_text.delta",
             "response.output_text.delta",
         }:
             self._line(f"[llm event] data={_compact(event)}")
-        if event_type in {"response.reasoning.delta", "response.reasoning_summary_text.delta"}:
+        if event_type in {
+            "response.reasoning.delta",
+            "response.reasoning_text.delta",
+            "response.reasoning_summary_text.delta",
+        }:
             self.llm_stream_chunk(event)
         elif event_type == "response.output_text.delta":
             delta = getattr(event, "delta", "")
@@ -119,8 +145,10 @@ class RunTrace:
         elif event_type == "response.created":
             self._output_buffer = ""
         if event_type == "response.completed":
-            self.llm_stream_end()
-            self._llm_usage(event)
+            self.llm_stream_end(request_status="completed")
+            has_usage = self._llm_usage(event)
+            if not has_usage:
+                self._write_stream_timing(None)
             self.llm_final(getattr(event, "response", event))
             self._output_buffer = ""
             self._llm_attribution = None
@@ -130,7 +158,7 @@ class RunTrace:
         event: Any,
         *,
         attribution: tuple[str, str] | None = None,
-    ) -> None:
+    ) -> bool:
         response = getattr(event, "response", event)
         usage = _get_field(response, "usage")
         if usage is None:
@@ -139,8 +167,9 @@ class RunTrace:
             metadata = _get_field(event, "response_metadata") or {}
             usage = _get_field(metadata, "token_usage") or _get_field(metadata, "usage")
         if usage is None:
-            return
+            return False
         self._write_llm_usage(usage, attribution=attribution)
+        return True
 
     def _write_llm_usage(
         self,
@@ -189,12 +218,32 @@ class RunTrace:
         """Emit per-response streaming performance once token usage is known."""
         if not self._completed_streams:
             return
-        duration, first_token = self._completed_streams.pop(0)
+        timing = self._completed_streams.pop(0)
+        duration = timing["duration"]
+        first_token = timing["first_token"]
         token_count = _positive_number(output_tokens)
-        time_per_output_token = None if token_count is None else duration / token_count
-        tokens_per_second = None if token_count is None else token_count / duration if duration else None
+        generation_duration = timing["generation_duration"]
+        generation_tokens = token_count - 1 if token_count is not None else None
+        can_measure_generation = (
+            generation_tokens is not None
+            and generation_tokens > 0
+            and generation_duration is not None
+            and generation_duration > 0
+        )
+        time_per_output_token = (
+            generation_duration / generation_tokens if can_measure_generation else None
+        )
+        tokens_per_second = (
+            generation_tokens / generation_duration if can_measure_generation else None
+        )
+        attribution_text = ""
+        if timing["attribution"] is not None:
+            component, family = timing["attribution"]
+            attribution_text = f"component={component} request_family={family} "
         self._line(
             "[llm timing] "
+            + attribution_text
+            + f"request_status={timing['status']} "
             f"first_token_ms={_milliseconds(first_token)} "
             f"stream_duration_ms={_milliseconds(duration)} "
             f"time_per_output_token_ms={_milliseconds(time_per_output_token)} "
@@ -220,11 +269,18 @@ class RunTrace:
         static_shape: Any | None = None,
     ) -> None:
         """Record the terminal response and its usage from a non-streaming model."""
+        # Non-streaming Responses API calls have no ``response.completed``
+        # event to close the timing window.  A request may have been started
+        # by ``llm_request`` immediately before this callback, so complete it
+        # here before usage renders its paired timing line.
+        self.llm_stream_end(request_status="completed")
         attribution = None
         if component is not None:
             label = component.strip() if isinstance(component, str) and component.strip() else "unknown"
             attribution = (label, _request_family(static_shape or {}))
-        self._llm_usage(response, attribution=attribution)
+        has_usage = self._llm_usage(response, attribution=attribution)
+        if not has_usage:
+            self._write_stream_timing(None)
         self.llm_final(response)
         # A concurrent Runtime-context response carries its attribution
         # explicitly and must not consume the foreground request's pending
@@ -460,7 +516,10 @@ def _as_serializable(value: Any) -> Any:
     model_dump = getattr(value, "model_dump", None)
     if callable(model_dump):
         try:
-            return _as_serializable(model_dump(mode="json"))
+            # SDK stream events can nest ParsedResponse generic subclasses whose
+            # runtime type differs from the declared Response field. Serialize
+            # their actual fields to preserve the full diagnostic payload.
+            return _as_serializable(model_dump(mode="json", serialize_as_any=True))
         except (TypeError, ValueError):
             return _as_serializable(model_dump())
     if isinstance(value, Mapping):
